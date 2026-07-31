@@ -1,0 +1,14 @@
+[Unit]
+Description=SROVA Network Music mount restore
+Wants=network-online.target
+After=network-online.target
+Before=srova.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/srova/srova-network-mount-helper restore
+TimeoutStartSec=30
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

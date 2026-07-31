@@ -1,0 +1,1080 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>SROVA VU</title>
+<link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+
+html, body {
+    width:100%; height:100%;
+    background:#000;
+    overflow:hidden;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    color:#fff;
+    touch-action:none;
+}
+
+/* Landscape lock overlay for portrait mode */
+#portraitMsg {
+    display:none;
+    position:fixed;
+    inset:0;
+    background:#0a0a0a;
+    z-index:999;
+    align-items:center;
+    justify-content:center;
+    flex-direction:column;
+    gap:16px;
+    color:#555;
+    font-size:15px;
+}
+#portraitMsg .material-icons { font-size:48px; }
+
+@media (orientation:portrait) {
+    #portraitMsg { display:flex; }
+    #app { display:none; }
+}
+
+#app {
+    display:flex;
+    flex-direction:column;
+    width:100%;
+    height:100%;
+}
+
+/* VU meters area */
+#meters {
+    --vu-meter-gap: 2vw;
+    --vu-meter-size:min(
+        calc((100vw - 4vw - var(--vu-meter-gap)) / 2),
+        calc(100vh - 7vh - 64px)
+    );
+    flex:1;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    gap:var(--vu-meter-gap);
+    padding:2vh 2vw 1vh;
+    min-height:0;
+    overflow:hidden;
+}
+
+.meter-wrap {
+    position:relative;
+    flex:0 1 auto;
+    width:var(--vu-meter-size);
+    height:var(--vu-meter-size);
+    max-width:calc((100% - var(--vu-meter-gap)) / 2);
+    max-height:100%;
+    aspect-ratio:1/1;
+    overflow:hidden;
+    background:
+        radial-gradient(circle at 50% 34%, rgba(201, 168, 76, 0.10), transparent 54%),
+        #050505;
+    border:1px solid rgba(201, 168, 76, 0.22);
+    box-shadow:
+        inset 0 1px 0 rgba(255, 226, 150, 0.08),
+        inset 0 -18px 34px rgba(0, 0, 0, 0.48),
+        0 18px 44px rgba(0, 0, 0, 0.48),
+        0 0 26px rgba(201, 118, 28, 0.07);
+}
+
+canvas.vu {
+    width:100%;
+    height:100%;
+    display:block;
+}
+
+/* Player bar */
+#playerBar {
+    flex-shrink:0;
+    background:
+        linear-gradient(180deg, rgba(15, 9, 4, 0.76) 0%, rgba(5, 3, 2, 0.94) 100%),
+        radial-gradient(circle at 50% 0%, rgba(212, 175, 55, 0.075), transparent 54%),
+        url("/ui_web/assets/srova-leather-dark-brown.jpg") center center / cover no-repeat;
+    border-top:1px solid rgba(201,168,76,0.30);
+    box-shadow:
+        0 -20px 48px rgba(0, 0, 0, 0.62),
+        inset 0 1px 0 rgba(255, 232, 170, 0.075),
+        inset 0 -1px 0 rgba(0, 0, 0, 0.86);
+    display:grid;
+    grid-template-rows:1fr;
+    align-items:center;
+    padding:12px 18px;
+    height:78px;
+}
+
+#pbTop {
+    display:grid;
+    grid-template-columns:minmax(220px,30vw) minmax(140px,340px) auto;
+    align-items:center;
+    width:100%;
+    gap:14px;
+    min-width:0;
+}
+
+/* Left column: art + meta */
+#pbLeft {
+    display:flex;
+    align-items:center;
+    gap:12px;
+    flex:1;
+    min-width:0;
+}
+
+/* Centre column: progress bar -- absolutely centred */
+#pbProgress {
+    display:flex;
+    align-items:center;
+    gap:8px;
+    justify-self:start;
+    width:min(34vw, 340px);
+    max-width:340px;
+    min-width:0;
+}
+
+#playerBar.is-live #pbProgress,
+#playerBar.is-idle #pbProgress {
+    visibility:hidden;
+    pointer-events:none;
+}
+
+/* Right column: controls + badge */
+#pbRight {
+    display:flex;
+    align-items:center;
+    gap:10px;
+    justify-self:end;
+    min-width:0;
+    flex:0 0 auto;
+    justify-content:flex-end;
+}
+
+#pbTechStack {
+    display:grid;
+    justify-items:start;
+    gap:4px;
+    min-width:0;
+    width:min(190px, 22vw);
+    max-width:190px;
+}
+
+#pbProgress span {
+    font-size:11px;
+    color:rgba(237,230,211,0.42);
+    flex-shrink:0;
+    width:34px;
+    font-variant-numeric:tabular-nums;
+}
+
+#pbTotal { text-align:right; }
+
+#progressBar {
+    flex:1;
+    height:3px;
+    background:rgba(201,168,76,0.17);
+    border-radius:0;
+    overflow:hidden;
+    cursor:pointer;
+    position:relative;
+}
+
+#progressBar::before {
+    content:"";
+    position:absolute;
+    top:-12px; left:0; right:0; bottom:-12px;
+}
+
+#progressFill {
+    height:100%;
+    width:0%;
+    background:#00bfff;
+    border-radius:0;
+    transition:width 0.1s linear;
+}
+
+#progressFill.hires { background:#c9a84c; }
+
+#pbArt {
+    width:50px;
+    height:50px;
+    border-radius:0;
+    object-fit:cover;
+    object-position:center;
+    flex-shrink:0;
+    background:#141414;
+    overflow:hidden;
+    box-shadow:
+        0 0 0 1px rgba(201,168,76,0.22),
+        0 10px 22px rgba(0,0,0,0.42);
+}
+
+#playerBar.is-live #pbArt,
+#pbArt.logoArt {
+    object-fit:contain;
+    background:#050505;
+}
+
+#pbMeta {
+    flex:1;
+    min-width:0;
+}
+
+#pbTrack {
+    font-size:14px;
+    font-weight:300;
+    color:#ede6d3;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}
+
+#pbArtist {
+    font-size:12px;
+    color:rgba(237,230,211,0.48);
+    margin-top:3px;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}
+
+#pbControls {
+    display:flex;
+    align-items:center;
+    gap:10px;
+    flex-shrink:0;
+}
+
+#pbControls button {
+    position:relative;
+    width:34px;
+    height:34px;
+    padding:0;
+    border-radius:50%;
+    border:1px solid rgba(245,210,122,0.16);
+    background:
+        radial-gradient(circle at 34% 28%, rgba(255,255,255,0.07) 0%, rgba(255,255,255,0.025) 28%, rgba(255,255,255,0) 52%),
+        linear-gradient(145deg, #202022 0%, #171718 45%, #101011 100%);
+    color:#d4af37;
+    box-shadow:
+        0 10px 19px rgba(0,0,0,0.58),
+        inset 1px 1px 1px rgba(255,244,202,0.085),
+        inset -2px -2px 4px rgba(0,0,0,0.55);
+    cursor:pointer;
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    transition:color 0.15s;
+}
+#pbControls button:hover {
+    border-color:rgba(245,210,122,0.36);
+    color:#f0d27a;
+    box-shadow:
+        0 11px 21px rgba(0,0,0,0.62),
+        0 0 22px rgba(212,175,55,0.18),
+        inset 1px 1px 1px rgba(255,244,202,0.11),
+        inset -2px -2px 4px rgba(0,0,0,0.58);
+}
+#pbControls button .material-icons {
+    font-size:22px;
+    color:inherit;
+    text-shadow:0 1px 1px rgba(0,0,0,0.92), 0 0 3px rgba(212,175,55,0.18);
+}
+#pbBtnPlay {
+    width:40px;
+    height:40px;
+}
+#pbBtnPlay .material-icons { font-size:26px; color:#f0d27a; }
+
+#pbBadge {
+    max-width:100%;
+    font-size:10px;
+    font-weight:700;
+    letter-spacing:0.05em;
+    padding:3px 8px;
+    border-radius:0;
+    flex-shrink:0;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}
+#pbBadge.hires { color:#c9a84c; background:rgba(201,168,76,0.08); border:1px solid rgba(201,168,76,0.32); }
+#pbBadge.cd    { color:#00bfff; background:rgba(0,191,255,0.07); border:1px solid rgba(0,191,255,0.25); }
+#pbBadge.hidden { display:none; }
+
+#pbDacName {
+    max-width:100%;
+    min-width:0;
+    padding:3px 8px;
+    border-radius:0;
+    border:1px solid rgba(144,144,144,0.26);
+    color:rgba(237,230,211,0.52);
+    background:rgba(255,255,255,0.018);
+    font-size:9px;
+    font-weight:700;
+    letter-spacing:0.10em;
+    line-height:1.1;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    text-transform:uppercase;
+}
+
+#pbDacName.audioInfoHiRes {
+    color:#c9a84c;
+    border-color:rgba(201,168,76,0.34);
+    background:rgba(201,168,76,0.07);
+}
+
+#pbDacName.audioInfoCD {
+    color:#00bfff;
+    border-color:rgba(0,191,255,0.28);
+    background:rgba(0,191,255,0.06);
+}
+
+#pbDacName.hidden { display:none; }
+
+@media (min-width:761px) and (max-width:980px) {
+    #playerBar {
+        padding:10px 12px;
+    }
+
+    #pbTop {
+        grid-template-columns:minmax(190px,25vw) minmax(120px,25vw) auto;
+        gap:10px;
+    }
+
+    #pbProgress {
+        width:min(25vw, 230px);
+        max-width:230px;
+        gap:6px;
+    }
+
+    #pbRight {
+        gap:8px;
+    }
+
+    #pbControls {
+        gap:6px;
+    }
+
+    #pbTechStack {
+        width:min(150px,18vw);
+        max-width:150px;
+    }
+}
+
+@media (max-width:760px) {
+    #playerBar {
+        height:74px;
+        padding:10px 12px;
+    }
+
+    #pbTop {
+        grid-template-columns:minmax(0,1fr) auto;
+        gap:10px;
+    }
+
+    #pbProgress {
+        display:none;
+    }
+
+    #pbBadge {
+        display:none;
+    }
+
+    #pbTechStack {
+        display:none;
+    }
+}
+/* Auto-hiding close/fullscreen button -- only appears on hover or touch */
+#vuCloseBtn {
+    position: fixed;
+    top: 10px;
+    right: 10px;
+    z-index: 9999;
+    background: rgba(0,0,0,0.50);
+    border: none;
+    color: #ccc;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 0.25s ease;
+    pointer-events: none;
+}
+#vuCloseBtn .material-icons { font-size: 18px; }
+#vuCloseBtn:hover { color: #fff; background: rgba(0,0,0,0.75); }
+body.show-close #vuCloseBtn {
+    opacity: 1;
+    pointer-events: auto;
+}
+/* Auto-hiding close button -- only visible on hover/touch */
+#closeBtn {
+    position:fixed;
+    top:10px;
+    right:10px;
+    z-index:9999;
+    background:rgba(0,0,0,0.6);
+    border:1px solid rgba(255,255,255,0.15);
+    color:#ccc;
+    width:34px;
+    height:34px;
+    border-radius:50%;
+    cursor:pointer;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    opacity:0;
+    transition:opacity 0.25s ease;
+    pointer-events:none;
+    font-size:18px;
+    line-height:1;
+}
+body.ui-visible #closeBtn {
+    opacity:1;
+    pointer-events:auto;
+}
+#closeBtn:hover { background:rgba(40,40,40,0.85); color:#fff; }
+</style>
+</head>
+<body>
+
+<button id="vuCloseBtn" onclick="window.close()" title="Close">
+  <span class="material-icons">close</span>
+</button>
+
+<button id="closeBtn" onclick="window.close()" title="Close">&#x2715;</button>
+
+<!-- Portrait mode message -->
+<div id="portraitMsg">
+  <span class="material-icons">screen_rotation</span>
+  <span>Please rotate to landscape</span>
+</div>
+
+<div id="app">
+  <div id="meters">
+    <div class="meter-wrap"><canvas class="vu" id="vuL"></canvas></div>
+    <div class="meter-wrap"><canvas class="vu" id="vuR"></canvas></div>
+  </div>
+
+  <div id="playerBar">
+    <div id="pbTop">
+      <div id="pbLeft">
+        <img id="pbArt" src="/ui_web/assets/srova-square-logo.png" onerror="this.onerror=null;this.src='/ui_web/assets/srova-square-logo.png';">
+        <div id="pbMeta">
+          <div id="pbTrack">-</div>
+          <div id="pbArtist"></div>
+        </div>
+      </div>
+      <div id="pbProgress">
+        <span id="pbCurrent">0:00</span>
+        <div id="progressBar"><div id="progressFill"></div></div>
+        <span id="pbTotal">0:00</span>
+      </div>
+      <div id="pbRight">
+        <div id="pbControls">
+          <button onclick="cmd('/tidal/prev')"><span class="material-icons">skip_previous</span></button>
+          <button id="pbBtnPlay" onclick="togglePlay()"><span class="material-icons">play_arrow</span></button>
+          <button onclick="cmd('/tidal/next')"><span class="material-icons">skip_next</span></button>
+          <button onclick="cmd('/tidal/repeat')" id="pbBtnRepeat"><span class="material-icons">repeat</span></button>
+          <button onclick="cmd('/tidal/shuffle')" id="pbBtnShuffle"><span class="material-icons">shuffle</span></button>
+        </div>
+        <div id="pbTechStack">
+          <div id="pbDacName" class="audioInfoBox audioInfoOff hidden"></div>
+          <span id="pbBadge" class="hidden"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ---- VU meter physics constants (IEC 60268-17) ----
+var VU_ATTACK_TC  = 0.180;   // faster rise for visible musical transients
+var VU_DECAY_TC   = 0.260;   // slightly slower release to avoid jitter
+var VU_MIN_DB     = -20.0;   // scale start
+var VU_MAX_DB     =  3.0;    // scale end
+var VU_ZERO_DB    =  0.0;    // 0 VU reference
+var VU_INPUT_SENSITIVITY = 0.75;
+var POLL_MS       = 40;      // ~25fps spectrum polling
+var SESSION_MS    = 2000;    // session polling
+
+// ---- needle state per channel ----
+var needleL = { angle: 0, vel: 0, target: 0 };
+var needleR = { angle: 0, vel: 0, target: 0 };
+
+// ---- playback state ----
+var playing    = false;
+var isHires    = false;
+var startTime  = 0;
+var duration   = 0;
+var elapsed    = 0;
+var FALLBACK_ART = "/ui_web/assets/srova-square-logo.png";
+
+function dacDisplayName(name, driver, device) {
+    var n = String(name || "").trim();
+    if (n) { return n; }
+    var d = String(device || "").trim();
+    var r = String(driver || "").trim();
+    if (r && d) { return r + " / " + d; }
+    return d || "";
+}
+
+function dbToAngle(db) {
+    var db_c = Math.max(VU_MIN_DB, Math.min(VU_MAX_DB, db));
+    var t = (db_c - VU_MIN_DB) / (VU_MAX_DB - VU_MIN_DB);
+    // Arc spans from -50 deg to +50 deg relative to vertical
+    return (t - 0.5) * 100.0 * Math.PI / 180.0;
+}
+
+function clamp(value, lo, hi) {
+    value = Number(value);
+    if (!isFinite(value)) { return lo; }
+    return Math.max(lo, Math.min(hi, value));
+}
+
+function spectrumDbToMeter(db, floorDb, ceilingDb) {
+    db = Number(db);
+    if (!isFinite(db)) { return 0; }
+    return clamp((db - floorDb) / (ceilingDb - floorDb), 0, 1);
+}
+
+function spectrumToTargetDb(rmsDb, peakDb) {
+    var rmsMeter  = spectrumDbToMeter(rmsDb,  -62, -42);
+    var peakMeter = spectrumDbToMeter(peakDb, -58, -28);
+    var meter = (rmsMeter * 0.72) + (peakMeter * 0.28);
+    meter *= VU_INPUT_SENSITIVITY;
+    return VU_MIN_DB + meter * (VU_MAX_DB - VU_MIN_DB);
+}
+
+function updateNeedle(n, targetDb, dt) {
+    var targetAngle = dbToAngle(targetDb);
+    // Spring-damper with VU ballistics
+    var tc = targetAngle > n.angle ? VU_ATTACK_TC : VU_DECAY_TC;
+    var k  = 1.0 / tc;
+    var damping = 1.9;
+    var spring  = k * k;
+    var err     = targetAngle - n.angle;
+    n.vel    += (spring * err - damping * k * n.vel) * dt;
+    n.angle  += n.vel * dt;
+    // Clamp
+    var minA = dbToAngle(VU_MIN_DB - 2);
+    var maxA = dbToAngle(VU_MAX_DB + 0.5);
+    if (n.angle < minA) { n.angle = minA; n.vel = 0; }
+    if (n.angle > maxA) { n.angle = maxA; n.vel = 0; }
+}
+
+function drawVU(canvasId, needle, label) {
+    var canvas = document.getElementById(canvasId);
+    if (!canvas) { return; }
+    var w = canvas.width;
+    var h = canvas.height;
+    var ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, w, h);
+
+    var s = Math.min(w, h);
+    var r = s * 0.045;
+    var cx = w * 0.50;
+    var cy = h * 0.78;
+    var arc = s * 0.58;
+
+    ctx.save();
+    roundRect(ctx, 0, 0, w, h, r);
+    ctx.clip();
+
+    var caseBg = ctx.createLinearGradient(0, 0, 0, h);
+    caseBg.addColorStop(0, "#8e4212");
+    caseBg.addColorStop(0.46, "#c76318");
+    caseBg.addColorStop(0.72, "#9a4713");
+    caseBg.addColorStop(0.88, "#261007");
+    caseBg.addColorStop(1, "#050505");
+    ctx.fillStyle = caseBg;
+    ctx.fillRect(0, 0, w, h);
+
+    var dialGlow = ctx.createRadialGradient(cx, h * 0.42, s * 0.10, cx, h * 0.46, s * 0.78);
+    dialGlow.addColorStop(0, "#ffd06f");
+    dialGlow.addColorStop(0.42, "#f6a13a");
+    dialGlow.addColorStop(0.76, "#cf721f");
+    dialGlow.addColorStop(1, "#874011");
+    ctx.fillStyle = dialGlow;
+    ctx.beginPath();
+    ctx.arc(cx, cy, arc * 1.08, Math.PI * 1.03, Math.PI * 1.97, false);
+    ctx.lineTo(w, 0);
+    ctx.lineTo(0, 0);
+    ctx.closePath();
+    ctx.fill();
+
+    var faceShade = ctx.createLinearGradient(0, 0, 0, h);
+    faceShade.addColorStop(0, "rgba(255,232,144,0.24)");
+    faceShade.addColorStop(0.46, "rgba(255,156,38,0.00)");
+    faceShade.addColorStop(0.74, "rgba(0,0,0,0.02)");
+    faceShade.addColorStop(1, "rgba(0,0,0,0.32)");
+    ctx.fillStyle = faceShade;
+    ctx.fillRect(0, 0, w, h);
+
+    var faceLift = ctx.createRadialGradient(cx, h * 0.53, s * 0.05, cx, h * 0.53, s * 0.46);
+    faceLift.addColorStop(0, "rgba(255,173,58,0.28)");
+    faceLift.addColorStop(0.66, "rgba(255,145,35,0.12)");
+    faceLift.addColorStop(1, "rgba(255,145,35,0.00)");
+    ctx.fillStyle = faceLift;
+    ctx.fillRect(0, 0, w, h);
+
+    ctx.beginPath();
+    ctx.arc(cx, cy, arc * 1.11, Math.PI * 1.04, Math.PI * 1.96);
+    ctx.strokeStyle = "rgba(0,0,0,0.28)";
+    ctx.lineWidth = s * 0.026;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(cx, cy, arc * 1.06, Math.PI * 1.05, Math.PI * 1.95);
+    ctx.strokeStyle = "rgba(255,184,67,0.18)";
+    ctx.lineWidth = s * 0.012;
+    ctx.stroke();
+
+    // Scale arc background
+    ctx.beginPath();
+    ctx.arc(cx, cy, arc * 0.84, Math.PI * 1.13, Math.PI * 1.87);
+    ctx.strokeStyle = "rgba(0,0,0,0.13)";
+    ctx.lineWidth = s * 0.018;
+    ctx.stroke();
+
+    // ---- Scale markings ----
+    var marks = [
+        { db: -20, label: "20" },
+        { db: -10, label: "10" },
+        { db:  -7, label:  "7" },
+        { db:  -5, label:  "5" },
+        { db:  -3, label:  "3" },
+        { db:  -2, label:  "2" },
+        { db:   0, label:  "0" },
+        { db:   3, label:  "3" }
+    ];
+
+    var innerR = arc * 0.73;
+    var outerR = arc * 0.88;
+    var labelR = arc * 0.64;
+    var fs = Math.max(8, s * 0.040);
+
+    ctx.textAlign    = "center";
+    ctx.textBaseline = "middle";
+
+    for (var i = 0; i < marks.length; i++) {
+        var m   = marks[i];
+        var ang = needle_arc_angle(m.db) - Math.PI * 0.5;   // pivot below: use -PI/2
+        var red = m.db >= 0;
+        var cosA = Math.cos(ang);
+        var sinA = Math.sin(ang);
+
+        // Tick line
+        ctx.beginPath();
+        ctx.moveTo(cx + innerR * cosA, cy + innerR * sinA);
+        ctx.lineTo(cx + outerR * cosA, cy + outerR * sinA);
+        ctx.strokeStyle = red ? "#9d211b" : "#090604";
+        ctx.lineWidth = red ? s * 0.009 : s * 0.008;
+        ctx.stroke();
+
+        // Label
+        ctx.font         = "800 " + fs + "px sans-serif";
+        ctx.fillStyle    = red ? "#9d211b" : "#090604";
+        ctx.fillText(m.label, cx + labelR * cosA, cy + labelR * sinA);
+    }
+
+    // Minor ticks between marks
+    var minorDbs = [-15, -9, -8, -6, -4, -0.5, 0.5, 1.5, 2.5];
+    for (var j = 0; j < minorDbs.length; j++) {
+        var ang2 = needle_arc_angle(minorDbs[j]) - Math.PI * 0.5;
+        ctx.beginPath();
+        ctx.moveTo(cx + arc * 0.78 * Math.cos(ang2), cy + arc * 0.78 * Math.sin(ang2));
+        ctx.lineTo(cx + arc * 0.88 * Math.cos(ang2), cy + arc * 0.88 * Math.sin(ang2));
+        ctx.strokeStyle = minorDbs[j] >= 0 ? "#9d211b" : "#0b0704";
+        ctx.lineWidth   = s * 0.005;
+        ctx.stroke();
+    }
+
+    // Red overload zone
+    ctx.beginPath();
+    var ang0 = needle_arc_angle(0)          - Math.PI * 0.5;
+    var ang3 = needle_arc_angle(VU_MAX_DB)  - Math.PI * 0.5;
+    ctx.arc(cx, cy, arc * 0.96, ang0, ang3);
+    ctx.strokeStyle = "rgba(154,32,26,0.88)";
+    ctx.lineWidth   = s * 0.015;
+    ctx.stroke();
+
+    // ---- VU label ----
+    ctx.font      = "800 " + Math.max(18, s * 0.092) + "px sans-serif";
+    ctx.fillStyle = "#100804";
+    ctx.textAlign = "center";
+    ctx.fillText("VU", cx, h * 0.51);
+
+    // Channel label (L / R)
+    ctx.font      = "800 " + Math.max(12, s * 0.052) + "px sans-serif";
+    ctx.fillStyle = "rgba(42,20,4,0.82)";
+    ctx.textAlign = "right";
+    ctx.fillText(label, w * 0.90, h * 0.56);
+
+    ctx.fillStyle = "rgba(8,5,4,0.78)";
+    ctx.beginPath();
+    ctx.arc(cx, cy + s * 0.02, s * 0.22, Math.PI, Math.PI * 2, false);
+    ctx.lineTo(cx + s * 0.26, h);
+    ctx.lineTo(cx - s * 0.26, h);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = "rgba(160,30,24,0.50)";
+    ctx.beginPath();
+    ctx.arc(cx - s * 0.15, cy + s * 0.025, s * 0.042, Math.PI, Math.PI * 2);
+    ctx.arc(cx + s * 0.15, cy + s * 0.025, s * 0.042, Math.PI, Math.PI * 2);
+    ctx.fill();
+
+    // ---- Needle ----
+    var needleLen = arc * 0.86;
+    var nAng      = needle.angle - Math.PI * 0.5;   // pivot below canvas: use -PI/2
+    var nx        = cx + needleLen * Math.cos(nAng);
+    var ny        = cy + needleLen * Math.sin(nAng);
+
+    ctx.beginPath();
+    ctx.moveTo(cx + s * 0.004, cy + s * 0.004);
+    ctx.lineTo(nx + s * 0.008, ny + s * 0.008);
+    ctx.strokeStyle = "rgba(0,0,0,0.38)";
+    ctx.lineWidth   = Math.max(1, s * 0.006);
+    ctx.lineCap     = "round";
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(nx, ny);
+    ctx.strokeStyle = "#070707";
+    ctx.lineWidth   = Math.max(1, s * 0.005);
+    ctx.lineCap     = "round";
+    ctx.stroke();
+
+    // Pivot hardware
+    var hub = ctx.createRadialGradient(cx - s * 0.025, cy - s * 0.030, s * 0.005, cx, cy, s * 0.085);
+    hub.addColorStop(0, "#ffd282");
+    hub.addColorStop(0.20, "#b86b20");
+    hub.addColorStop(0.55, "#3a2112");
+    hub.addColorStop(1, "#050505");
+    ctx.fillStyle = hub;
+    ctx.beginPath();
+    ctx.arc(cx, cy, s * 0.078, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.85)";
+    ctx.lineWidth = s * 0.010;
+    ctx.stroke();
+    ctx.fillStyle = "rgba(255,204,112,0.80)";
+    ctx.beginPath();
+    ctx.arc(cx - s * 0.022, cy - s * 0.026, s * 0.012, 0, Math.PI * 2);
+    ctx.fill();
+
+    // ---- Glass reflection ----
+    var gloss = ctx.createLinearGradient(0, 0, 0, h * 0.5);
+    gloss.addColorStop(0,   "rgba(255,255,255,0.20)");
+    gloss.addColorStop(0.40, "rgba(255,255,255,0.050)");
+    gloss.addColorStop(1,   "rgba(255,255,255,0.00)");
+    ctx.fillStyle = gloss;
+    roundRect(ctx, 0, 0, w, h * 0.5, r);
+    ctx.fill();
+
+    var sweep = ctx.createLinearGradient(0, 0, w, h);
+    sweep.addColorStop(0, "rgba(255,255,255,0.00)");
+    sweep.addColorStop(0.48, "rgba(255,255,255,0.055)");
+    sweep.addColorStop(1, "rgba(255,255,255,0.00)");
+    ctx.fillStyle = sweep;
+    ctx.fillRect(0, 0, w, h);
+
+    ctx.restore();
+
+    // ---- Outer bezel ----
+    ctx.strokeStyle = "rgba(0,0,0,0.88)";
+    ctx.lineWidth   = s * 0.020;
+    roundRect(ctx, 0, 0, w, h, r);
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(240,178,70,0.16)";
+    ctx.lineWidth   = Math.max(1, s * 0.004);
+    roundRect(ctx, s * 0.014, s * 0.014, w - s * 0.028, h - s * 0.028, r * 0.72);
+    ctx.stroke();
+}
+
+// Convert dB value to needle angle (radians, 0=vertical up)
+function needle_arc_angle(db) {
+    var t = (Math.max(VU_MIN_DB, Math.min(VU_MAX_DB, db)) - VU_MIN_DB)
+            / (VU_MAX_DB - VU_MIN_DB);
+    return (t - 0.5) * 100.0 * Math.PI / 180.0;
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.quadraticCurveTo(x + w, y,     x + w, y + r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+}
+
+// ---- Resize canvases to match display size ----
+function resizeCanvases() {
+    var wraps = document.querySelectorAll(".meter-wrap");
+    for (var i = 0; i < wraps.length; i++) {
+        var c = wraps[i].querySelector("canvas");
+        if (!c) { continue; }
+        var rect = wraps[i].getBoundingClientRect();
+        var w = Math.max(1, Math.round(rect.width || wraps[i].clientWidth || 0));
+        var h = Math.max(1, Math.round(rect.height || wraps[i].clientHeight || 0));
+        if (c.width !== w) { c.width = w; }
+        if (c.height !== h) { c.height = h; }
+    }
+}
+
+// ---- Animation loop ----
+var lastRafTs = 0;
+var targetDbL = -70.0;
+var targetDbR = -70.0;
+
+function rafLoop(ts) {
+    var dt = lastRafTs > 0 ? Math.min((ts - lastRafTs) / 1000.0, 0.1) : 0.016;
+    lastRafTs = ts;
+
+    updateNeedle(needleL, targetDbL, dt);
+    updateNeedle(needleR, targetDbR, dt);
+
+    drawVU("vuL", needleL, "L");
+    drawVU("vuR", needleR, "R");
+
+    // Update progress bar
+    if (playing && duration > 0) {
+        elapsed = Date.now() / 1000 - startTime;
+        elapsed = Math.min(elapsed, duration);
+        var pct = (elapsed / duration) * 100;
+        var fill = document.getElementById("progressFill");
+        var cur  = document.getElementById("pbCurrent");
+        if (fill) { fill.style.width = pct + "%"; }
+        if (cur)  { cur.textContent  = fmt(elapsed); }
+    }
+
+    requestAnimationFrame(rafLoop);
+}
+
+function fmt(s) {
+    s = Math.max(0, Math.floor(s));
+    var m   = Math.floor(s / 60);
+    var sec = s % 60;
+    return m + ":" + (sec < 10 ? "0" + sec : sec);
+}
+
+function setPlayerBarIdle() {
+    var bar = document.getElementById("playerBar");
+    var art = document.getElementById("pbArt");
+    var track = document.getElementById("pbTrack");
+    var artist = document.getElementById("pbArtist");
+    var cur = document.getElementById("pbCurrent");
+    var total = document.getElementById("pbTotal");
+    var fill = document.getElementById("progressFill");
+    var badge = document.getElementById("pbBadge");
+    var dacName = document.getElementById("pbDacName");
+    var playIcon = document.getElementById("pbBtnPlay").querySelector(".material-icons");
+
+    playing = false;
+    duration = 0;
+    elapsed = 0;
+    if (bar) { bar.classList.add("is-idle"); bar.classList.remove("is-live"); }
+    if (art) { art.src = FALLBACK_ART; art.classList.remove("logoArt"); }
+    if (track) { track.textContent = "SROVA"; }
+    if (artist) { artist.textContent = "Ready"; }
+    if (cur) { cur.textContent = "0:00"; }
+    if (total) { total.textContent = "0:00"; }
+    if (fill) { fill.style.width = "0%"; fill.className = ""; }
+    if (badge) { badge.className = "hidden"; }
+    if (dacName) { dacName.className = "audioInfoBox audioInfoOff hidden"; dacName.textContent = ""; }
+    if (playIcon) { playIcon.textContent = "play_arrow"; }
+}
+
+// ---- Spectrum polling ----
+function pollSpectrum() {
+    fetch("/spectrum")
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            targetDbL = spectrumToTargetDb(d.left_rms, d.left_peak);
+            targetDbR = spectrumToTargetDb(d.right_rms, d.right_peak);
+        })
+        .catch(function() {});
+}
+
+function fetchJson(url) {
+    return fetch(url).then(function(r) { return r.json(); });
+}
+
+// ---- Session polling ----
+function pollSession() {
+    Promise.all([
+        fetchJson("/session"),
+        fetchJson("/status").catch(function() { return {}; })
+    ])
+        .then(function(payloads) {
+            var s = payloads[0] || {};
+            var status = payloads[1] || {};
+            var hasMedia = !!(s && (s.track_id || s.title || s.artist || s.cover || s.context_title || s.station_name));
+            if (!hasMedia || s.current_track_valid === false || s.playback_state === "idle") {
+                setPlayerBarIdle();
+                return;
+            }
+
+            var bar = document.getElementById("playerBar");
+            var art = document.getElementById("pbArt");
+            var track = document.getElementById("pbTrack");
+            var artist = document.getElementById("pbArtist");
+            var titleText = s.title || s.radio_title || s.station_name || "SROVA";
+            var artistText = s.artist || s.radio_artist || s.context_title || s.album || "";
+            var sourceType = String(s.playback_source_type || s.context_type || s.source_type || s.source || "").toLowerCase();
+
+            playing   = s.playing  || false;
+            duration  = s.duration || 0;
+            var liveLike = !duration || sourceType === "radio" || sourceType === "live" || !!s.is_radio;
+            if (art) {
+                var artSrc = s.cover || s.icon || s.station_icon || s.artwork_url || s.image_url || FALLBACK_ART;
+                art.src = artSrc;
+                art.classList.toggle("logoArt", liveLike || !s.cover);
+            }
+            if (track) { track.textContent = titleText; }
+            if (artist) { artist.textContent = artistText; }
+            if (bar) {
+                bar.classList.toggle("is-live", liveLike);
+                bar.classList.remove("is-idle");
+            }
+            // Always sync position from server -- VU page needs accurate position on open
+            var serverPos = s.position || 0;
+            startTime = Date.now() / 1000 - serverPos;
+            elapsed   = serverPos;
+            var cur = document.getElementById("pbCurrent");
+            if (cur) { cur.textContent = liveLike ? "0:00" : fmt(serverPos); }
+            // Total time
+            var tot = document.getElementById("pbTotal");
+            if (tot) { tot.textContent = liveLike ? "0:00" : fmt(duration); }
+
+            document.getElementById("pbBtnPlay")
+                .querySelector(".material-icons").textContent =
+                    playing ? "pause" : "play_arrow";
+
+            var sr = s.sample_rate || status.sample_rate;
+            var bd = s.bit_depth || status.bit_depth;
+            var codec = s.codec || status.codec;
+            isHires = (bd && bd >= 24) || (sr && sr > 48000);
+            var fill = document.getElementById("progressFill");
+            if (fill) {
+                fill.className = isHires ? "hires" : "";
+                fill.style.width = (!liveLike && duration) ? Math.max(0, Math.min(100, (serverPos / duration) * 100)) + "%" : "0%";
+            }
+            var badge = document.getElementById("pbBadge");
+            var dacName = document.getElementById("pbDacName");
+            var dacText = dacDisplayName(
+                s.dac_name || status.dac_name,
+                s.alsa_driver || status.alsa_driver,
+                s.alsa_device || status.alsa_device
+            );
+            if (dacName) {
+                if (dacText) {
+                    dacName.textContent = dacText.toUpperCase();
+                    dacName.className = "audioInfoBox " + (isHires ? "audioInfoHiRes" : "audioInfoCD");
+                } else {
+                    dacName.textContent = "";
+                    dacName.className = "audioInfoBox audioInfoOff hidden";
+                }
+            }
+            if (sr || bd || codec) {
+                var parts = [];
+                if (codec) { parts.push(codec); }
+                if (bd)      { parts.push(bd + "bit"); }
+                if (sr)      { parts.push((sr / 1000).toFixed(1) + "kHz"); }
+                badge.textContent = parts.join(" / ");
+                badge.className   = isHires ? "hires" : "cd";
+            } else {
+                badge.className = "hidden";
+            }
+        })
+        .catch(function() {});
+}
+
+function cmd(url) {
+    fetch(url).catch(function() {});
+    setTimeout(pollSession, 600);
+}
+
+function togglePlay() {
+    if (playing) {
+        playing = false;
+        document.getElementById("pbBtnPlay")
+            .querySelector(".material-icons").textContent = "play_arrow";
+        cmd("/tidal/pause");
+    } else {
+        playing = true;
+        document.getElementById("pbBtnPlay")
+            .querySelector(".material-icons").textContent = "pause";
+        cmd("/tidal/resume");
+    }
+}
+
+// ---- Auto-hide UI (close button) on mouse/touch idle ----
+var _uiHideTimer = null;
+function _showUI() {
+    document.body.classList.add("ui-visible");
+    if (_uiHideTimer) { clearTimeout(_uiHideTimer); }
+    _uiHideTimer = setTimeout(function() {
+        document.body.classList.remove("ui-visible");
+    }, 2500);
+}
+document.addEventListener("mousemove", _showUI);
+document.addEventListener("touchstart", _showUI);
+
+// ---- Init ----
+window.addEventListener("load", function() {
+    resizeCanvases();
+    requestAnimationFrame(resizeCanvases);
+    requestAnimationFrame(rafLoop);
+    pollSpectrum();
+    pollSession();
+    setInterval(pollSpectrum, POLL_MS);
+    setInterval(pollSession,  SESSION_MS);
+
+    // Seek on progress bar click
+    var bar = document.getElementById("progressBar");
+    if (bar) {
+        bar.addEventListener("click", function(e) {
+            if (!duration) { return; }
+            var rect    = bar.getBoundingClientRect();
+            var pct     = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+            var seekSec = Math.floor(pct * duration);
+            startTime   = Date.now() / 1000 - seekSec;
+            elapsed     = seekSec;
+            fetch("/tidal/seek/" + seekSec).catch(function() {});
+        });
+    }
+});
+
+window.addEventListener("resize", function() {
+    resizeCanvases();
+});
+// ---- Auto-hide close button ----
+var _hideCloseTmr = null;
+function _showClose() {
+    document.body.classList.add("show-close");
+    if (_hideCloseTmr) { clearTimeout(_hideCloseTmr); }
+    _hideCloseTmr = setTimeout(function() {
+        document.body.classList.remove("show-close");
+    }, 2500);
+}
+document.addEventListener("mousemove", _showClose);
+document.addEventListener("touchstart", _showClose);
+</script>
+</body>
+</html>

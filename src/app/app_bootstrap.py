@@ -1,0 +1,374 @@
+"""Application bootstrap/lifecycle methods delegated from main.py."""
+
+import logging
+import os
+import time
+
+import gi
+
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+from gi.repository import Gtk, Adw, GLib, Gdk
+
+from ui import config as ui_config
+
+logger = logging.getLogger(__name__)
+
+
+def _detect_display_scale(display) -> int:
+    """Return the primary monitor's integer scale factor (1 or 2 on most systems)."""
+    try:
+        monitors = display.get_monitors()
+        if monitors.get_n_items() > 0:
+            return max(1, monitors.get_item(0).get_scale_factor())
+    except Exception as e:
+        logger.debug("Could not read monitor scale factor: %s", e)
+    return 1
+
+
+def _get_text_scale_factor() -> float:
+    """Return the GNOME text-scaling-factor from GSettings (default 1.0).
+
+    Ubuntu and other distros sometimes set this above 1.0 (e.g. 1.25) to make
+    system fonts larger.  We use this to cancel out the distro-level scaling
+    from our own CSS font overrides so we don't double-scale.
+    """
+    try:
+        from gi.repository import Gio
+        settings = Gio.Settings.new("org.gnome.desktop.interface")
+        val = settings.get_double("text-scaling-factor")
+        return max(0.5, val)
+    except Exception as e:
+        logger.debug("Could not read text-scaling-factor: %s", e)
+    return 1.0
+
+
+def detect_app_version(self):
+    env_ver = str(os.environ.get("HIRESTI_VERSION", "")).strip()
+    if env_ver:
+        return env_ver
+    try:
+        root = os.path.dirname(os.path.abspath(__file__))
+        src_root = os.path.dirname(root)
+        ver_file = os.path.join(src_root, "version.txt")
+        if os.path.exists(ver_file):
+            with open(ver_file, "r", encoding="utf-8") as f:
+                version = str(f.read()).strip()
+                if version:
+                    return version
+        changelog = os.path.join(src_root, "CHANGELOG.md")
+        with open(changelog, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("## "):
+                    head = line[3:].strip()
+                    version = head.split(" - ", 1)[0].strip()
+                    if version:
+                        return version
+                    break
+    except Exception:
+        pass
+    return "dev"
+
+
+def _configure_icon_theme(display):
+    icon_theme = Gtk.IconTheme.get_for_display(display)
+    app_root = os.path.dirname(os.path.dirname(__file__))
+    project_root = os.path.dirname(app_root)
+    search_paths = [
+        os.path.join(app_root, "icons"),
+        os.path.join(project_root, "icons"),
+    ]
+    existing_paths = []
+    try:
+        existing_paths = list(icon_theme.get_search_path() or [])
+    except Exception as e:
+        logger.debug("Could not read GTK icon theme search path: %s", e)
+    preferred = []
+    final_paths = []
+    seen = set()
+    for path in search_paths + existing_paths:
+        norm = os.path.abspath(path)
+        if norm in seen:
+            continue
+        if not os.path.isdir(norm):
+            continue
+        final_paths.append(norm)
+        seen.add(norm)
+        if path in search_paths:
+            preferred.append(norm)
+    if preferred:
+        # Prefer bundled icons over distro theme variants so app-specific
+        # symbolic artwork stays consistent across environments.
+        icon_theme.set_search_path(final_paths)
+        logger.info("Preferring bundled GTK icon theme search paths: %s", ", ".join(preferred))
+    else:
+        logger.warning("No bundled GTK icon theme search path found.")
+    return icon_theme
+
+
+def do_shutdown(self):
+    logger.info("Shutting down application...")
+    if hasattr(self, "_stop_remote_api"):
+        self._stop_remote_api(show_notice=False)
+    self._stop_mpris_service()
+    self._stop_tray_icon()
+    self.settings["search_history"] = list(self.search_history)[:10]
+    pending = getattr(self, "_settings_save_source", 0)
+    if pending:
+        GLib.source_remove(pending)
+        self._settings_save_source = 0
+    pulse = getattr(self, "_playing_pulse_source", 0)
+    if pulse:
+        GLib.source_remove(pulse)
+        self._playing_pulse_source = 0
+    ui_loop = getattr(self, "_ui_loop_source", 0)
+    if ui_loop:
+        GLib.source_remove(ui_loop)
+        self._ui_loop_source = 0
+    output_status = getattr(self, "_output_status_source", 0)
+    if output_status:
+        GLib.source_remove(output_status)
+        self._output_status_source = 0
+    seek_commit = getattr(self, "_seek_commit_source", 0)
+    if seek_commit:
+        GLib.source_remove(seek_commit)
+        self._seek_commit_source = 0
+    self.save_settings()
+    if self.player is not None:
+        self.player.cleanup()
+    # Call explicit parent vfunc to avoid introspection edge-cases when
+    # shutting down from headless/error paths.
+    Adw.Application.do_shutdown(self)
+
+
+def _restore_runtime_state(self):
+    saved_volume = self.settings.get("volume", 80)
+    if hasattr(self, "_sync_volume_ui_state"):
+        self._sync_volume_ui_state(value=saved_volume)
+    elif self.vol_scale is not None:
+        self.vol_scale.set_value(saved_volume)
+    if self.player is not None:
+        self.player.set_volume(saved_volume / 100.0)
+
+    mode_icon = self.MODE_ICONS.get(self.play_mode, "hiresti-mode-loop-symbolic")
+    mode_tip = self.MODE_TOOLTIPS.get(self.play_mode, "Loop All (Album/Playlist)")
+    for btn in (getattr(self, "mode_btn", None), getattr(self, "now_playing_mode_btn", None)):
+        if btn is not None:
+            btn.set_icon_name(mode_icon)
+            btn.set_tooltip_text(mode_tip)
+    if hasattr(self, "_sync_playback_status_icon"):
+        self._sync_playback_status_icon()
+
+    if self.paned is not None and self.win is not None:
+        sidebar_px = int(max(120, self.win.get_width() * float(ui_config.SIDEBAR_RATIO)))
+        self.paned.set_position(sidebar_px)
+
+    self._apply_viz_bars_by_count(self.settings.get("viz_bar_count", 32), update_dropdown=True)
+    self._apply_viz_frequency_scale_by_index(self.settings.get("viz_frequency_scale", 0), update_dropdown=True)
+    self._apply_viz_profile_by_index(self.settings.get("viz_profile", 1), update_dropdown=True)
+    self._apply_viz_effect_by_index(self.settings.get("viz_effect", 3), update_dropdown=True)
+    self._apply_spectrum_theme_by_index(self.settings.get("spectrum_theme", 0), update_dropdown=True)
+    self._apply_lyrics_font_preset_by_index(self.settings.get("lyrics_font_preset", 1), update_dropdown=True)
+    self._apply_lyrics_motion_by_index(self.settings.get("lyrics_bg_motion", 1), update_dropdown=True)
+    self._apply_lyrics_offset_ms(self.settings.get("lyrics_user_offset_ms", 0))
+
+
+def _run_post_activate_tasks(app):
+    # Run non-critical startup work after first frame to improve perceived launch speed.
+    app._start_mpris_service()
+    if hasattr(app, "_start_remote_api_if_enabled"):
+        app._start_remote_api_if_enabled()
+    app._restore_session_async()
+    app._schedule_update_ui_loop(40)
+    app._schedule_output_status_loop(1000)
+    GLib.timeout_add(80, app._start_spectrum_stream_prewarm)
+    GLib.timeout_add(220, lambda: (app._init_tray_icon(), False)[1])
+    GLib.timeout_add(0, app._ensure_overlay_handles_visible)
+    return False
+
+
+def do_activate(self):
+    activate_t0 = time.monotonic()
+
+    def _startup_mark(stage):
+        logger.info(
+            "STARTUP TIMING %s +%.1fms",
+            str(stage),
+            (time.monotonic() - activate_t0) * 1000.0,
+        )
+
+    if self.window_created:
+        self.win.present()
+        return
+
+    display = Gdk.Display.get_default()
+    if display is None:
+        logger.error("No graphical display detected; cannot start GTK UI.")
+        self.quit()
+        return
+
+    src_dir = os.path.dirname(os.path.dirname(__file__))
+    _configure_icon_theme(display)
+    _startup_mark("icon-theme")
+
+    provider = Gtk.CssProvider()
+    logo_png = os.path.join(src_dir, "icons", "hicolor", "512x512", "apps", "hiresti.png")
+    css_data = ui_config.CSS_DATA.replace("__HIRESTI_LOGO_SVG__", logo_png.replace("\\", "/"))
+    provider.load_from_data(css_data.encode())
+    Gtk.StyleContext.add_provider_for_display(display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    _startup_mark("css-loaded")
+
+    # Detect display scale factor and apply DPI-adaptive sizes before building UI.
+    _display_scale = _detect_display_scale(display)
+    import utils.helpers as _helpers
+    _helpers.set_ui_scale(_display_scale)
+    _text_scale = _get_text_scale_factor()
+    # GTK4/Adwaita already handles cross-DPI rendering correctly via logical
+    # pixels — no manual font scaling needed for integer scale factors.
+    # Only apply an override when the user has explicitly set a text-scaling-
+    # factor above 1.0 (accessibility preference), in which case we honour it
+    # by scaling our custom CSS classes to match.
+    _font_scale = _text_scale if _text_scale > 1.05 else 1.0
+    _override_css = ui_config.get_scale_css_overrides(_font_scale)
+    if _override_css:
+        _scale_provider = Gtk.CssProvider()
+        _scale_provider.load_from_data(_override_css.encode())
+        Gtk.StyleContext.add_provider_for_display(
+            display, _scale_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1
+        )
+    logger.info("Display scale=%d, text-scaling-factor=%.2f → font_scale=%.2f, COVER_SIZE=%d",
+                _display_scale, _text_scale, _font_scale, _helpers.COVER_SIZE)
+    _startup_mark("display-scale")
+
+    self.win = Adw.ApplicationWindow(
+        application=self,
+        title="SROVA Desktop",
+        default_width=ui_config.WINDOW_WIDTH,
+        default_height=ui_config.WINDOW_HEIGHT,
+    )
+    self.window_created = True
+    self.win.connect("close-request", self.on_window_close_request)
+
+    self.main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    self.win.set_content(self.main_vbox)
+
+    self._build_header(self.main_vbox)
+    self.content_window_handle = Gtk.WindowHandle()
+    self.content_window_handle.set_hexpand(True)
+    self.content_window_handle.set_vexpand(True)
+    self.main_vbox.append(self.content_window_handle)
+    self.content_overlay = Gtk.Overlay()
+    self.content_overlay.set_hexpand(True)
+    self.content_overlay.set_vexpand(True)
+    self.content_window_handle.set_child(self.content_overlay)
+    self.content_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    self.content_vbox.set_hexpand(True)
+    self.content_vbox.set_vexpand(True)
+    self.content_overlay.set_child(self.content_vbox)
+    self._build_body(self.content_vbox)
+    _startup_mark("build-body")
+    self._build_player_bar(self.content_vbox)
+    _startup_mark("build-player-bar")
+    if hasattr(self, "_build_now_playing_overlay"):
+        self._build_now_playing_overlay()
+        _startup_mark("build-now-playing-overlay")
+    self._setup_theme_watch()
+    _startup_mark("theme-watch")
+    self._restore_runtime_state()
+    _startup_mark("restore-runtime-state")
+    self._set_login_view_pending()
+    _startup_mark("login-view-pending")
+
+
+    is_bp = self.settings.get("bit_perfect", False)
+    is_ex = self.settings.get("exclusive_lock", False)
+
+
+    if is_bp:
+        if self.bp_label is not None:
+            self.bp_label.set_visible(True)
+        self._lock_volume_controls(True)
+    self.player.toggle_bit_perfect(is_bp, exclusive_lock=is_ex)
+    _startup_mark("bit-perfect")
+
+
+    saved_rt_profile = self.settings.get(
+        "alsa_mmap_realtime_priority",
+        self.ALSA_MMAP_REALTIME_PRIORITY_DEFAULT,
+    )
+    if saved_rt_profile not in self.ALSA_MMAP_REALTIME_PRIORITY_MAP:
+        saved_rt_profile = self.ALSA_MMAP_REALTIME_PRIORITY_DEFAULT
+    self.player.set_alsa_mmap_realtime_priority(
+        self.ALSA_MMAP_REALTIME_PRIORITY_MAP[saved_rt_profile]
+    )
+    _startup_mark("alsa-mmap-priority")
+
+
+    saved_profile = self.settings.get("latency_profile", "Standard (100ms)")
+    if saved_profile in self.LATENCY_MAP:
+        buf_ms, lat_ms = self.LATENCY_MAP[saved_profile]
+        self.player.set_alsa_latency(buf_ms, lat_ms)
+    _startup_mark("alsa-latency")
+
+
+    from actions.audio_settings_actions import USB_CLOCK_DEFAULT, _USB_CLOCK_MODE_MAP
+    saved_usb_clock = self.settings.get("usb_clock_mode", USB_CLOCK_DEFAULT)
+    if saved_usb_clock not in _USB_CLOCK_MODE_MAP:
+        saved_usb_clock = USB_CLOCK_DEFAULT
+    if hasattr(self.player, "set_usb_clock_mode"):
+        self.player.set_usb_clock_mode(_USB_CLOCK_MODE_MAP[saved_usb_clock])
+    _startup_mark("usb-clock-mode")
+
+
+    drivers = self.player.get_drivers()
+    saved_drv = self.settings.get("driver", "Auto (Default)")
+    if saved_drv == "ALSA":
+        saved_drv = "ALSA（auto）"
+    elif saved_drv == "ALSA (auto)":
+        saved_drv = "ALSA（auto）"
+    elif saved_drv == "ALSA (mmap)":
+        saved_drv = "ALSA（mmap）"
+    if is_ex:
+        drivers = [drv for drv in drivers if drv in ("ALSA（auto）", "ALSA（mmap）")]
+
+
+    if saved_drv in drivers:
+        try:
+            idx = drivers.index(saved_drv)
+            self.driver_dd.set_selected(idx)
+        except Exception as e:
+            logger.warning("Failed to restore saved driver selection '%s': %s", saved_drv, e)
+    _startup_mark("driver-selection-restored")
+
+    # Defer heavy output initialization until after first frame is presented.
+    GLib.idle_add(lambda: (self.on_driver_changed(self.driver_dd, None), False)[1])
+    _startup_mark("driver-init-scheduled")
+
+    if is_ex:
+        self._refresh_driver_dropdown_options(saved_drv, exclusive_enabled=True)
+
+    key_controller = Gtk.EventControllerKey()
+    key_controller.connect("key-pressed", self.on_key_pressed)
+    self.win.add_controller(key_controller)
+    _startup_mark("key-controller")
+
+    self.win.present()
+    _startup_mark("win-present")
+    GLib.idle_add(_run_post_activate_tasks, self)
+    GLib.idle_add(self._clear_initial_search_focus)
+    GLib.timeout_add(120, self._clear_initial_search_focus)
+    self.win.connect("notify::default-width", self.update_layout_proportions)
+    self.win.connect("notify::default-height", self.update_layout_proportions)
+    # Fullscreen/restore can finish allocation a bit later; listen and re-align.
+    for prop in ("fullscreened", "maximized"):
+        try:
+            self.win.connect(f"notify::{prop}", self.update_layout_proportions)
+        except Exception:
+            pass
+    if getattr(self, "body_overlay", None) is not None:
+        self.body_overlay.connect("notify::width", self.update_layout_proportions)
+        self.body_overlay.connect("notify::height", self.update_layout_proportions)
+    self.paned.connect("notify::position", self.on_paned_position_changed)
+    GLib.idle_add(lambda: (self._schedule_viz_handle_realign(animate=False), False)[1])
+    _startup_mark("activate-done")

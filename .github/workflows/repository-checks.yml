@@ -1,0 +1,65 @@
+name: Repository checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  syntax-and-safety:
+    name: Syntax and safety
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check Python syntax
+        run: python -m compileall -q src tests
+
+      - name: Check shell syntax
+        shell: bash
+        run: |
+          while IFS= read -r -d '' file; do
+            echo "Checking $file"
+            bash -n "$file"
+          done < <(git ls-files -z "*.sh")
+
+      - name: Validate issue-form YAML
+        run: |
+          python -m pip install --disable-pip-version-check PyYAML==6.0.2
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          for path in sorted(Path(".github/ISSUE_TEMPLATE").glob("*.yml")):
+              with path.open("r", encoding="utf-8") as handle:
+                  yaml.safe_load(handle)
+              print(f"Valid YAML: {path}")
+          PY
+
+      - name: Reject generated and temporary files
+        shell: bash
+        run: |
+          bad_files="$(
+            git ls-files |
+              grep -Ei '(^|/)(dist|target|__pycache__|srcOLD|old_dist[^/]*)/|\.py[co]$|\.log$|\.deb$|\.rpm$|\.sqlite3?$|\.db$|\.bak(_|$)|redzone|crdownload|unconfirmed' ||
+              true
+          )"
+
+          if [[ -n "$bad_files" ]]; then
+            echo "Forbidden tracked files found:"
+            echo "$bad_files"
+            exit 1
+          fi
+
+          echo "No generated or temporary files are tracked."

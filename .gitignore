@@ -1,0 +1,76 @@
+# Python caches and test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Rust build output and vendored dependencies
+**/target/
+**/vendor/
+
+# Generated packages and build trees
+build*/
+dist/
+*.deb
+*.rpm
+*.flatpak
+*.AppImage
+
+# Compiled libraries
+*.so
+
+# Runtime state and user data
+.env
+.env.*
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.token
+*.pem
+*.key
+*.p12
+.secrets/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Backups and historical working copies
+*.bak
+*.bak_*
+*_backup_*/
+*backup*/
+old_dist*/
+srcOLD/
+
+# Local editor and assistant configuration
+.vscode/
+.idea/
+.claude/
+.codex/
+.agents/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Browser partial downloads and dated working copies
+*.crdownload*
+.xdp-*
+src/ui_web/index[0-9][0-9][0-9][0-9][0-9][0-9].html
+src/ui_web/srova[0-9][0-9][0-9][0-9][0-9][0-9].css
+*.redzone_*

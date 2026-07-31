@@ -1,0 +1,65 @@
+name: Feature request
+description: Suggest a focused improvement for SROVA
+title: "[Feature]: "
+labels:
+  - enhancement
+  - needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the listening or usability problem first, then the proposed solution.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or need
+      description: What limitation or workflow problem would this address?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed improvement
+      description: Describe the smallest useful version of the feature.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Local Music
+        - Network Music
+        - TIDAL
+        - Internet Radio
+        - Play Queue
+        - Browser interface
+        - Audio output
+        - Packaging or installation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Stability or audio-quality considerations
+      description: Note any possible effect on bit-perfect playback, resource usage, platform compatibility, or existing workflows.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues for a similar request.
+          required: true
+        - label: This request does not include credentials or private data.
+          required: true

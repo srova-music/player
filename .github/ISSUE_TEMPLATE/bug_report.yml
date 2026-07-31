@@ -1,0 +1,95 @@
+name: Bug report
+description: Report a reproducible problem in SROVA
+title: "[Bug]: "
+labels:
+  - bug
+  - needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a SROVA problem. Do not include passwords, API keys, OAuth tokens, private library paths, or other credentials.
+
+  - type: input
+    id: version
+    attributes:
+      label: SROVA version
+      placeholder: "Example: 1.0.0 / 1.0-1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - AMD64 PC or NUC
+        - Raspberry Pi 5 ARM64
+        - Raspberry Pi 4 ARM64
+        - Other ARM64
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: source
+    attributes:
+      label: Playback source
+      options:
+        - Local Music
+        - Network Music
+        - TIDAL
+        - Internet Radio
+        - Player or browser interface
+        - Packaging or installation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe what happened.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open...
+        2. Select...
+        3. Observe...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Relevant environment
+      description: Include OS, browser, DAC, audio output mode, and network setup where relevant.
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs or screenshots
+      description: Remove credentials, tokens, personal paths, public IP addresses, and private data before attaching anything.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I removed credentials and private data from this report.
+          required: true
+        - label: I searched existing issues for the same problem.
+          required: true

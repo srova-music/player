@@ -1,0 +1,576 @@
+#!/usr/bin/python3
+"""Root-only SROVA Network Music mount helper."""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
+MANAGED_BASE = Path("/mnt/srova-network")
+CONFIG_DIR = Path("/etc/srova")
+CONFIG_FILE = CONFIG_DIR / "network-mounts.json"
+CREDENTIAL_DIR = CONFIG_DIR / "network-credentials"
+LOCK_FILE = Path("/run/srova-network-mount.lock")
+LOCK_TIMEOUT = 5.0
+LOCK_POLL_INTERVAL = 0.05
+SCHEMA_VERSION = 1
+MAX_MANAGED_MOUNTS = 32
+SERVICE_USER = "srova"
+RESTORE_RETRIES = 2
+COMMAND_TIMEOUT = 10
+
+NFS_OPTIONS = ("ro", "nosuid", "nodev", "noexec", "soft", "timeo=20", "retrans=1", "_netdev")
+SMB_BASE_OPTIONS = ("ro", "nosuid", "nodev", "noexec", "vers=3.0", "file_mode=0444", "dir_mode=0555", "_netdev")
+MANAGED_ID_RE = re.compile(r"^(nfs|smb)-[0-9a-f]{12}$")
+DNS_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
+class HelperError(Exception):
+    pass
+
+
+def validate_text(value: Any, field: str, max_len: int, required: bool = True) -> str:
+    text = str(value or "")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        raise HelperError(f"{field} contains control characters")
+    text = text.strip()
+    if required and not text:
+        raise HelperError(f"{field} is required")
+    if len(text) > max_len:
+        raise HelperError(f"{field} is too long")
+    return text
+
+
+def reject_injection(value: Any, field: str, max_len: int) -> str:
+    text = validate_text(value, field, max_len)
+    if ".." in text or "," in text or any(ch in text for ch in ";&|`$<>"):
+        raise HelperError(f"{field} contains unsafe characters")
+    return text
+
+
+def validate_host(value: Any) -> str:
+    host = reject_injection(value, "host", 253)
+    if host.startswith("-") or any(ch.isspace() for ch in host):
+        raise HelperError("host is invalid")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        if all(ch.isdigit() or ch == "." for ch in host):
+            raise HelperError("host IP address is malformed")
+        if not host or not all(DNS_LABEL_RE.fullmatch(label) for label in host.split(".")):
+            raise HelperError("host is invalid")
+        return host
+    if isinstance(ip, ipaddress.IPv6Address):
+        raise HelperError("IPv6 hosts are not supported for Network Music mounts")
+    return str(ip)
+
+
+def validate_protocol(value: Any) -> str:
+    proto = validate_text(value, "protocol", 3).lower()
+    if proto not in ("nfs", "smb"):
+        raise HelperError("protocol must be nfs or smb")
+    return proto
+
+
+def validate_nfs_export(value: Any) -> str:
+    export = reject_injection(value, "export", 1024)
+    if not export.startswith("/") or "//" in export:
+        raise HelperError("NFS export must be a well-formed absolute path")
+    return export
+
+
+def validate_smb_share(value: Any) -> str:
+    share = reject_injection(value, "share", 255)
+    if "/" in share or "\\" in share or share in (".", "..") or share.endswith("$"):
+        raise HelperError("SMB share is not allowed")
+    return share
+
+
+def validate_username(value: Any, required: bool = False) -> str:
+    return validate_text(value, "username", 255, required=required)
+
+
+def validate_password(value: Any) -> str:
+    text = "" if value is None else str(value)
+    if len(text) > 1024:
+        raise HelperError("password is too long")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        raise HelperError("password contains control characters")
+    return text
+
+
+def validate_domain(value: Any) -> str:
+    return validate_text(value, "domain", 255, required=False)
+
+
+def validate_managed_id(value: Any) -> str:
+    mid = validate_text(value, "mount id", 16)
+    if not MANAGED_ID_RE.fullmatch(mid):
+        raise HelperError("mount id is invalid")
+    return mid
+
+
+def service_ids() -> tuple[int, int]:
+    try:
+        entry = pwd.getpwnam(SERVICE_USER)
+    except KeyError as exc:
+        raise HelperError("srova service user does not exist") from exc
+    return int(entry.pw_uid), int(entry.pw_gid)
+
+
+def source_for(defn: Dict[str, Any]) -> str:
+    proto = validate_protocol(defn.get("protocol"))
+    host = validate_host(defn.get("host"))
+    if proto == "nfs":
+        return f"{host}:{validate_nfs_export(defn.get('export'))}"
+    return f"//{host}/{validate_smb_share(defn.get('share'))}"
+
+
+def mount_id(defn: Dict[str, Any]) -> str:
+    proto = validate_protocol(defn.get("protocol"))
+    digest = hashlib.sha256(f"{proto}\0{source_for(defn)}".encode()).hexdigest()[:12]
+    return f"{proto}-{digest}"
+
+
+def validate_definition(defn: Any) -> Dict[str, Any]:
+    if not isinstance(defn, dict):
+        raise HelperError("managed mount definition is invalid")
+    proto = validate_protocol(defn.get("protocol"))
+    clean: Dict[str, Any] = {"protocol": proto, "host": validate_host(defn.get("host"))}
+    if proto == "nfs":
+        clean["export"] = validate_nfs_export(defn.get("export"))
+    else:
+        clean["share"] = validate_smb_share(defn.get("share"))
+        auth = str(defn.get("auth") or "guest")
+        if auth not in ("guest", "credentials"):
+            raise HelperError("managed SMB authentication mode is unsupported")
+        clean["auth"] = auth
+    expected_id = mount_id(clean)
+    if defn.get("id") is not None and validate_managed_id(defn.get("id")) != expected_id:
+        raise HelperError("managed mount id does not match its source")
+    clean["id"] = expected_id
+    return clean
+
+
+def mount_path(defn: Dict[str, Any]) -> Path:
+    target = MANAGED_BASE / mount_id(defn)
+    base = MANAGED_BASE.resolve(strict=False)
+    resolved = target.resolve(strict=False)
+    if os.path.commonpath([str(base), str(resolved)]) != str(base):
+        raise HelperError("managed target escaped mount base")
+    return target
+
+
+def ensure_dirs() -> None:
+    CONFIG_DIR.mkdir(mode=0o755, exist_ok=True)
+    CREDENTIAL_DIR.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(CREDENTIAL_DIR, 0o700)
+    MANAGED_BASE.mkdir(mode=0o755, exist_ok=True)
+
+
+def read_stdin_json() -> Dict[str, Any]:
+    raw = sys.stdin.read(1024 * 32)
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise HelperError("JSON input is malformed") from exc
+    if not isinstance(data, dict):
+        raise HelperError("JSON input must be an object")
+    if any(key in data for key in ("target", "mount_path", "options", "mount_options")):
+        raise HelperError("caller-supplied mount targets or options are not accepted")
+    return data
+
+
+def run(argv: List[str], timeout: int = COMMAND_TIMEOUT) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          timeout=timeout, shell=False, check=False)
+
+
+def load_config() -> Dict[str, Any]:
+    try:
+        with CONFIG_FILE.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {"version": SCHEMA_VERSION, "mounts": []}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HelperError(f"managed mount configuration is unreadable or malformed: {exc}") from exc
+    if not isinstance(data, dict) or data.get("version") != SCHEMA_VERSION or not isinstance(data.get("mounts"), list):
+        raise HelperError("managed mount configuration has an unsupported schema")
+    if len(data["mounts"]) > MAX_MANAGED_MOUNTS:
+        raise HelperError("managed mount configuration exceeds the supported limit")
+    mounts = [validate_definition(item) for item in data["mounts"]]
+    if len({item["id"] for item in mounts}) != len(mounts):
+        raise HelperError("managed mount configuration contains duplicate ids")
+    return {"version": SCHEMA_VERSION, "mounts": mounts}
+
+
+def atomic_write_config(data: Dict[str, Any]) -> None:
+    mounts = data.get("mounts") if isinstance(data, dict) else None
+    if not isinstance(mounts, list) or len(mounts) > MAX_MANAGED_MOUNTS:
+        raise HelperError("managed mount limit exceeded")
+    validated = {"version": SCHEMA_VERSION, "mounts": [validate_definition(item) for item in mounts]}
+    ensure_dirs()
+    fd, tmp = tempfile.mkstemp(prefix="network-mounts.", dir=str(CONFIG_DIR), text=True)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(validated, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, CONFIG_FILE)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def credential_path(mid: str) -> Path:
+    return CREDENTIAL_DIR / f"{validate_managed_id(mid)}.cred"
+
+
+def create_temporary_credentials(mid: str, username: Any, password: Any, domain: Any = "") -> Path:
+    user = validate_username(username, required=True)
+    secret = validate_password(password)
+    dom = validate_domain(domain)
+    ensure_dirs()
+    fd, name = tempfile.mkstemp(prefix=f".{validate_managed_id(mid)}.", suffix=".tmp", dir=str(CREDENTIAL_DIR), text=True)
+    path = Path(name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(f"username={user}\npassword={secret}\n")
+            if dom:
+                fh.write(f"domain={dom}\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    return path
+
+
+def remove_credentials(mid: str) -> None:
+    credential_path(mid).unlink(missing_ok=True)
+
+
+def findmnt(target: Path) -> Optional[Dict[str, Any]]:
+    proc = run(["findmnt", "-J", "--mountpoint", str(target)], timeout=4)
+    if proc.returncode != 0:
+        return None
+    try:
+        filesystems = json.loads(proc.stdout or "{}").get("filesystems") or []
+    except (AttributeError, json.JSONDecodeError):
+        return None
+    requested = os.path.normpath(str(target))
+    for fs in filesystems:
+        if isinstance(fs, dict) and os.path.normpath(str(fs.get("target") or "")) == requested:
+            return fs
+    return None
+
+
+def mounted_ok(defn: Dict[str, Any]) -> bool:
+    target = mount_path(defn)
+    fs = findmnt(target)
+    if not fs:
+        return False
+    if os.path.normpath(str(fs.get("target") or "")) != os.path.normpath(str(target)):
+        return False
+    proto = validate_protocol(defn.get("protocol"))
+    fstype = str(fs.get("fstype") or "").lower()
+    options = set(str(fs.get("options") or "").split(","))
+    if proto == "nfs" and fstype not in ("nfs", "nfs4"):
+        return False
+    if proto == "smb" and fstype != "cifs":
+        return False
+    if str(fs.get("source") or "") != source_for(defn) or "ro" not in options:
+        return False
+    uid, gid = service_ids()
+    return _user_can_search(target, uid, gid)
+
+
+def _user_can_search(path: Path, uid: int, gid: int) -> bool:
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return False
+    if stat_result.st_uid == uid:
+        return (stat_result.st_mode & 0o500) == 0o500
+    if stat_result.st_gid == gid:
+        return (stat_result.st_mode & 0o050) == 0o050
+    return (stat_result.st_mode & 0o005) == 0o005
+
+
+def _remove_empty_mount_dir(target: Path) -> None:
+    try:
+        target.rmdir()
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def unmount_target(target: Path) -> bool:
+    fs = findmnt(target)
+    if fs is None or os.path.normpath(str(fs.get("target") or "")) != os.path.normpath(str(target)):
+        return False
+    proc = run(["umount", str(target)], timeout=8)
+    if proc.returncode != 0:
+        raise HelperError((proc.stderr or proc.stdout or "unmount failed").strip())
+    if findmnt(target) is not None:
+        raise HelperError("unmount verification failed")
+    return True
+
+
+def payload_for(defn: Dict[str, Any], mounted: Optional[bool] = None,
+                created_mount: Optional[bool] = None) -> Dict[str, Any]:
+    clean = validate_definition(defn)
+    payload = {"ok": True, "id": clean["id"], "protocol": clean["protocol"],
+               "source": source_for(clean), "mount_path": str(mount_path(clean)),
+               "mounted": mounted_ok(clean) if mounted is None else bool(mounted), "read_only": True}
+    if created_mount is not None:
+        payload["created_mount"] = bool(created_mount)
+    return payload
+
+
+def mount_defn(defn: Dict[str, Any], persist: bool = True) -> Dict[str, Any]:
+    proto = validate_protocol(defn.get("protocol"))
+    host = validate_host(defn.get("host"))
+    clean: Dict[str, Any] = {"protocol": proto, "host": host}
+    if proto == "nfs":
+        clean["export"] = validate_nfs_export(defn.get("export"))
+    else:
+        clean["share"] = validate_smb_share(defn.get("share"))
+    clean["id"] = mount_id(clean)
+    mid = clean["id"]
+    target = mount_path(clean)
+    target_existed = target.exists()
+    created_mount = False
+    temp_credential: Optional[Path] = None
+    credential_backup: Optional[Path] = None
+    credential_promoted = False
+    persistent_credential = credential_path(mid)
+
+    ensure_dirs()
+    target.mkdir(mode=0o755, exist_ok=True)
+    uid, gid = service_ids()
+    exact_before = findmnt(target)
+    if exact_before is not None and not mounted_ok(clean):
+        raise HelperError("managed mount path is occupied by an unexpected filesystem")
+
+    try:
+        if proto == "nfs":
+            argv = ["mount", "-t", "nfs", "-o", ",".join(NFS_OPTIONS), source_for(clean), str(target)]
+        else:
+            username = validate_username(defn.get("username"), required=False)
+            password = validate_password(defn.get("password"))
+            domain = validate_domain(defn.get("domain"))
+            opts = list(SMB_BASE_OPTIONS) + [f"uid={uid}", f"gid={gid}"]
+            if username:
+                temp_credential = create_temporary_credentials(mid, username, password, domain)
+                opts.append(f"credentials={temp_credential}")
+                clean["auth"] = "credentials"
+            elif defn.get("auth") == "credentials":
+                if not persistent_credential.is_file():
+                    raise HelperError("saved SMB credentials are missing")
+                opts.append(f"credentials={persistent_credential}")
+                clean["auth"] = "credentials"
+            else:
+                opts.append("guest")
+                clean["auth"] = "guest"
+            argv = ["mount", "-t", "cifs", "-o", ",".join(opts), source_for(clean), str(target)]
+
+        if exact_before is None:
+            try:
+                proc = run(argv)
+            except Exception:
+                created_mount = findmnt(target) is not None
+                raise
+            exact_after = findmnt(target)
+            created_mount = exact_after is not None
+            if proc.returncode != 0:
+                raise HelperError((proc.stderr or proc.stdout or "mount failed").strip())
+        if not mounted_ok(clean):
+            raise HelperError("mount verification failed")
+
+        if temp_credential is not None:
+            if persistent_credential.exists():
+                fd, backup_name = tempfile.mkstemp(prefix=f".{mid}.", suffix=".backup", dir=str(CREDENTIAL_DIR))
+                os.close(fd)
+                credential_backup = Path(backup_name)
+                shutil.copy2(persistent_credential, credential_backup)
+                os.chmod(credential_backup, 0o600)
+            os.replace(temp_credential, persistent_credential)
+            credential_promoted = True
+            temp_credential = None
+            os.chmod(persistent_credential, 0o600)
+
+        if persist:
+            config = load_config()
+            mounts = [item for item in config["mounts"] if item["id"] != mid]
+            if len(mounts) >= MAX_MANAGED_MOUNTS:
+                raise HelperError(f"no more than {MAX_MANAGED_MOUNTS} managed mounts are supported")
+            mounts.append(clean)
+            atomic_write_config({"version": SCHEMA_VERSION, "mounts": mounts})
+
+        if credential_backup is not None:
+            try:
+                credential_backup.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return payload_for(clean, mounted=True, created_mount=created_mount)
+    except Exception as original_error:
+        rollback_error = None
+        if created_mount:
+            try:
+                unmount_target(target)
+            except Exception as exc:
+                rollback_error = exc
+        if credential_promoted:
+            if credential_backup is not None and credential_backup.exists():
+                os.replace(credential_backup, persistent_credential)
+                credential_backup = None
+            else:
+                persistent_credential.unlink(missing_ok=True)
+            credential_promoted = False
+        if temp_credential is not None:
+            temp_credential.unlink(missing_ok=True)
+        if credential_backup is not None and not credential_promoted:
+            credential_backup.unlink(missing_ok=True)
+        if not target_existed and findmnt(target) is None:
+            _remove_empty_mount_dir(target)
+        if rollback_error is not None:
+            raise HelperError(f"{original_error}; rollback unmount failed: {rollback_error}") from original_error
+        raise
+
+
+def action_connect(data: Dict[str, Any]) -> Dict[str, Any]:
+    return mount_defn(data, persist=True)
+
+
+def action_disconnect(data: Dict[str, Any]) -> Dict[str, Any]:
+    mid = validate_managed_id(data.get("id"))
+    config = load_config()
+    target_defn = next((item for item in config["mounts"] if item["id"] == mid), None)
+    if target_defn is None:
+        raise HelperError("managed mount not found")
+    target = mount_path(target_defn)
+    unmount_target(target)
+    mounts = [item for item in config["mounts"] if item["id"] != mid]
+    atomic_write_config({"version": SCHEMA_VERSION, "mounts": mounts})
+    remove_credentials(mid)
+    if findmnt(target) is None:
+        _remove_empty_mount_dir(target)
+    return {"ok": True, "id": mid, "mount_path": str(target), "mounted": False}
+
+
+def action_list(data: Dict[str, Any]) -> Dict[str, Any]:
+    return {"ok": True, "mounts": [payload_for(item) for item in load_config()["mounts"]]}
+
+
+def action_restore(data: Dict[str, Any]) -> Dict[str, Any]:
+    restored, failed = [], []
+    for item in load_config()["mounts"]:
+        if mounted_ok(item):
+            restored.append(payload_for(item, mounted=True))
+            continue
+        last_error = ""
+        for attempt in range(RESTORE_RETRIES):
+            try:
+                restored.append(mount_defn(item, persist=False))
+                break
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt + 1 < RESTORE_RETRIES:
+                    time.sleep(1)
+        else:
+            failed.append({"id": item["id"], "source": source_for(item), "error": last_error[:300]})
+    return {"ok": True, "restored": restored, "failed": failed}
+
+
+def action_unmount_all(data: Dict[str, Any]) -> Dict[str, Any]:
+    unmounted, failed = [], []
+    for item in load_config()["mounts"]:
+        target = mount_path(item)
+        try:
+            if unmount_target(target):
+                unmounted.append(str(target))
+        except Exception as exc:
+            failed.append({"id": item["id"], "mount_path": str(target), "error": str(exc)[:300]})
+    return {"ok": not failed, "unmounted": unmounted, "failed": failed}
+
+
+ACTIONS = {"connect": action_connect, "disconnect": action_disconnect, "list": action_list,
+           "restore": action_restore, "unmount-all": action_unmount_all}
+
+
+@contextmanager
+def operation_lock(timeout: float = LOCK_TIMEOUT):
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(str(LOCK_FILE), flags, 0o600)
+    except OSError as exc:
+        raise HelperError("Network mount lock file could not be opened safely") from exc
+    deadline = time.monotonic() + max(0.0, timeout)
+    try:
+        lock_stat = os.fstat(fd)
+        if not stat.S_ISREG(lock_stat.st_mode):
+            raise HelperError("Network mount lock file is not a regular file")
+        if os.geteuid() == 0 and lock_stat.st_uid != 0:
+            raise HelperError("Network mount lock file is not root-owned")
+        os.fchmod(fd, 0o600)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise HelperError("Network mount helper is busy; try again shortly")
+                time.sleep(LOCK_POLL_INTERVAL)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def main(argv: List[str]) -> int:
+    if len(argv) != 2 or argv[1] not in ACTIONS:
+        print(json.dumps({"ok": False, "error": "invalid action"}))
+        return 2
+    data: Dict[str, Any] = {}
+    try:
+        data = read_stdin_json()
+        with operation_lock():
+            result = ACTIONS[argv[1]](data)
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result.get("ok", True) else 1
+    except Exception as exc:
+        message = str(exc)
+        password = str(data.get("password") or "")
+        if password:
+            message = message.replace(password, "[redacted]")
+        print(json.dumps({"ok": False, "error": message[:500]}))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

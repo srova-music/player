@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.srova.player</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>SROVA</name>
+  <summary>Headless audiophile player with bit-perfect output support</summary>
+  <icon type="stock">srova</icon>
+
+  <developer id="music.srova">
+    <name>SROVA Team</name>
+  </developer>
+
+  <description>
+    <p>
+      SROVA is a headless audiophile music player for Local Music, TIDAL, and Internet Radio.
+      It is designed for bit-perfect playback, dedicated audio systems, and browser-based control
+      from desktops, tablets, and phones on your local network.
+    </p>
+    <p>
+      SROVA starts automatically after installation and after each reboot. Use the Open button to
+      view the local and network browser addresses for your running SROVA server.
+    </p>
+    <p>
+      Features include Local Music library scanning, TIDAL playback, Internet Radio, DAC status,
+      exclusive audio output indicators, and a responsive web interface.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">com.srova.player.desktop</launchable>
+  <provides>
+    <binary>srova</binary>
+    <binary>srova-open</binary>
+  </provides>
+
+  <categories>
+    <category>Audio</category>
+    <category>AudioVideo</category>
+    <category>Player</category>
+  </categories>
+
+  <url type="homepage">https://srova.music/</url>
+  <url type="bugtracker">https://srova.music/</url>
+  <url type="help">https://srova.music/</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>SROVA web interface for local, TIDAL, and radio playback</caption>
+      <image>https://srova.music/srova-site/assets/screenshots/srova-desktop-home.png</image>
+    </screenshot>
+  </screenshots>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="1.0-1" date="2026-07-27"/>
+    <release version="1.0~rc2-1" date="2026-07-15"/>
+    <release version="1.0~rc1-1" date="2026-07-10">
+      <description>
+        <p>
+          RC1 packaging update: SROVA now installs as a headless service and the desktop Open
+          action shows the SROVA browser access popup instead of launching a legacy desktop app.
+        </p>
+        <p>
+          This build includes SROVA branding, support contact metadata, AppStream installer details,
+          and improved side-by-side behavior with older installations.
+        </p>
+      </description>
+    </release>
+  </releases>
+</component>

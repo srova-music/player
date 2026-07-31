@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SROVA</title>
+
+<!-- Srova Favicon -->
+<link rel="icon" href="/ui_web/favicon.ico">
+<link rel="icon" type="image/png" sizes="32x32" href="/ui_web/icon-32.png">
+<link rel="apple-touch-icon" href="/ui_web/icons/icon-180.png">
+<link rel="icon" type="image/png" sizes="512x512" href="/ui_web/icon-512.png">
+<link rel="manifest" href="/ui_web/manifest.webmanifest" crossorigin="use-credentials">
+<meta name="theme-color" content="#050505">
+
+<link rel="stylesheet" href="/ui_web/srova.css?v=20260727_v1_scrobbling_signup3">
+<link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Josefin+Sans:wght@100;200;300;400&family=Outfit:wght@300;400&display=swap" rel="stylesheet">
+</head>
+
+<body>
+
+<!-- HEADER -->
+<header>
+
+  <button id="headerHomeBtn" onclick="goHome()" title="Home" aria-label="SROVA Home">
+    <img src="/ui_web/assets/srova-wordmark.svg?v=20260512a" alt="SROVA" class="srovaHeaderWordmark" draggable="false">
+  </button>
+
+  <div id="srovaInstanceLabel" class="hidden" aria-live="polite"></div>
+
+  <div id="searchBox">
+    <input
+      id="searchInput"
+      name="srova_global_search"
+      type="text"
+      placeholder="Search songs, albums, artists..."
+      autocomplete="off"
+      autocapitalize="none"
+      autocorrect="off"
+      spellcheck="false"
+      oninput="onSearchInput(event)"
+      onkeydown="onSearchKey(event)"
+    >
+    <button id="searchClear" class="hidden" onclick="clearSearch()">
+      <span class="material-icons">close</span>
+    </button>
+  </div>
+
+  <button id="queueBtn" onclick="showQueue()" title="Play Queue">
+    <span class="material-icons">queue_music</span>
+  </button>
+
+  <button id="playlistsBtn" onclick="showPlaylists()" title="My Playlists">
+    <span class="material-icons">library_music</span>
+  </button>
+
+  <button id="settingsBtn" onclick="showSettings()" title="Settings">
+    <span class="material-icons">settings</span>
+  </button>
+
+</header>
+
+
+<!-- LOGIN MODAL -->
+<div id="loginModal" class="hidden">
+  <div id="loginCard">
+    <div id="loginWaiting" class="hidden">
+      <p class="loginInstruction">Open the link below in your browser and log in to Tidal:</p>
+      <a id="loginUrl" href="#" target="_blank" rel="noopener"></a>
+      <p class="loginStatus">Waiting for authorisation<span class="loginDots"></span></p>
+      <button class="loginCancelBtn" onclick="cancelLogin()">Cancel</button>
+    </div>
+    <div id="loginError" class="hidden">
+      <p class="loginInstruction">Login failed. Please try again.</p>
+      <button class="loginCancelBtn" onclick="cancelLogin()">Close</button>
+    </div>
+  </div>
+</div>
+
+
+<!-- HOME PAGE -->
+<div id="homeView">
+  <div id="homeSections"></div>
+</div>
+
+
+<!-- MY ALBUMS FULL PAGE -->
+<div id="myAlbumsView" style="display:none">
+  <div class="libraryViewHeader">
+    <div class="libraryViewTitle">My Albums</div>
+    <div class="libraryViewActions">
+      <div id="myAlbumsViewToggleMount"
+           class="libraryViewToggleMount"></div>
+      <button type="button"
+              class="libraryBackBtn"
+              onclick="showView('home')"
+              title="Back"
+              aria-label="Back">
+        <span class="material-icons">arrow_back</span>
+      </button>
+    </div>
+  </div>
+  <div id="myAlbumsGrid"></div>
+</div>
+
+
+<!-- MY SONGS FULL PAGE -->
+<div id="mySongsView" style="display:none">
+  <div class="libraryViewHeader">
+    <div class="libraryViewTitle">My Songs</div>
+    <div class="libraryViewActions">
+      <div id="mySongsViewToggleMount"
+           class="libraryViewToggleMount"></div>
+      <button type="button"
+              class="libraryBackBtn"
+              onclick="showView('home')"
+              title="Back"
+              aria-label="Back">
+        <span class="material-icons">arrow_back</span>
+      </button>
+    </div>
+  </div>
+  <div id="mySongsGrid"></div>
+</div>
+
+
+<!-- MY PLAYLISTS PAGE -->
+<div id="playlistsView" style="display:none">
+  <div id="playlistsContent"></div>
+</div>
+
+
+<!-- SEARCH RESULTS -->
+<div id="searchView" style="display:none">
+  <div id="searchResults"></div>
+</div>
+
+<!-- LOCAL MUSIC PAGE -->
+<div id="localMusicView" style="display:none">
+  <div id="localMusicContent"></div>
+</div>
+
+
+<!-- ALBUM / PLAYLIST / MIX / ARTIST PAGE -->
+<div id="albumView" style="display:none">
+  <div id="albumHeader">
+    <button id="backBtn" onclick="goBack()">
+      <span class="material-icons">arrow_back</span>
+    </button>
+    <img id="albumArt">
+    <div>
+      <div id="albumTitle"></div>
+      <div id="albumArtist"></div>
+      <div id="albumTechInfo" class="hidden"></div>
+      <div id="albumStatsLine" class="hidden"></div>
+    </div>
+  </div>
+  <div id="trackList"></div>
+</div>
+
+
+<!-- PLAY QUEUE PAGE -->
+<div id="queueView" style="display:none"></div>
+
+
+<!-- SETTINGS PAGE -->
+<div id="settingsView" style="display:none"></div>
+
+
+<!-- NOW PLAYING FULL SCREEN VIEW -->
+<div id="nowPlayingView" class="hidden">
+
+  <div id="nowPlayingInner">
+
+    <div id="nowPlayingBrand" aria-label="SROVA">
+      <img src="/ui_web/assets/srova-wordmark.svg?v=20260512a" alt="SROVA" class="srovaNowPlayingWordmark" draggable="false">
+    </div>
+
+    <div id="nowPlayingHeader">
+      <button id="nowPlayingDown" onclick="closeNowPlaying()">
+        <span class="material-icons">keyboard_arrow_down</span>
+      </button>
+      <div id="nowPlayingFrom">
+        <div id="nowPlayingFromLabel">PLAYING FROM</div>
+        <div id="nowPlayingFromTitle"></div>
+      </div>
+      <div id="npHeaderRight">
+        <button id="npBtnVU" onclick="openVuPanel()" title="VU Meter">
+          <span class="material-icons">graphic_eq</span>
+        </button>
+        <button id="npBtnLyrics" onclick="openLyricsPanel()" title="Lyrics">
+          <span class="material-icons">lyrics</span>
+        </button>
+        <button id="npBtnInfo" onclick="openMetaPanel()" title="Track Info">
+          <span class="material-icons">info_outline</span>
+        </button>
+        <button id="npBtnQueue" onclick="showQueue()" title="View Play Queue">
+          <span class="material-icons">queue_music</span>
+        </button>
+      </div>
+    </div>
+
+    <img id="nowPlayingArt" onclick="closeNowPlaying()">
+
+    <div id="nowPlayingMeta">
+      <div id="nowPlayingMetaText">
+        <div id="nowPlayingTrack"></div>
+        <div id="nowPlayingArtist"></div>
+        <div id="radioArtistNowPlaying" style="display:none"></div>
+        <div id="radioTitleNowPlaying" style="display:none"></div>
+        <div id="nowPlayingTechRow">
+          <div class="audioInfoStack">
+            <div id="nowPlayingDacName" class="audioInfoBox audioInfoOff"></div>
+            <div id="nowPlayingQuality"></div>
+          </div>
+          <span id="npExclusiveLock" class="exclusiveLock exclusiveLockOff" title="Exclusive mode off">
+            <span class="material-icons">lock</span>
+          </span>
+          <span id="npBitPerfect" class="bitPerfectReadout bitPerfectOff" title="Bit Perfect Unconfirmed" aria-label="Bit Perfect Unconfirmed">BP</span>
+          <div id="npWaveformBars" class="srovaRoundLogoVisualizer npWaveformBars" aria-hidden="true">
+            <div class="srovaRoundLogoCore" aria-hidden="true">
+              <span class="srovaRoundLogoBar srovaRoundLogoBar1"></span>
+              <span class="srovaRoundLogoBar srovaRoundLogoBar2"></span>
+              <span class="srovaRoundLogoBar srovaRoundLogoBar3"></span>
+              <span class="srovaRoundLogoBar srovaRoundLogoBar4"></span>
+              <span class="srovaRoundLogoBar srovaRoundLogoBar5"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <button id="npBtnHeart" onclick="toggleNpHeart()" title="Favorite">
+        <span class="material-icons">favorite_border</span>
+      </button>
+    </div>
+
+    <div id="nowPlayingProgressWrap">
+      <div id="nowPlayingProgress">
+        <div id="nowPlayingFill"></div>
+      </div>
+      <div id="nowPlayingTimes">
+        <span id="nowPlayingCurrent">0:00</span>
+        <span id="nowPlayingTotal">0:00</span>
+      </div>
+    </div>
+
+    <div id="nowPlayingControls">
+      <button id="npBtnRepeat"  onclick="toggleRepeat()"><span class="material-icons">repeat</span></button>
+      <button id="npBtnPrev"    onclick="prevTrack()"><span class="material-icons">skip_previous</span></button>
+      <button id="npBtnPlay"    onclick="togglePlayPause()" aria-label="Play" title="Play"><span class="material-icons">play_arrow</span></button>
+      <button id="npBtnNext"    onclick="nextTrack()"><span class="material-icons">skip_next</span></button>
+      <button id="npBtnShuffle" onclick="toggleShuffle()"><span class="material-icons">shuffle</span></button>
+    </div>
+
+  </div><!-- end nowPlayingInner -->
+
+  <!-- TRACK INFO PANEL -- slides up over Now Playing -->
+  <div id="metaPanel">
+    <div id="metaPanelHandle">
+      <button id="metaCloseBtn" onclick="closeMetaPanel()">
+        <span class="material-icons">keyboard_arrow_down</span>
+      </button>
+      <div id="metaPanelTitle">Track Info</div>
+      <div style="width:40px"></div>
+    </div>
+    <div id="metaContent"></div>
+  </div>
+
+  <!-- LYRICS PANEL -- slides up over Now Playing -->
+  <div id="lyricsPanel">
+    <div id="lyricsPanelHandle">
+      <button id="lyricsCloseBtn" onclick="closeLyricsPanel()">
+        <span class="material-icons">keyboard_arrow_down</span>
+      </button>
+      <div id="lyricsPanelTitle">Lyrics</div>
+      <div style="width:40px"></div>
+    </div>
+    <div id="lyricsContent"></div>
+  </div>
+
+  <!-- VU METER PANEL -- slides up over Now Playing (mobile/tablet only) -->
+  <div id="vuPanel">
+    <div id="vuPanelHandle">
+      <button id="vuCloseBtn" onclick="closeVuPanel()">
+        <span class="material-icons">keyboard_arrow_down</span>
+      </button>
+      <div id="vuPanelTitle">VU Meter</div>
+      <div style="width:40px"></div>
+    </div>
+    <div id="vuMeters">
+      <div class="vuMeterWrap"><canvas id="vuCanvasL"></canvas></div>
+      <div class="vuMeterWrap"><canvas id="vuCanvasR"></canvas></div>
+    </div>
+    <div id="vuPanelBar">
+      <div id="vpbLeft">
+        <img id="vpbArt">
+        <div id="vpbMeta">
+          <div id="vpbTrack"></div>
+          <div id="vpbArtist"></div>
+        </div>
+      </div>
+      <div id="vpbProgress">
+        <span id="vpbCurrent">0:00</span>
+        <div id="vpbProgressBar"><div id="vpbFill"></div></div>
+        <span id="vpbTotal">0:00</span>
+      </div>
+      <div id="vpbRight">
+        <div id="vpbControls">
+          <button onclick="prevTrack()"><span class="material-icons">skip_previous</span></button>
+          <button id="vpbBtnPlay" onclick="togglePlayPause()" aria-label="Play" title="Play"><span class="material-icons">play_arrow</span></button>
+          <button onclick="nextTrack()"><span class="material-icons">skip_next</span></button>
+        </div>
+        <span id="vpbBadge" class="hidden"></span>
+      </div>
+    </div>
+  </div>
+
+</div><!-- end nowPlayingView -->
+
+
+<div id="playerBar" class="hidden">
+
+  <div class="playerTop">
+    <div class="playerLeft">
+      <img id="playerArt" class="playerArtwork" onclick="openNowPlaying()" style="cursor:pointer">
+      <div class="playerInfo">
+        <div id="playerTrack"></div>
+        <div class="playerInfoRow">
+          <span id="playerArtist"></span>
+        </div>
+        <div id="radioArtistPlayerBar" style="display:none"></div>
+        <div id="radioTitlePlayerBar" style="display:none"></div>
+      </div>
+    </div>
+    <div class="playerControls">
+      <button id="btnRepeat"    onclick="toggleRepeat()"><span class="material-icons">repeat</span></button>
+      <button id="btnPrev"      onclick="prevTrack()"><span class="material-icons">skip_previous</span></button>
+      <button id="btnPlayPause" onclick="togglePlayPause()" aria-label="Play" title="Play"><span class="material-icons">play_arrow</span></button>
+      <button id="btnNext"      onclick="nextTrack()"><span class="material-icons">skip_next</span></button>
+      <button id="btnShuffle"   onclick="toggleShuffle()"><span class="material-icons">shuffle</span></button>
+    </div>
+    <div class="playerRight">
+      <button id="playerTechTrayToggle" type="button" aria-expanded="false" aria-controls="playerTechTray" aria-label="Show audio path details">
+        <span class="material-icons">keyboard_arrow_up</span>
+      </button>
+      <div id="playerTechTray" aria-hidden="false">
+        <div class="playerTechTrayInner">
+          <div class="audioInfoStack">
+            <div id="playerDacName" class="audioInfoBox audioInfoOff"></div>
+            <div id="playerMeta"></div>
+          </div>
+          <div class="playerTechTrayControls">
+            <span id="exclusiveLock" class="exclusiveLock exclusiveLockOff" title="Exclusive mode off" onclick="toggleExclusiveFromLock()">
+              <span class="material-icons">lock</span>
+            </span>
+            <span id="bitPerfect" class="bitPerfectReadout bitPerfectOff" title="Bit Perfect Unconfirmed" aria-label="Bit Perfect Unconfirmed">BP</span>
+          </div>
+          <!-- RC3 Point 4: mobile-portrait track metadata row. -->
+          <div id="playerTrayTrackInfo" class="playerTrayTrackInfo" aria-hidden="true">
+            <div id="playerTrayTrackInfoText" class="playerTrayTrackInfoText"></div>
+          </div>
+        </div>
+      </div>
+      <div id="playerInfinitePlayControl" class="playerInfinitePlayControl" aria-hidden="true">
+        <button id="playerInfinitePlayBtn" class="playerInfinitePlayBtn" type="button" aria-expanded="false" aria-controls="playerInfinitePlayMenu" aria-label="Infinite Play mode">
+                    <svg class="playerInfinitePlaySvg playerInfinitePlaySvgRecraft" viewBox="0 0 1536 1024" aria-hidden="true" focusable="false">
+            <defs>
+              <radialGradient id="playerInfinitePlayModeGradient" cx="50%" cy="50%" r="72%">
+                <stop class="playerInfinitePlayModeGradientCore" offset="0%"></stop>
+                <stop class="playerInfinitePlayModeGradientMid" offset="28%"></stop>
+                <stop class="playerInfinitePlayModeGradientOuter" offset="100%"></stop>
+              </radialGradient>
+            </defs>
+            <circle class="playerInfinitePlayModeHalo" cx="455" cy="506" r="132"></circle>
+            <circle class="playerInfinitePlayModeCore" cx="455" cy="506" r="54"></circle>
+            <ellipse class="playerInfinitePlayModeCoreSpec" cx="438" cy="485" rx="18" ry="10" transform="rotate(-20 438 485)"></ellipse>
+            <path class="playerInfinitePlayModeFill" transform="scale(1.23077 1.23077)" d="M408.457 565.631C452.787 546.844 475.924 520.838 507.565 486.026L551.407 437.591C559.044 429.166 570.901 415.482 578.898 408.141L515.169 338.185C467.218 285.826 429.961 243.155 352.732 237.882C347.205 237.504 338.865 237.437 333.38 238.019C287.845 241.601 245.45 261.515 215.616 296.452C186.009 331.234 171.421 376.351 175.059 421.888C178.78 467.322 200.529 509.376 235.453 538.665C269.307 567.219 313.063 581.249 357.205 577.701C376.047 576.098 390.971 572.323 408.457 565.631Z"></path>
+            <path class="playerInfinitePlayModeRim" transform="scale(1.23077 1.23077)" d="M408.457 565.631C452.787 546.844 475.924 520.838 507.565 486.026L551.407 437.591C559.044 429.166 570.901 415.482 578.898 408.141L515.169 338.185C467.218 285.826 429.961 243.155 352.732 237.882C347.205 237.504 338.865 237.437 333.38 238.019C287.845 241.601 245.45 261.515 215.616 296.452C186.009 331.234 171.421 376.351 175.059 421.888C178.78 467.322 200.529 509.376 235.453 538.665C269.307 567.219 313.063 581.249 357.205 577.701C376.047 576.098 390.971 572.323 408.457 565.631Z"></path>
+            <ellipse class="playerInfinitePlayModeSpec" cx="430" cy="368" rx="92" ry="60" transform="rotate(-18 430 368)"></ellipse>
+            <path class="playerInfinitePlayRibbon" transform="scale(1.23077 1.23077)" d="M624.62 458.508C612.173 474.11 591.215 496.127 577.444 511.328C551.511 539.956 523.381 573.685 493.004 596.842C441.034 637.098 375.04 654.709 309.929 645.699C247.462 636.723 191.075 603.411 153.058 553.026C113.272 500.545 98.145 437.217 107.201 372.282C116.175 309.718 149.745 253.326 200.459 215.621C252.608 176.295 315.275 161.609 379.608 170.566C382.743 171.099 386.933 171.686 389.918 172.52C395.74 172.362 414.562 178.682 420.866 180.806C448.423 190.189 474.176 204.212 497.013 222.27C518.403 239.03 541.123 264.43 559.564 284.641C581.494 308.475 603.24 332.478 624.8 356.648C628.501 351.848 635.346 344.662 639.528 340.007L667.9 308.616C689.731 284.613 715.643 254.894 739.488 233.333C788.271 188.593 852.873 165.153 918.988 168.204C982.58 171.733 1042.16 200.425 1084.57 247.95C1128.49 296.894 1148.35 359.372 1144.72 424.647C1140.73 486.77 1112.53 544.846 1066.18 586.381C1018.54 629.587 955.442 651.659 891.267 647.563C836.294 643.979 784.087 622.153 742.914 585.543C722.158 567.339 703.424 546.044 684.963 525.497L624.62 458.508ZM670.978 407.661C678.119 415.066 684.94 423.071 691.881 430.698L735.911 479.232C771.151 518.209 805.362 557.405 858.455 571.574C902.474 583.758 948.565 579.262 988.486 556.595C1028.07 534.329 1057.15 497.199 1069.28 453.426C1081.34 409.63 1075.45 362.829 1052.9 323.395C1030.45 283.914 993.071 255.121 949.175 243.498C934.057 239.446 913.164 236.63 897.437 237.972C826.335 241.81 784.93 281.879 740.439 331.736C718.078 356.793 694.142 383.327 670.978 407.661ZM408.457 565.631C452.787 546.844 475.924 520.838 507.565 486.026L551.407 437.591C559.044 429.166 570.901 415.482 578.898 408.141L515.169 338.185C467.218 285.826 429.961 243.155 352.732 237.882C347.205 237.504 338.865 237.437 333.38 238.019C287.845 241.601 245.45 261.515 215.616 296.452C186.009 331.234 171.421 376.351 175.059 421.888C178.78 467.322 200.529 509.376 235.453 538.665C269.307 567.219 313.063 581.249 357.205 577.701C376.047 576.098 390.971 572.323 408.457 565.631Z"></path>
+            <path class="playerInfinitePlayRibbonDetail" transform="scale(1.23077 1.23077)" d="M379.608 170.566C382.743 171.099 386.933 171.686 389.918 172.52L388.134 173.561C384.849 173.471 381.591 173.787 379.349 171.549L379.608 170.566Z"></path>
+            <path class="playerInfinitePlayTriangleSvg" transform="scale(1.23077 1.23077)" d="M848.646 303.162C849.474 303.225 850.3 303.318 851.121 303.441C858.938 304.624 923.22 345.015 934.426 351.833L980.061 379.607C988.444 384.711 996.887 389.787 1005.14 395.041C1010.35 397.728 1014.37 406.432 1012.71 412.171C1010.29 420.527 993.445 428.716 986.396 432.982L942.988 459.024L884.799 494.2C877.435 498.628 862.978 507.882 855.601 511.43C853.875 512.276 852.019 512.821 850.111 513.045C842.022 513.958 834.179 507.917 833.774 499.678C833.316 490.337 833.604 480.651 833.613 471.261L833.646 414.644L833.616 350.025C833.608 339.042 833.455 327.701 833.811 316.735C833.885 314.459 835.593 310.187 837.208 308.514C841.105 304.477 843.409 303.654 848.646 303.162Z"></path>
+          </svg>
+        </button>
+        <div id="playerInfinitePlayMenu" class="playerInfinitePlayMenu" aria-hidden="true">
+          <button type="button" class="playerInfinitePlayMenuBtn infinitePlayModeSame" data-mode="same_artist">Same Artist</button>
+          <button type="button" class="playerInfinitePlayMenuBtn infinitePlayModeSimilar" data-mode="similar_artist">Similar Artists</button>
+          <button type="button" class="playerInfinitePlayMenuBtn infinitePlayModeSurprise" data-mode="surprise_me">Surprise Me</button>
+        </div>
+      </div>
+      <button id="playerTechTrayInlineToggle" type="button" aria-expanded="false" aria-disabled="true" disabled aria-controls="playerTechTray" aria-label="Show audio path details">
+        <span class="material-icons">keyboard_arrow_up</span>
+      </button>
+      <!-- SROVA visualizer swap 030526_1918: round animated logo replaces the old four-bar waveform.
+           Cosmetic-only and reversible: restore the old #waveformBars span block to undo. -->
+      <div id="waveformBars" class="srovaRoundLogoVisualizer" aria-hidden="true">
+        <div class="srovaRoundLogoCore" aria-hidden="true">
+          <span class="srovaRoundLogoBar srovaRoundLogoBar1"></span>
+          <span class="srovaRoundLogoBar srovaRoundLogoBar2"></span>
+          <span class="srovaRoundLogoBar srovaRoundLogoBar3"></span>
+          <span class="srovaRoundLogoBar srovaRoundLogoBar4"></span>
+          <span class="srovaRoundLogoBar srovaRoundLogoBar5"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="playerProgress">
+    <span id="currentTime">0:00</span>
+    <div id="progressBar"><div id="progressFill"></div></div>
+    <span id="totalTime">0:00</span>
+  </div>
+
+</div>
+
+
+<div id="add-radio-modal" class="modal hidden" aria-hidden="true">
+  <div class="modal-content">
+    <h2 id="radio-modal-title">Add station</h2>
+    <div class="field floating"><label for="radio-name">Name</label><input id="radio-name" type="text" autocomplete="off"></div>
+    <div class="field floating"><label for="radio-url">URL</label><input id="radio-url" type="url" autocomplete="off"></div>
+    <div class="field floating"><label for="radio-icon">Icon</label><input id="radio-icon" type="text" autocomplete="off"></div>
+    <div id="radio-modal-error" class="hidden" style="color:#e05050;font-size:13px;margin-top:8px;"></div>
+    <div class="modal-actions">
+      <button id="radio-cancel" class="pill" onclick="closeAddRadioModal()">Cancel</button>
+      <button id="radio-add" class="pill primary" onclick="submitAddRadio()">Add</button>
+    </div>
+  </div>
+</div>
+
+<script src="/ui_web/ui.js?v=20260727_v1_first_run1"></script>
+<script>
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", function() {
+    navigator.serviceWorker.register("/ui_web/sw.js").catch(function() {});
+  });
+}
+</script>
+
+</body>
+</html>

@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>SROVA Mini Player</title>
+<link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+    background: #0e0e0e;
+    color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+#main {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 12px 6px;
+    flex: 1;
+    min-height: 0;
+}
+
+#art {
+    width: 68px;
+    height: 68px;
+    border-radius: 6px;
+    object-fit: cover;
+    flex-shrink: 0;
+    background: #1a1a1a;
+}
+
+#info {
+    flex: 1;
+    min-width: 0;
+}
+
+#track {
+    font-size: 13px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: #fff;
+}
+
+#artist {
+    font-size: 11px;
+    color: #888;
+    margin-top: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+#badge {
+    display: inline-block;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    padding: 2px 5px;
+    border-radius: 3px;
+    margin-top: 5px;
+}
+#badge.hires  { color: #c8a951; background: rgba(200,169,81,0.10); border: 1px solid rgba(200,169,81,0.30); }
+#badge.cd     { color: #00d2ff; background: rgba(0,210,255,0.08);  border: 1px solid rgba(0,210,255,0.25); }
+#badge.hidden { display: none; }
+
+#controls {
+    display: flex;
+    align-items: center;
+    margin-top: 6px;
+    margin-left: -6px;
+}
+
+#controls button {
+    background: none;
+    border: none;
+    color: #888;
+    cursor: pointer;
+    padding: 2px 6px;
+    display: flex;
+    align-items: center;
+    transition: color 0.15s;
+}
+#controls button:hover { color: #fff; }
+#controls button .material-icons { font-size: 22px; }
+#btnPlay .material-icons          { font-size: 30px; color: #fff; }
+
+#progressWrap {
+    padding: 0 12px 10px;
+    flex-shrink: 0;
+}
+
+#bar {
+    width: 100%;
+    height: 3px;
+    background: #252525;
+    border-radius: 2px;
+    overflow: hidden;
+    cursor: pointer;
+    position: relative;
+}
+#bar::before {
+    content: "";
+    position: absolute;
+    top: -8px; left: 0; right: 0; bottom: -8px;
+}
+
+#fill {
+    height: 100%;
+    width: 0%;
+    border-radius: 2px;
+    background: #00d2ff;
+    transition: width 0.1s linear, background 0.4s ease;
+}
+#fill.hires { background: #c8a951; }
+
+#times {
+    display: flex;
+    justify-content: space-between;
+    font-size: 9px;
+    color: #555;
+    margin-top: 4px;
+}
+
+#idle {
+    display: none;
+    flex: 1;
+    align-items: center;
+    justify-content: center;
+    color: #444;
+    font-size: 13px;
+}
+</style>
+</head>
+
+<body>
+
+<div id="main">
+  <img id="art" src="">
+  <div id="info">
+    <div id="track">-</div>
+    <div id="artist"></div>
+    <span id="badge" class="hidden"></span>
+    <div id="controls">
+      <button onclick="cmd('/tidal/prev')"><span class="material-icons">skip_previous</span></button>
+      <button id="btnPlay" onclick="togglePlay()"><span class="material-icons">play_arrow</span></button>
+      <button onclick="cmd('/tidal/next')"><span class="material-icons">skip_next</span></button>
+    </div>
+  </div>
+</div>
+
+<div id="progressWrap">
+  <div id="bar"><div id="fill"></div></div>
+  <div id="times"><span id="cur">0:00</span><span id="tot">0:00</span></div>
+</div>
+
+<div id="idle">Nothing playing</div>
+
+<script>
+var playingState = false;
+var duration     = 0;
+var startTime    = 0;
+var elapsed      = 0;
+var isHires      = false;
+
+var artEl    = document.getElementById("art");
+var trackEl  = document.getElementById("track");
+var artistEl = document.getElementById("artist");
+var badgeEl  = document.getElementById("badge");
+var btnPlay  = document.getElementById("btnPlay");
+var fillEl   = document.getElementById("fill");
+var curEl    = document.getElementById("cur");
+var totEl    = document.getElementById("tot");
+var mainEl   = document.getElementById("main");
+var progWrap = document.getElementById("progressWrap");
+var idleEl   = document.getElementById("idle");
+var barEl    = document.getElementById("bar");
+
+function fmt(s) {
+    s = Math.max(0, Math.floor(s));
+    var m   = Math.floor(s / 60);
+    var sec = s % 60;
+    return m + ":" + (sec < 10 ? "0" + sec : sec);
+}
+
+function poll() {
+    fetch("/session")
+        .then(function(r) { return r.json(); })
+        .then(function(s) {
+            if (!s.track_id) {
+                mainEl.style.display    = "none";
+                progWrap.style.display  = "none";
+                idleEl.style.display    = "flex";
+                return;
+            }
+            mainEl.style.display    = "flex";
+            progWrap.style.display  = "block";
+            idleEl.style.display    = "none";
+
+            artEl.src            = s.cover  || "";
+            trackEl.textContent  = s.title  || "";
+            artistEl.textContent = s.artist || "";
+            duration             = s.duration || 0;
+            playingState         = s.playing  || false;
+
+            if (s.position > 2) {
+                startTime = Date.now() / 1000 - s.position;
+                elapsed   = s.position;
+            }
+
+            btnPlay.querySelector(".material-icons").textContent =
+                playingState ? "pause" : "play_arrow";
+
+            totEl.textContent = fmt(duration);
+
+            var sr = s.sample_rate;
+            var bd = s.bit_depth;
+            isHires = (bd && bd >= 24) || (sr && sr > 48000);
+            if (sr || bd || s.codec) {
+                var parts = [];
+                if (s.codec) { parts.push(s.codec); }
+                if (bd)      { parts.push(bd + "bit"); }
+                if (sr)      { parts.push((sr / 1000).toFixed(1) + "kHz"); }
+                badgeEl.textContent = parts.join(" / ");
+                badgeEl.className   = isHires ? "hires" : "cd";
+                fillEl.className    = isHires ? "hires" : "";
+            } else {
+                badgeEl.className = "hidden";
+                fillEl.className  = "";
+            }
+        })
+        .catch(function() {});
+}
+
+function progressLoop() {
+    if (playingState && duration > 0) {
+        elapsed = Date.now() / 1000 - startTime;
+        var pct = Math.min((elapsed / duration) * 100, 100);
+        fillEl.style.width = pct + "%";
+        curEl.textContent  = fmt(elapsed);
+    }
+    requestAnimationFrame(progressLoop);
+}
+
+function cmd(url) {
+    fetch(url).catch(function() {});
+    setTimeout(poll, 700);
+}
+
+function togglePlay() {
+    if (playingState) {
+        playingState = false;
+        btnPlay.querySelector(".material-icons").textContent = "play_arrow";
+        cmd("/tidal/pause");
+    } else {
+        playingState = true;
+        startTime    = Date.now() / 1000 - elapsed;
+        btnPlay.querySelector(".material-icons").textContent = "pause";
+        cmd("/tidal/resume");
+    }
+}
+
+barEl.addEventListener("click", function(e) {
+    if (!duration) { return; }
+    var rect    = barEl.getBoundingClientRect();
+    var pct     = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    var seekSec = Math.floor(pct * duration);
+    startTime   = Date.now() / 1000 - seekSec;
+    elapsed     = seekSec;
+    fetch("/tidal/seek/" + seekSec).catch(function() {});
+});
+
+setInterval(poll, 2000);
+poll();
+progressLoop();
+</script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+# SROVA Linux package bundled Python dependencies
+#
+# Exact Version 1 package set shared by AMD64 and ARM64 builds.
+# Install with --no-deps so pip cannot introduce an unlisted version.
+certifi==2026.7.22
+idna==3.18
+isodate==0.7.2
+mpegdash==0.4.1
+pyaes==1.6.1
+pystray==0.19.5
+python-dateutil==2.9.0.post0
+python-xlib==0.33
+qrcode==8.2
+ratelimit==2.2.1
+requests==2.34.2
+six==1.17.0
+tidalapi==0.8.11
+typing-extensions==4.16.0
+urllib3==2.7.0
