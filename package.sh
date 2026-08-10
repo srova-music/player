@@ -211,6 +211,7 @@ HEADLESS_RUNTIME_REQUIRED=(
     src/local_library.py
     src/network_music.py
     src/network_root_state.py
+    src/version_info.py
     src/radio_metadata.py
     src/app/__init__.py
     src/core/__init__.py

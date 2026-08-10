@@ -58,6 +58,28 @@
     box-sizing: border-box !important;
 }
 
+.srovaOtherOutputsWarningModal {
+    align-items: flex-start !important;
+    overflow-y: auto !important;
+}
+
+.srovaVolumeSafetyWarning.srovaOtherOutputsWarningPanel {
+    width: min(780px, 100%) !important;
+    max-width: 780px !important;
+    margin: auto 0 !important;
+}
+
+.srovaOtherOutputsWarningLead,
+.srovaOtherOutputsDisclaimer {
+    color: var(--srova-cream) !important;
+}
+
+.srovaOtherOutputsDisclaimer {
+    padding: 12px 14px !important;
+    border-left: 3px solid rgba(192, 64, 64, 0.72) !important;
+    background: rgba(192, 64, 64, 0.08) !important;
+}
+
 .srovaVolumeSafetyWarning {
     width: min(680px, 100%) !important;
     display: grid !important;
@@ -224,6 +246,33 @@
     background: var(--srova-gold-light) !important;
 }
 
+.srovaVolumeSafetyActions {
+    display: flex !important;
+    flex-wrap: wrap !important;
+    align-items: center !important;
+    gap: 12px !important;
+}
+
+.srovaVolumeSafetyCancelButton {
+    min-height: 42px !important;
+    padding: 12px 18px 10px !important;
+    color: var(--srova-cream-dim) !important;
+    background: rgba(255, 255, 255, 0.035) !important;
+    border: 1px solid rgba(237, 230, 211, 0.24) !important;
+    font-family: var(--srova-display) !important;
+    font-size: 11px !important;
+    font-weight: 300 !important;
+    letter-spacing: 0.14em !important;
+    line-height: 1.2 !important;
+    text-transform: uppercase !important;
+    cursor: pointer !important;
+}
+
+.srovaVolumeSafetyCancelButton:hover {
+    color: var(--srova-cream) !important;
+    border-color: rgba(237, 230, 211, 0.52) !important;
+}
+
 @media (max-width: 560px) {
     .srovaVolumeSafetyWarning {
         grid-template-columns: 1fr !important;
@@ -242,6 +291,10 @@
     .srovaVolumeSafetyButton {
         width: 100% !important;
         justify-self: stretch !important;
+    }
+
+    .srovaVolumeSafetyCancelButton {
+        width: 100% !important;
     }
 }
 
@@ -9595,6 +9648,30 @@ body:not(.hires) #vuPanel #vpbFill {
     margin-top: 6px;
     font-size: 13px;
     color: var(--srova-cream-dim);
+}
+
+.dacDeviceFilterRow {
+    max-width: 820px !important;
+    margin: 0 0 18px !important;
+    padding: 14px !important;
+    background: rgba(201, 168, 76, 0.045) !important;
+    border: 1px solid rgba(201, 168, 76, 0.16) !important;
+}
+
+.dacRecommendedOutputNotice,
+.dacOtherOutputNotice {
+    margin-top: 9px !important;
+    font-family: var(--srova-body) !important;
+    font-size: 12px !important;
+    line-height: 1.4 !important;
+}
+
+.dacRecommendedOutputNotice {
+    color: var(--srova-gold-light) !important;
+}
+
+.dacOtherOutputNotice {
+    color: #e3a46f !important;
 }
 
 .dacLockNotice {

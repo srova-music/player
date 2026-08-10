@@ -694,13 +694,13 @@ class NetworkMusicTests(unittest.TestCase):
             (
                 self.repo_root / "version.txt"
             ).read_text(encoding="utf-8").strip(),
-            "1.0-1",
+            "1.1-1",
         )
 
         for expected in (
             "package.sh",
             "build_deb.sh",
-            "1.0-1",
+            "1.1-1",
             "/opt/srova",
             "8081",
         ):

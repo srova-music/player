@@ -699,6 +699,28 @@ def _add_artwork_to_album_rows(rows, roots):
     return albums
 
 
+def _add_artwork_to_track_rows(rows, roots):
+    tracks = [dict(row) for row in rows or []]
+    artwork_cache = {}
+    for track in tracks:
+        try:
+            storage_path = _track_storage_path(track)
+            if not storage_path:
+                continue
+            cache_key = os.path.dirname(str(storage_path)) or str(storage_path)
+            if cache_key not in artwork_cache:
+                artwork_cache[cache_key] = (
+                    _album_artwork_url_for_paths([storage_path], roots) or ""
+                )
+            artwork_url = artwork_cache.get(cache_key) or ""
+            if artwork_url:
+                track["artwork_url"] = artwork_url
+                track["cover"] = artwork_url
+        except Exception:
+            continue
+    return tracks
+
+
 def _album_folder_for_path(path):
     return _local_db_path_for_grouping(os.path.dirname(str(path or "")))
 
@@ -2260,6 +2282,25 @@ class LocalLibraryIndex:
             "last_scan_error": last_scan_error or None,
         }
 
+    def track_count_for_roots(self, roots):
+        active_roots = _normalise_roots(roots)
+        if not active_roots:
+            return 0
+
+        placeholders = ",".join("?" for _ in active_roots)
+        try:
+            with self._connect() as con:
+                row = con.execute(
+                    "SELECT COUNT(*) AS c FROM local_tracks "
+                    "WHERE root IN ({})".format(placeholders),
+                    active_roots,
+                ).fetchone()
+        except Exception as exc:
+            if not _is_sqlite_busy(exc):
+                raise
+            raise LocalLibraryBusyError("local_library_busy")
+        return int(row["c"] or 0)
+
     def tracks(self, limit=1000):
         self._raise_if_rebuild_running()
         limit = _coerce_limit(limit, default=1000, maximum=5000)
@@ -2589,22 +2630,13 @@ class LocalLibraryIndex:
             if not _is_sqlite_busy(exc):
                 raise
             raise LocalLibraryBusyError("local_library_busy")
-        songs = _filter_rows_to_configured_roots([dict(row) for row in song_rows], self.roots)
-        artwork_cache = {}
-        for song in songs:
-            try:
-                storage_path = _track_storage_path(song)
-                if not storage_path:
-                    continue
-                cache_key = os.path.dirname(str(storage_path)) or str(storage_path)
-                if cache_key not in artwork_cache:
-                    artwork_cache[cache_key] = _album_artwork_url_for_paths([storage_path], self.roots) or ""
-                artwork_url = artwork_cache.get(cache_key) or ""
-                if artwork_url:
-                    song["artwork_url"] = artwork_url
-                    song["cover"] = artwork_url
-            except Exception:
-                continue
+        songs = _add_artwork_to_track_rows(
+            _filter_rows_to_configured_roots(
+                [dict(row) for row in song_rows],
+                self.roots,
+            ),
+            self.roots,
+        )
         album_rows_filtered = _filter_rows_to_configured_roots([dict(row) for row in album_rows], self.roots)
         albums = self._album_groups_from_rows(album_rows_filtered, limit=limit)
         artists = [dict(row) for row in artist_rows]
@@ -2787,14 +2819,12 @@ class LocalLibraryIndex:
             with self._connect() as con:
                 album_rows = con.execute(
                     """
-                    SELECT album,
-                           COUNT(*) AS track_count,
-                           COALESCE(SUM(duration), 0) AS duration,
-                           MIN(id) AS first_track_id
+                    SELECT id, root, artist, album_artist, album, compilation,
+                           path, cue_audio_path, duration, sample_rate,
+                           bit_depth, codec, mtime, scanned_at
                     FROM local_tracks
                     WHERE artist = ?
-                    GROUP BY album
-                    ORDER BY album COLLATE NOCASE
+                    ORDER BY album COLLATE NOCASE, path COLLATE NOCASE
                     """,
                     (artist,),
                 ).fetchall()
@@ -2817,8 +2847,22 @@ class LocalLibraryIndex:
             if not _is_sqlite_busy(exc):
                 raise
             raise LocalLibraryBusyError("local_library_busy")
-        albums = [dict(row) for row in album_rows]
-        tracks = [dict(row) for row in track_rows]
+        album_rows = _filter_rows_to_configured_roots(
+            [dict(row) for row in album_rows],
+            self.roots,
+        )
+        albums = self._album_groups_from_rows(
+            album_rows,
+            hide_single_track_groups=False,
+            sort="alpha_asc",
+        )
+        tracks = _add_artwork_to_track_rows(
+            _filter_rows_to_configured_roots(
+                [dict(row) for row in track_rows],
+                self.roots,
+            ),
+            self.roots,
+        )
         return {
             "ok": True,
             "db_path": self.db_path,

@@ -26,6 +26,7 @@ from app import app_init_runtime
 from local_library import LocalLibraryBusyError, LocalLibraryIndex, local_library_rebuild_running
 import network_music
 from network_root_state import add_exact_managed_root, remove_exact_managed_root
+from version_info import read_version_payload
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,36 @@ _AUDIO_OUTPUT_LOCK = threading.Lock()
 _VALID_ALSA_DRIVERS = ("ALSA", "alsa_mmap")
 _DAC_NOT_DETECTED_ERROR = "dac_not_detected"
 _DAC_NOT_DETECTED_MESSAGE = "DAC not detected. Please connect or switch on your DAC before playback."
+_OTHER_AUDIO_OUTPUT_WARNING_VERSION = 1
+_AUDIO_SYS_ROOT = Path("/sys")
+_AUDIO_PROC_ROOT = Path("/proc/asound")
+_AUDIO_UDEV_DATA_ROOT = Path("/run/udev/data")
+_RECOMMENDED_AUDIO_HAT_TOKENS = (
+    "alloboss",
+    "allodigione",
+    "allokatana",
+    "allopiano",
+    "allorevolution",
+    "audioinjector",
+    "audiophonics",
+    "bossdac",
+    "fe-pi-audio",
+    "hifiberry",
+    "i-sabre",
+    "interludeaudio",
+    "iqaudio",
+    "justboom",
+    "pianodac",
+    "pisound",
+    "respeaker",
+    "rpi-codeczero",
+    "rpi-dac",
+    "rpi-digiamp",
+    "sndrpiallo",
+    "sndrpihifiberry",
+    "sndrpiiqaudio",
+    "sndrpijustboom",
+)
 
 PLAY_QUEUE = []
 QUEUE_INDEX = 0
@@ -285,6 +316,9 @@ _APP_SETTINGS_LOCK = threading.Lock()
 _APP_SETTINGS = {
     "tidal_infinite_play": False,
     "tidal_infinite_play_mode": "similar_artist",
+    "recommended_audio_outputs_only": True,
+    "other_audio_outputs_warning_version": 0,
+    "other_audio_outputs_acknowledged_at": 0,
 }
 
 # Scrobble credentials file
@@ -779,7 +813,7 @@ def _local_library_roots_payload(payload):
     os.environ[_NETWORK_MUSIC_ROOTS_ENV] = network_roots_value
     os.environ[_NETWORK_ROOT_MIGRATION_ENV] = _NETWORK_ROOT_MIGRATION_COMPLETE
 
-    message = "Music folders saved. Press Scan Now to update the SROVA index."
+    message = "Music folders saved. Select Save & Scan to update the SROVA index."
     if warnings:
         message += " Mount check: " + " ".join(warnings)
     return {
@@ -1428,6 +1462,10 @@ def _parse_aplay_devices(output):
             "name": name,
             "driver": "ALSA",
             "device": device,
+            "_aplay_card_short": card_short,
+            "_aplay_card_name": card_name,
+            "_aplay_device_short": dev_short,
+            "_aplay_device_name": dev_name,
         })
     return devices
 
@@ -1437,6 +1475,156 @@ def _alsa_device_numbers(device):
     if not m:
         return None, None
     return m.group(1), m.group(2)
+
+
+def _read_audio_identity_text(path, limit=16384):
+    try:
+        raw = Path(path).read_bytes()[:limit]
+    except Exception:
+        return ""
+    return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+
+
+def _read_udev_audio_properties(card_num, udev_root=None):
+    root = Path(udev_root or _AUDIO_UDEV_DATA_ROOT)
+    properties = {}
+    content = _read_audio_identity_text(root / f"+sound:card{card_num}")
+    for raw_line in content.splitlines():
+        if not raw_line.startswith("E:") or "=" not in raw_line:
+            continue
+        key, value = raw_line[2:].split("=", 1)
+        properties[key.strip()] = value.strip()
+    return properties
+
+
+def _usb_removable_value(device_path):
+    try:
+        candidates = [Path(device_path)] + list(Path(device_path).parents)
+    except Exception:
+        return ""
+    for candidate in candidates:
+        value = _read_audio_identity_text(candidate / "removable", limit=64).lower()
+        if value in ("fixed", "removable", "unknown"):
+            return value
+    return ""
+
+
+def _audio_device_metadata(
+    device_info,
+    sys_root=None,
+    proc_root=None,
+    udev_root=None,
+):
+    card_num, device_num = _alsa_device_numbers(device_info.get("device"))
+    metadata = {
+        "card_num": card_num or "",
+        "device_num": device_num or "",
+        "card_id": "",
+        "pcm_info": "",
+        "sysfs_path": "",
+        "driver_path": "",
+        "usb_removable": "",
+        "device_tree_compatible": "",
+        "udev": {},
+        "aplay_identity": " ".join(
+            str(device_info.get(key) or "")
+            for key in (
+                "name",
+                "_aplay_card_short",
+                "_aplay_card_name",
+                "_aplay_device_short",
+                "_aplay_device_name",
+            )
+        ),
+    }
+    if card_num is None or device_num is None:
+        return metadata
+
+    sys_base = Path(sys_root or _AUDIO_SYS_ROOT)
+    proc_base = Path(proc_root or _AUDIO_PROC_ROOT)
+    card_link = sys_base / "class" / "sound" / f"card{card_num}"
+    device_link = card_link / "device"
+    try:
+        metadata["sysfs_path"] = os.path.realpath(str(device_link))
+    except Exception:
+        metadata["sysfs_path"] = ""
+    try:
+        metadata["driver_path"] = os.path.realpath(str(device_link / "driver"))
+    except Exception:
+        metadata["driver_path"] = ""
+
+    metadata["card_id"] = _read_audio_identity_text(proc_base / f"card{card_num}" / "id")
+    metadata["pcm_info"] = _read_audio_identity_text(
+        proc_base / f"card{card_num}" / f"pcm{device_num}p" / "info"
+    )
+    metadata["udev"] = _read_udev_audio_properties(card_num, udev_root=udev_root)
+    metadata["usb_removable"] = _usb_removable_value(metadata["sysfs_path"])
+
+    compatible_parts = []
+    try:
+        current = Path(metadata["sysfs_path"])
+        for candidate in [current] + list(current.parents)[:8]:
+            compatible = _read_audio_identity_text(candidate / "of_node" / "compatible")
+            if compatible and compatible not in compatible_parts:
+                compatible_parts.append(compatible)
+    except Exception:
+        pass
+    metadata["device_tree_compatible"] = " ".join(compatible_parts)
+    return metadata
+
+
+def _audio_device_recommendation_from_metadata(metadata):
+    properties = dict(metadata.get("udev") or {})
+    form_factor = str(properties.get("SOUND_FORM_FACTOR") or "").strip().lower()
+    bus = str(properties.get("ID_BUS") or "").strip().lower()
+    usb_driver = str(properties.get("ID_USB_DRIVER") or "").strip().lower()
+    driver_path = str(metadata.get("driver_path") or "").lower()
+    sysfs_path = str(metadata.get("sysfs_path") or "").lower()
+    removable = str(metadata.get("usb_removable") or "").strip().lower()
+
+    usb_topology = (
+        bus == "usb"
+        or usb_driver == "snd-usb-audio"
+        or driver_path.endswith("/snd-usb-audio")
+        or bool(re.search(r"/usb\d+(?:/|$)", sysfs_path))
+    )
+    if usb_topology and form_factor not in ("internal", "webcam") and removable != "fixed":
+        return {
+            "recommended": True,
+            "recommendation": "external_usb",
+            "recommendation_reason": "External USB audio device",
+        }
+
+    identity_text = " ".join(
+        [
+            str(metadata.get("card_id") or ""),
+            str(metadata.get("pcm_info") or ""),
+            str(metadata.get("aplay_identity") or ""),
+            str(metadata.get("device_tree_compatible") or ""),
+            sysfs_path,
+            driver_path,
+        ]
+    ).lower()
+    identity_compact = re.sub(r"[^a-z0-9]+", "", identity_text)
+    for token in _RECOMMENDED_AUDIO_HAT_TOKENS:
+        token_compact = re.sub(r"[^a-z0-9]+", "", token.lower())
+        if token_compact and token_compact in identity_compact:
+            return {
+                "recommended": True,
+                "recommendation": "supported_audio_hat",
+                "recommendation_reason": "Supported audio HAT",
+            }
+
+    return {
+        "recommended": False,
+        "recommendation": "other",
+        "recommendation_reason": "Other or unverified system output",
+    }
+
+
+def _audio_device_recommendation(device_info):
+    metadata = _audio_device_metadata(device_info)
+    return _audio_device_recommendation_from_metadata(metadata)
 
 
 def _dac_identity_token_text(value):
@@ -1513,7 +1701,7 @@ def _require_audio_output_for_playback(reason="playback"):
     raise AudioOutputUnavailable(detail)
 
 
-def _discover_audio_devices():
+def _discover_audio_devices(include_other=None):
     try:
         res = subprocess.run(
             ["aplay", "-l"],
@@ -1527,26 +1715,45 @@ def _discover_audio_devices():
         logger.debug("aplay device discovery failed: %s", e)
         devices = []
 
-    with _AUDIO_OUTPUT_LOCK:
-        current_driver = ALSA_DRIVER
-        current_device = ALSA_DEVICE
-        current_name = ALSA_DAC_NAME
+    if include_other is None:
+        include_other = not _recommended_audio_outputs_only()
 
-    if current_device and not any(d.get("device") == current_device for d in devices):
-        devices.insert(0, {
-            "label": f"{current_name or 'Current output'} — {current_device}",
-            "name": current_name or "Current output",
-            "driver": current_driver,
-            "device": current_device,
-        })
-    return devices
+    visible = []
+    for raw_device in devices:
+        recommendation = _audio_device_recommendation(raw_device)
+        device = {
+            "label": raw_device.get("label"),
+            "name": raw_device.get("name"),
+            "driver": raw_device.get("driver"),
+            "device": raw_device.get("device"),
+            "recommended": bool(recommendation.get("recommended")),
+            "recommendation": recommendation.get("recommendation") or "other",
+            "recommendation_reason": recommendation.get("recommendation_reason") or "",
+        }
+        if device["recommended"] or include_other:
+            visible.append(device)
+
+    visible.sort(key=lambda item: (
+        0 if item.get("recommended") else 1,
+        str(item.get("name") or "").lower(),
+        str(item.get("device") or ""),
+    ))
+    return visible
+
+
+def _find_discovered_audio_device(device):
+    target = str(device or "").strip()
+    for candidate in _discover_audio_devices(include_other=True):
+        if str(candidate.get("device") or "").strip() == target:
+            return candidate
+    return None
 
 
 def _resolve_dac_name(device=None):
     target = str(device or ALSA_DEVICE or "").strip()
     with _AUDIO_OUTPUT_LOCK:
         saved_name = ALSA_DAC_NAME
-    for d in _discover_audio_devices():
+    for d in _discover_audio_devices(include_other=True):
         if d.get("device") == target:
             return _normalise_dac_name(d.get("name"))
     return saved_name or target
@@ -1585,6 +1792,30 @@ def _audio_output_state():
         "dac_name": name,
     }
     out.update(_audio_output_locked_state())
+    return out
+
+
+def _audio_output_settings_state():
+    out = _audio_output_state()
+    selected = _find_discovered_audio_device(out.get("alsa_device"))
+    recommended_only = _recommended_audio_outputs_only()
+    out.update({
+        "recommended_only": recommended_only,
+        "device_available": bool(selected),
+        "device_recommended": bool(selected and selected.get("recommended")),
+        "device_recommendation": (
+            selected.get("recommendation") if selected else "unavailable"
+        ),
+        "device_recommendation_reason": (
+            selected.get("recommendation_reason")
+            if selected else
+            "The saved output is not currently available."
+        ),
+        "device_selectable": bool(
+            selected and (selected.get("recommended") or not recommended_only)
+        ),
+        "other_audio_output_warning_version": _OTHER_AUDIO_OUTPUT_WARNING_VERSION,
+    })
     return out
 
 
@@ -2232,14 +2463,26 @@ def _set_audio_output_preference(driver, device, dac_name=""):
     global ALSA_DRIVER, ALSA_DEVICE, ALSA_DAC_NAME
     driver = _validate_audio_driver(driver)
     device = _validate_audio_device(device)
-    name = _normalise_dac_name(dac_name) or _resolve_dac_name(device)
+    discovered = _find_discovered_audio_device(device)
+    if not discovered:
+        raise ValueError("Selected ALSA output is not currently available.")
+    if _recommended_audio_outputs_only() and not discovered.get("recommended"):
+        raise ValueError(
+            "This is an Other output. Turn off Only show recommended devices "
+            "and accept the Volume Safety warning before selecting it."
+        )
+    name = (
+        _normalise_dac_name(discovered.get("name"))
+        or _normalise_dac_name(dac_name)
+        or device
+    )
     _save_audio_output_config(driver, device, name)
     with _AUDIO_OUTPUT_LOCK:
         ALSA_DRIVER = driver
         ALSA_DEVICE = device
         ALSA_DAC_NAME = name
     logger.info("Audio output preference saved: %s / %s (%s)", driver, device, name or "unnamed")
-    return _audio_output_state()
+    return _audio_output_settings_state()
 
 
 # =========================================================================
@@ -2269,6 +2512,73 @@ def _save_app_settings():
         os.replace(tmp, _APP_SETTINGS_FILE)
     except Exception as e:
         logger.warning("save_app_settings failed: %s", e)
+
+
+def _recommended_audio_outputs_only():
+    with _APP_SETTINGS_LOCK:
+        value = _APP_SETTINGS.get("recommended_audio_outputs_only", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in ("0", "false", "no", "off")
+    return bool(value)
+
+
+def _audio_device_filter_state():
+    with _APP_SETTINGS_LOCK:
+        raw_acknowledged_version = _APP_SETTINGS.get(
+            "other_audio_outputs_warning_version", 0
+        )
+        raw_acknowledged_at = _APP_SETTINGS.get(
+            "other_audio_outputs_acknowledged_at", 0
+        )
+    try:
+        acknowledged_version = int(raw_acknowledged_version or 0)
+    except Exception:
+        acknowledged_version = 0
+    try:
+        acknowledged_at = int(raw_acknowledged_at or 0)
+    except Exception:
+        acknowledged_at = 0
+    return {
+        "recommended_only": _recommended_audio_outputs_only(),
+        "warning_version": _OTHER_AUDIO_OUTPUT_WARNING_VERSION,
+        "acknowledged_warning_version": acknowledged_version,
+        "acknowledged_at": acknowledged_at,
+    }
+
+
+def _set_recommended_audio_outputs_only(
+    enabled,
+    warning_acknowledged=False,
+    warning_version=None,
+):
+    if not isinstance(enabled, bool):
+        raise ValueError("recommended_only must be true or false.")
+    if not enabled:
+        try:
+            acknowledged_version = int(warning_version or 0)
+        except Exception:
+            acknowledged_version = 0
+        if warning_acknowledged is not True:
+            raise ValueError(
+                "The Volume Safety warning must be accepted before showing Other outputs."
+            )
+        if acknowledged_version != _OTHER_AUDIO_OUTPUT_WARNING_VERSION:
+            raise ValueError("The current Volume Safety warning must be accepted.")
+
+    with _APP_SETTINGS_LOCK:
+        _APP_SETTINGS["recommended_audio_outputs_only"] = enabled
+        if not enabled:
+            _APP_SETTINGS[
+                "other_audio_outputs_warning_version"
+            ] = _OTHER_AUDIO_OUTPUT_WARNING_VERSION
+            _APP_SETTINGS["other_audio_outputs_acknowledged_at"] = int(time.time())
+    _save_app_settings()
+    logger.info(
+        "Audio output visibility changed: recommended_only=%s warning_version=%s",
+        enabled,
+        _OTHER_AUDIO_OUTPUT_WARNING_VERSION if not enabled else "unchanged",
+    )
+    return _audio_device_filter_state()
 
 
 def _tidal_infinite_play_enabled():
@@ -4204,16 +4514,42 @@ def _local_library_maintenance_busy_payload(extra=None):
     return payload
 
 
+def _local_library_search_ready(data, availability):
+    data = data or {}
+    availability = availability or {}
+    configured_roots = availability.get("configured_roots") or []
+    active_roots = availability.get("active_roots") or []
+    return bool(
+        data.get("ok")
+        and configured_roots
+        and active_roots
+        and data.get("last_scan_at")
+        and not data.get("last_scan_error")
+        and not data.get("busy")
+        and not data.get("rebuild_running")
+        and data.get("maintenance_mode") != "local_library_rebuild"
+        and int(data.get("searchable_track_count") or 0) > 0
+    )
+
+
 def _local_library_status_payload():
     _sync_local_library_artwork_policy()
     availability = _music_root_availability()
     try:
-        # Status only reads database metadata. Passing no roots avoids any
-        # additional normalization or filesystem access.
-        data = LocalLibraryIndex(roots=[]).status()
+        # Read the base database metadata without configured roots, then count
+        # only rows belonging to roots already proven active by availability.
+        index = LocalLibraryIndex(roots=[])
+        data = index.status()
+        active_roots = availability["active_roots"]
+        data["searchable_track_count"] = (
+            index.track_count_for_roots(active_roots)
+            if active_roots
+            else 0
+        )
         data["roots"] = availability["active_roots"]
         data["configured_roots"] = availability["configured_roots"]
         data["unavailable_roots"] = availability["unavailable_roots"]
+        data["search_ready"] = _local_library_search_ready(data, availability)
         return data
     except LocalLibraryBusyError:
         return {
@@ -4223,6 +4559,8 @@ def _local_library_status_payload():
             "roots": availability["active_roots"],
             "configured_roots": availability["configured_roots"],
             "unavailable_roots": availability["unavailable_roots"],
+            "searchable_track_count": None,
+            "search_ready": False,
             "scan_running": True,
             "rebuild_running": local_library_rebuild_running(),
             "maintenance_mode": (
@@ -4238,6 +4576,8 @@ def _local_library_status_payload():
             "roots": availability["active_roots"],
             "configured_roots": availability["configured_roots"],
             "unavailable_roots": availability["unavailable_roots"],
+            "searchable_track_count": None,
+            "search_ready": False,
         }
 
 
@@ -5056,6 +5396,30 @@ def _local_library_play_payload(payload):
                 )
             if SHUFFLE_ON and PLAY_QUEUE:
                 _queue_shuffle_future_after_current_locked(_queue_current_identity_locked())
+            PLAY_QUEUE_PENDING_AFTER_CONTEXT = False
+        save_queue()
+    elif context_type in ("", "local"):
+        with _QUEUE_LOCK:
+            PLAY_QUEUE.clear()
+            ORIGINAL_QUEUE.clear()
+            PLAY_QUEUE_META_CACHE.clear()
+            PLAY_QUEUE.append(track_id)
+            ORIGINAL_QUEUE.append(track_id)
+            PLAY_QUEUE_META_CACHE[track_id] = {
+                "source": "local",
+                "id": track_id,
+                "title": track.get("title") or "",
+                "artist": track.get("artist") or "",
+                "album": track.get("album") or "",
+                "cover": artwork_url or "",
+                "artwork_url": artwork_url or "",
+                "duration": int(track.get("duration") or 0),
+                "quality": "LOCAL",
+                "is_cue_track": int(track.get("is_cue_track") or 0),
+                "cue_start_seconds": track.get("cue_start_seconds"),
+                "cue_end_seconds": track.get("cue_end_seconds"),
+            }
+            QUEUE_INDEX = 0
             PLAY_QUEUE_PENDING_AFTER_CONTEXT = False
         save_queue()
     try:
@@ -8062,18 +8426,55 @@ class ControlHandler(BaseHTTPRequestHandler):
 
         # -- Audio output / DAC preference -------------------------------
         if self.path == "/api/audio/output":
-            self._send_json(_audio_output_state())
+            self._send_json(_audio_output_settings_state(), no_store=True)
             return
 
         if self.path == "/api/audio/devices":
+            recommended_only = _recommended_audio_outputs_only()
+            all_devices = _discover_audio_devices(include_other=True)
+            devices = [
+                device for device in all_devices
+                if device.get("recommended") or not recommended_only
+            ]
+            with _AUDIO_OUTPUT_LOCK:
+                current_driver = ALSA_DRIVER
+                current_device = ALSA_DEVICE
+                current_name = ALSA_DAC_NAME
+            current_info = next(
+                (
+                    device for device in all_devices
+                    if device.get("device") == current_device
+                ),
+                None,
+            )
             self._send_json({
-                "devices": _discover_audio_devices(),
+                "devices": devices,
+                "recommended_only": recommended_only,
+                "warning_version": _OTHER_AUDIO_OUTPUT_WARNING_VERSION,
                 "current": {
-                    "driver": ALSA_DRIVER,
-                    "device": ALSA_DEVICE,
-                    "dac_name": _resolve_dac_name(ALSA_DEVICE),
+                    "driver": current_driver,
+                    "device": current_device,
+                    "dac_name": (
+                        current_info.get("name")
+                        if current_info else
+                        (current_name or current_device)
+                    ),
+                    "available": bool(current_info),
+                    "recommended": bool(
+                        current_info and current_info.get("recommended")
+                    ),
+                    "recommendation": (
+                        current_info.get("recommendation")
+                        if current_info else
+                        "unavailable"
+                    ),
                 }
-            })
+            }, no_store=True)
+            return
+
+        # -- Application release metadata ----------------------------------
+        if static_path == "/api/version":
+            self._send_json(read_version_payload(), no_store=True)
             return
 
         # -- Network / Remote Access ---------------------------------------
@@ -8232,7 +8633,9 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "source":           playback_source,
                 "title":            context_for_status.get("title"),
                 "artist":           context_for_status.get("artist"),
+                "artist_id":        context_for_status.get("artist_id"),
                 "album":            context_for_status.get("album"),
+                "album_id":         context_for_status.get("album_id"),
                 "cover":            context_for_status.get("cover"),
                 "duration":         context_for_status.get("duration"),
                 "context_type":     status_context_type,
@@ -10011,6 +10414,20 @@ class ControlHandler(BaseHTTPRequestHandler):
             return
 
         # -- Audio output / DAC preference -------------------------------
+        if self.path == "/api/audio/device-filter":
+            try:
+                state = _set_recommended_audio_outputs_only(
+                    payload.get("recommended_only"),
+                    warning_acknowledged=payload.get("warning_acknowledged") is True,
+                    warning_version=payload.get("warning_version"),
+                )
+                response = {"ok": True}
+                response.update(state)
+                self._send_json(response, no_store=True)
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, no_store=True)
+            return
+
         if self.path == "/api/audio/output":
             try:
                 locked = _audio_output_locked_state()

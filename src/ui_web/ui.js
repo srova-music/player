@@ -136,6 +136,11 @@ var lastSearchPayload = null;
 var onlineSourcesAvailable = true;
 var onlineSourcePollTimer = null;
 var ONLINE_SOURCE_OFFLINE_MESSAGE = "You are offline. Local Music remains available.";
+var globalSearchRequestedVisible = false;
+var globalSearchTidalReady = false;
+var globalSearchLocalReady = false;
+var globalSearchTidalRequestSerial = 0;
+var globalSearchLocalRequestSerial = 0;
 
 function fetchWithTimeout(url, options, timeoutMs) {
     options = options || {};
@@ -153,6 +158,79 @@ function fetchWithTimeout(url, options, timeoutMs) {
     });
 }
 
+function globalSearchHasReadySource() {
+    return !!(globalSearchTidalReady || globalSearchLocalReady);
+}
+
+function applyGlobalSearchTidalStatus(data) {
+    data = data || {};
+    globalSearchTidalReady = !!(
+        data.logged_in === true &&
+        data.tidal_online === true &&
+        data.offline !== true &&
+        onlineSourcesAvailable
+    );
+    setGlobalSearchVisible(globalSearchRequestedVisible);
+}
+
+function applyGlobalSearchLocalStatus(data) {
+    globalSearchLocalReady = !!(data && data.search_ready === true);
+    setGlobalSearchVisible(globalSearchRequestedVisible);
+}
+
+function refreshGlobalSearchTidalAvailability() {
+    var requestSerial = ++globalSearchTidalRequestSerial;
+    return fetchWithTimeout(
+        "/tidal/status?_=" + encodeURIComponent(String(Date.now())),
+        {cache: "no-store"},
+        4000
+    )
+        .then(function(res) {
+            if (!res.ok) { throw new Error("TIDAL status unavailable"); }
+            return res.json();
+        })
+        .then(function(data) {
+            if (requestSerial !== globalSearchTidalRequestSerial) { return null; }
+            applyGlobalSearchTidalStatus(data || {});
+            return data || {};
+        })
+        .catch(function() {
+            if (requestSerial !== globalSearchTidalRequestSerial) { return null; }
+            applyGlobalSearchTidalStatus({});
+            return null;
+        });
+}
+
+function refreshGlobalSearchLocalAvailability() {
+    var requestSerial = ++globalSearchLocalRequestSerial;
+    return fetchWithTimeout(
+        "/api/local/library/status",
+        {cache: "no-store"},
+        4000
+    )
+        .then(function(res) {
+            if (!res.ok) { throw new Error("Local library status unavailable"); }
+            return res.json();
+        })
+        .then(function(data) {
+            if (requestSerial !== globalSearchLocalRequestSerial) { return null; }
+            applyGlobalSearchLocalStatus(data || {});
+            return data || {};
+        })
+        .catch(function() {
+            if (requestSerial !== globalSearchLocalRequestSerial) { return null; }
+            applyGlobalSearchLocalStatus({});
+            return null;
+        });
+}
+
+function refreshGlobalSearchAvailability() {
+    return Promise.all([
+        refreshGlobalSearchTidalAvailability(),
+        refreshGlobalSearchLocalAvailability()
+    ]);
+}
+
 function applyOnlineSourceAvailability(online) {
     var wasOnline = onlineSourcesAvailable;
     onlineSourcesAvailable = online !== false;
@@ -163,6 +241,12 @@ function applyOnlineSourceAvailability(online) {
     if (input) {
         input.disabled = !onlineSourcesAvailable;
         input.placeholder = onlineSourcesAvailable ? "Search TIDAL..." : ONLINE_SOURCE_OFFLINE_MESSAGE;
+    }
+    if (!onlineSourcesAvailable) {
+        globalSearchTidalReady = false;
+        setGlobalSearchVisible(globalSearchRequestedVisible);
+    } else if (!wasOnline && globalSearchRequestedVisible) {
+        refreshGlobalSearchTidalAvailability();
     }
     if (wasOnline && !onlineSourcesAvailable && lastKnownPlaybackStatus) {
         var source = String(lastKnownPlaybackStatus.source || "").toLowerCase();
@@ -217,6 +301,11 @@ function refreshOnlineSourceState() {
         })
         .catch(function() {
             applyOnlineSourceAvailability(true);
+        })
+        .then(function() {
+            if (globalSearchRequestedVisible) {
+                refreshGlobalSearchLocalAvailability();
+            }
         });
 }
 
@@ -1547,10 +1636,14 @@ function shouldResetTrackListDetailScroll(endpoint) {
 }
 
 function setGlobalSearchVisible(visible) {
+    globalSearchRequestedVisible = visible === true;
+    visible = globalSearchRequestedVisible && globalSearchHasReadySource();
     if (searchBox) {
         if (visible) {
+            searchBox.classList.remove("hidden");
             searchBox.style.removeProperty("display");
         } else {
+            searchBox.classList.add("hidden");
             searchBox.style.setProperty("display", "none", "important");
         }
     }
@@ -1568,6 +1661,15 @@ function setGlobalSearchVisible(visible) {
             searchInput.setAttribute("aria-hidden", "true");
             if (searchClear) { searchClear.classList.add("hidden"); }
         }
+    }
+    if (
+        globalSearchRequestedVisible &&
+        !visible &&
+        searchView &&
+        searchView.style.display !== "none"
+    ) {
+        if (searchResults) { searchResults.innerHTML = ""; }
+        showView("home");
     }
 }
 
@@ -1621,6 +1723,11 @@ function readSavedSearchPayload() {
 }
 
 function restoreSearchView() {
+    if (!globalSearchHasReadySource()) {
+        setGlobalSearchVisible(true);
+        showView("home");
+        return;
+    }
     showView("search");
 
     var savedTab = "";
@@ -1731,6 +1838,7 @@ var currentSettingsTab = "audio";
 var _settingsRenderToken = 0;
 var _tidalStatusRequestToken = 0;
 var SROVA_VOLUME_SAFETY_DISMISSED_KEY = "srovaVolumeSafetyWarningDismissedV1";
+var SROVA_OTHER_AUDIO_OUTPUT_WARNING_VERSION = 1;
 var SETTINGS_TABS = [
     { id: "audio", label: "Audio" },
     { id: "tidal", label: "TIDAL" },
@@ -1831,6 +1939,29 @@ function appendSettingsSections(st, panels) {
     panels.about.appendChild(buildAboutSection());
 }
 
+function loadAboutVersion(versionEl) {
+    if (!versionEl || typeof fetch !== "function") { return; }
+
+    fetch("/api/version?_=" + encodeURIComponent(String(Date.now())), {
+        cache: "no-store"
+    })
+        .then(function(res) {
+            if (!res.ok) { throw new Error("Version information unavailable"); }
+            return res.json();
+        })
+        .then(function(data) {
+            var displayVersion = String(
+                data && data.display_version ? data.display_version : ""
+            ).trim();
+            if (displayVersion) {
+                versionEl.textContent = "Ver " + displayVersion;
+            }
+        })
+        .catch(function() {
+            // Keep the neutral placeholder if release metadata cannot be read.
+        });
+}
+
 function buildAboutSection() {
     var sec = document.createElement("div");
     sec.className = "settingsSection settingsAboutSection";
@@ -1847,8 +1978,9 @@ function buildAboutSection() {
 
     var version = document.createElement("div");
     version.className = "settingsStatus settingsAboutVersion";
-    version.textContent = "Ver 1.0";
+    version.textContent = "Ver …";
     sec.appendChild(version);
+    loadAboutVersion(version);
 
     var websiteRow = document.createElement("div");
     websiteRow.className = "settingsAboutWebsiteRow";
@@ -2075,7 +2207,7 @@ function buildLocalMusicLibrarySection() {
 
     var maintenanceDesc = document.createElement("div");
     maintenanceDesc.className = "settingsSectionDesc localLibraryMaintenanceDesc";
-    maintenanceDesc.textContent = "Save folder changes, scan for new music, or refresh the current status.";
+    maintenanceDesc.textContent = "Save the folders shown above and scan them in one reliable step, or refresh the current status.";
     sec.appendChild(maintenanceDesc);
 
     var actions = document.createElement("div");
@@ -2083,13 +2215,9 @@ function buildLocalMusicLibrarySection() {
 
     var saveBtn = document.createElement("button");
     saveBtn.className = "settingsBtn";
-    saveBtn.textContent = "Save Folders";
+    saveBtn.textContent = "Save & Scan";
+    saveBtn.title = "Validate and save the folders shown above, then scan those saved folders.";
     actions.appendChild(saveBtn);
-
-    var scanBtn = document.createElement("button");
-    scanBtn.className = "settingsBtn";
-    scanBtn.textContent = "Scan Now";
-    actions.appendChild(scanBtn);
 
     var refreshBtn = document.createElement("button");
     refreshBtn.className = "settingsBtn";
@@ -2166,6 +2294,7 @@ function buildLocalMusicLibrarySection() {
     var localLibraryPathInputs = [];
     var networkLibraryPathInputs = [];
     var managedDisconnectInFlight = {};
+    var localLibraryRootsDirty = false;
 
     function normalizeLocalLibraryRoots(roots) {
         var clean = [];
@@ -2178,6 +2307,13 @@ function buildLocalMusicLibrarySection() {
             clean.push(value);
         }
         return clean;
+    }
+
+    function markLocalLibraryRootsUnsaved() {
+        localLibraryRootsDirty = true;
+        localLibrarySaveMessage = "";
+        localLibrarySaveMessageUntil = 0;
+        status.textContent = "Folder changes are not saved. Select Save & Scan to accept them.";
     }
 
     function updateLocalLibraryPathLabels() {
@@ -2219,6 +2355,7 @@ function buildLocalMusicLibrarySection() {
         pathInput.autocomplete = "off";
         pathInput.placeholder = placeholder || "/mnt/music";
         pathInput.value = String(value || "");
+        pathInput.addEventListener("input", markLocalLibraryRootsUnsaved);
         row.appendChild(pathInput);
 
         var browseBtn = document.createElement("button");
@@ -2240,6 +2377,7 @@ function buildLocalMusicLibrarySection() {
             var idx = inputList.indexOf(pathInput);
             if (idx >= 0) { inputList.splice(idx, 1); }
             updateLocalLibraryPathLabels();
+            markLocalLibraryRootsUnsaved();
         };
         row._localLibraryRemoveBtn = removeBtn;
         row.appendChild(removeBtn);
@@ -2365,6 +2503,7 @@ function buildLocalMusicLibrarySection() {
 
     function applyCanonicalMusicRootRows(data, managedMounts) {
         data = data && typeof data === "object" ? data : {};
+        localLibraryRootsDirty = false;
         if (Array.isArray(managedMounts)) {
             lastManagedNetworkMounts = managedMounts.slice();
         }
@@ -2416,7 +2555,7 @@ function buildLocalMusicLibrarySection() {
                     throw new Error((data && data.error) || "Could not save music folders.");
                 }
                 applyCanonicalMusicRootRows(data);
-                var msg = messagePrefix || data.message || "Music folders saved. Press Scan Now to update the SROVA index.";
+                var msg = messagePrefix || data.message || "Music folders saved. Select Save & Scan to update the SROVA index.";
                 localLibrarySaveMessage = msg;
                 localLibrarySaveMessageUntil = Date.now() + 9000;
                 status.textContent = msg;
@@ -2426,13 +2565,25 @@ function buildLocalMusicLibrarySection() {
     }
 
     function setBusy(isBusy) {
-        scanBtn.disabled = !!isBusy;
         saveBtn.disabled = !!isBusy;
         cleanupBtn.disabled = !!isBusy;
         rebuildBtn.disabled = !!isBusy;
         localAddFolderBtn.disabled = !!isBusy;
         networkAddFolderBtn.disabled = !!isBusy;
         networkDiscoverBtn.disabled = !!isBusy;
+        var editableControls = sec.querySelectorAll(
+            ".localLibraryPathInput, .localLibraryBrowseBtn, .localLibraryRemoveFolderBtn"
+        );
+        for (var i = 0; i < editableControls.length; i++) {
+            editableControls[i].disabled = !!isBusy;
+        }
+        if (!isBusy) {
+            saveBtn.textContent = "Save & Scan";
+        } else if (lastLocalLibraryStatusData && lastLocalLibraryStatusData.scan_running) {
+            saveBtn.textContent = isLocalLibraryMaintenance(lastLocalLibraryStatusData)
+                ? "Rebuilding..."
+                : "Scanning...";
+        }
     }
 
     function clearScanActivityHideTimer() {
@@ -2520,6 +2671,7 @@ function buildLocalMusicLibrarySection() {
 
     function renderStats(data, managedMounts) {
         lastLocalLibraryStatusData = data || {};
+        applyGlobalSearchLocalStatus(data || {});
         var stats = data && data.last_scan_stats ? data.last_scan_stats : {};
         var rows = [
             ["Tracks indexed", data && data.track_count !== undefined && data.track_count !== null ? data.track_count : "Unknown"],
@@ -2551,7 +2703,9 @@ function buildLocalMusicLibrarySection() {
             bits.push("Ready");
         }
         var statusText = bits.join(" - ");
-        if (localLibrarySaveMessage && Date.now() < localLibrarySaveMessageUntil) {
+        if (localLibraryRootsDirty) {
+            statusText = "Folder changes are not saved. Select Save & Scan to accept them.";
+        } else if (localLibrarySaveMessage && Date.now() < localLibrarySaveMessageUntil) {
             statusText = localLibrarySaveMessage;
         }
         status.textContent = statusText;
@@ -2572,7 +2726,9 @@ function buildLocalMusicLibrarySection() {
         }
 
         dbPath.textContent = data && data.db_path ? "DB: " + data.db_path : "";
-        applyCanonicalMusicRootRows(data, managedMounts);
+        if (!localLibraryRootsDirty) {
+            applyCanonicalMusicRootRows(data, managedMounts);
+        }
         applyLocalLibraryMaintenanceState(data || {});
         setBusy(data && (data.scan_running || isLocalLibraryMaintenance(data)));
     }
@@ -2616,6 +2772,33 @@ function buildLocalMusicLibrarySection() {
             });
     }
 
+    function startSavedMusicRootsScan() {
+        setBusy(true);
+        saveBtn.textContent = "Starting Scan...";
+        status.textContent = "Starting local library scan... SROVA is designed to be a bit-perfect lossless audio player. Supported lossless formats: FLAC, ALAC/M4A, WAV/WAVE and AIFF/AIF. MP3, AAC and other lossy formats are ignored by design.";
+        scanActivitySeenRunning = true;
+        setScanActivityVisibleForMinimum();
+        renderScanActivity({scan_running: true, last_scan_stats: lastLocalLibraryStatusData && lastLocalLibraryStatusData.last_scan_stats}, lastLocalLibraryStatusData && lastLocalLibraryStatusData.last_scan_stats ? lastLocalLibraryStatusData.last_scan_stats : {});
+        if (!_localLibrarySettingsPoll) {
+            _localLibrarySettingsPoll = setInterval(loadStatus, 2000);
+        }
+        return fetch("/api/local/library/scan", {method: "POST"})
+            .then(function(res) { return res.json(); })
+            .then(function(data) {
+                if (!data || !data.ok) {
+                    showLocalLibraryActionError(data, "Could not start scan.");
+                    return false;
+                }
+                saveBtn.textContent = "Scanning...";
+                loadStatus();
+                return true;
+            })
+            .catch(function() {
+                showLocalLibraryActionError(null, "Could not start scan.");
+                return false;
+            });
+    }
+
     saveBtn.onclick = function() {
         var localRoots = getRootsFromInputs(localLibraryPathInputs);
         var networkRoots = getRootsFromInputs(networkLibraryPathInputs);
@@ -2626,36 +2809,19 @@ function buildLocalMusicLibrarySection() {
             if (typeof showQueueActionToast === "function") { showQueueActionToast(emptyMessage, true); }
             return;
         }
+        setBusy(true);
+        saveBtn.textContent = "Saving...";
         status.textContent = "Saving music folders...";
-        saveCurrentMusicRoots()
+        saveCurrentMusicRoots("Music folders saved. Starting scan...")
+            .then(function() {
+                return startSavedMusicRootsScan();
+            })
             .catch(function(err) {
                 var errorMessage = (err && err.message) || "Could not save music folders.";
+                localLibraryRootsDirty = true;
+                setBusy(false);
                 status.textContent = errorMessage;
                 if (typeof showQueueActionToast === "function") { showQueueActionToast(errorMessage, true); }
-            });
-    };
-
-    scanBtn.onclick = function() {
-        scanBtn.disabled = true;
-        status.textContent = "Starting local library scan... SROVA is designed to be a bit-perfect lossless audio player. Supported lossless formats: FLAC, ALAC/M4A, WAV/WAVE and AIFF/AIF. MP3, AAC and other lossy formats are ignored by design.";
-        scanActivitySeenRunning = true;
-        setScanActivityVisibleForMinimum();
-        renderScanActivity({scan_running: true, last_scan_stats: lastLocalLibraryStatusData && lastLocalLibraryStatusData.last_scan_stats}, lastLocalLibraryStatusData && lastLocalLibraryStatusData.last_scan_stats ? lastLocalLibraryStatusData.last_scan_stats : {});
-        if (!_localLibrarySettingsPoll) {
-            _localLibrarySettingsPoll = setInterval(loadStatus, 2000);
-        }
-        fetch("/api/local/library/scan", {method: "POST"})
-            .then(function(res) { return res.json(); })
-            .then(function(data) {
-                if (!data || !data.ok) {
-                    showLocalLibraryActionError(data, "Could not start scan.");
-                    return;
-                }
-                loadStatus();
-            })
-            .catch(function() {
-                status.textContent = "Could not start scan.";
-                scanBtn.disabled = false;
             });
     };
 
@@ -2690,7 +2856,8 @@ function buildLocalMusicLibrarySection() {
 
     function runRebuildLibrary() {
         rebuildBtn.disabled = true;
-        scanBtn.disabled = true;
+        saveBtn.disabled = true;
+        saveBtn.textContent = "Rebuilding...";
         cleanupBtn.disabled = true;
         status.textContent = "Starting local library rebuild...";
         scanActivitySeenRunning = true;
@@ -2726,11 +2893,13 @@ function buildLocalMusicLibrarySection() {
 
     localAddFolderBtn.onclick = function() {
         var input = addLocalLibraryPathRow("");
+        markLocalLibraryRootsUnsaved();
         setTimeout(function() { input.focus(); }, 0);
     };
 
     networkAddFolderBtn.onclick = function() {
         var input = addNetworkLibraryPathRow("");
+        markLocalLibraryRootsUnsaved();
         setTimeout(function() { input.focus(); }, 0);
     };
 
@@ -3042,7 +3211,7 @@ function openNetworkShareDiscoveryModal(options) {
                 return;
             }
             if (options.addNetworkPath && data.mount_path) { options.addNetworkPath(data.mount_path); }
-            var message = "Share connected read-only. Press Scan Now to update the SROVA index.";
+            var message = "Share connected read-only. Select Save & Scan to update the SROVA index.";
             setStatus(message, false);
             if (options.setStatus) { options.setStatus(message, false); }
             if (options.reloadStatus) { options.reloadStatus(); }
@@ -3434,6 +3603,7 @@ function openLocalLibraryFolderBrowser(pathInput) {
     selectBtn.onclick = function() {
         if (currentPath && pathInput) {
             pathInput.value = currentPath;
+            pathInput.dispatchEvent(new Event("input", {bubbles: true}));
         }
         closeModal();
     };
@@ -3909,6 +4079,171 @@ function showSrovaVolumeSafetyModal() {
         clearInterval(timer);
         if (modal.parentNode) { modal.parentNode.removeChild(modal); }
     };
+}
+
+
+function showOtherAudioOutputsWarning(onAccept, onCancel) {
+    if (document.getElementById("srovaOtherOutputsWarningModal")) { return; }
+
+    var modal = document.createElement("div");
+    modal.id = "srovaOtherOutputsWarningModal";
+    modal.className = "srovaVolumeSafetyModal srovaOtherOutputsWarningModal";
+
+    var card = document.createElement("div");
+    card.className = "srovaVolumeSafetyWarning srovaOtherOutputsWarningPanel";
+    card.setAttribute("role", "alertdialog");
+    card.setAttribute("aria-modal", "true");
+    card.setAttribute("aria-labelledby", "srovaOtherOutputsWarningTitle");
+    card.setAttribute("aria-describedby", "srovaOtherOutputsWarningSummary");
+
+    var icon = document.createElement("div");
+    icon.className = "srovaVolumeSafetyIcon";
+    icon.textContent = "\u26A0";
+    card.appendChild(icon);
+
+    var body = document.createElement("div");
+    body.className = "srovaVolumeSafetyBody";
+
+    var title = document.createElement("h2");
+    title.id = "srovaOtherOutputsWarningTitle";
+    title.className = "srovaVolumeSafetyTitle";
+    title.textContent = "READ CAREFULLY \u2014 DANGER: RISK OF PERMANENT HEARING LOSS AND EQUIPMENT DAMAGE";
+    body.appendChild(title);
+
+    var summary = document.createElement("p");
+    summary.id = "srovaOtherOutputsWarningSummary";
+    summary.className = "srovaVolumeSafetySummary";
+    summary.textContent =
+        "SROVA uses exclusive audio output at a fixed 100% digital level. When you enable Other output devices\u2014including built-in speakers, headphone sockets, HDMI/DisplayPort outputs, or unverified audio devices\u2014the normal volume controls in your operating system, browser, phone, tablet, application, or connected device may not reduce the playback level.";
+    body.appendChild(summary);
+
+    var consequenceIntro = document.createElement("p");
+    consequenceIntro.textContent =
+        "Playback may begin suddenly at an extremely high level. This can cause:";
+    body.appendChild(consequenceIntro);
+
+    var consequenceList = document.createElement("ul");
+    [
+        "Immediate and permanent hearing loss or tinnitus.",
+        "Permanent damage to headphones or in-ear monitors (IEMs).",
+        "Damage to speakers, amplifiers, or other connected audio equipment."
+    ].forEach(function(text) {
+        var item = document.createElement("li");
+        item.textContent = text;
+        consequenceList.appendChild(item);
+    });
+    body.appendChild(consequenceList);
+
+    var preparationIntro = document.createElement("p");
+    preparationIntro.className = "srovaOtherOutputsWarningLead";
+    preparationIntro.textContent = "Before continuing:";
+    body.appendChild(preparationIntro);
+
+    var preparationList = document.createElement("ul");
+    [
+        "Remove headphones or IEMs from your ears.",
+        "Set the physical volume control on your DAC, amplifier, or powered speakers to its minimum level.",
+        "Confirm that a working hardware volume control is present in the audio chain.",
+        "Increase the hardware volume slowly only after playback has started safely."
+    ].forEach(function(text) {
+        var item = document.createElement("li");
+        item.textContent = text;
+        preparationList.appendChild(item);
+    });
+    body.appendChild(preparationList);
+
+    var acknowledgement = document.createElement("p");
+    acknowledgement.textContent =
+        "By continuing, you confirm that you understand and voluntarily accept these risks. You are responsible for ensuring that suitable hardware volume control and safe listening levels are used.";
+    body.appendChild(acknowledgement);
+
+    var disclaimer = document.createElement("p");
+    disclaimer.className = "srovaOtherOutputsDisclaimer";
+    disclaimer.textContent =
+        "To the fullest extent permitted by applicable law, SROVA and its developers disclaim responsibility for hearing injury or damage to audio equipment resulting from the use of non-recommended outputs or the absence or misuse of appropriate hardware volume control. This notice does not affect any rights or liabilities that cannot lawfully be excluded.";
+    body.appendChild(disclaimer);
+
+    var controls = document.createElement("div");
+    controls.className = "srovaVolumeSafetyControls";
+
+    var checkboxLabel = document.createElement("label");
+    checkboxLabel.className = "srovaVolumeSafetyCheckbox";
+    var checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkboxLabel.appendChild(checkbox);
+    var checkboxText = document.createElement("span");
+    checkboxText.textContent =
+        "I understand that enabling Other output devices can cause permanent hearing loss and permanent damage to headphones, IEMs, speakers, amplifiers, or other equipment.";
+    checkboxLabel.appendChild(checkboxText);
+    controls.appendChild(checkboxLabel);
+
+    var countdown = document.createElement("div");
+    countdown.className = "srovaVolumeSafetyCountdown";
+    controls.appendChild(countdown);
+
+    var actions = document.createElement("div");
+    actions.className = "srovaVolumeSafetyActions";
+
+    var cancelButton = document.createElement("button");
+    cancelButton.type = "button";
+    cancelButton.className = "srovaVolumeSafetyCancelButton";
+    cancelButton.textContent = "Cancel \u2014 Keep Recommended Devices Only";
+    actions.appendChild(cancelButton);
+
+    var acceptButton = document.createElement("button");
+    acceptButton.type = "button";
+    acceptButton.className = "srovaVolumeSafetyButton";
+    acceptButton.disabled = true;
+    acceptButton.textContent = "I Accept the Risk \u2014 Show All Devices";
+    actions.appendChild(acceptButton);
+    controls.appendChild(actions);
+
+    body.appendChild(controls);
+    card.appendChild(body);
+    modal.appendChild(card);
+    document.body.appendChild(modal);
+
+    var remaining = 20;
+    var timer = null;
+
+    function syncAcceptanceState() {
+        if (remaining > 0) {
+            countdown.textContent = "Please read this warning carefully... " + remaining + "s";
+        } else if (!checkbox.checked) {
+            countdown.textContent = "Tick the acknowledgement box to continue.";
+        } else {
+            countdown.textContent = "You may continue.";
+        }
+        acceptButton.disabled = remaining > 0 || !checkbox.checked;
+    }
+
+    function closeWarning(accepted) {
+        if (timer) { clearInterval(timer); }
+        if (modal.parentNode) { modal.parentNode.removeChild(modal); }
+        if (accepted) {
+            if (typeof onAccept === "function") { onAccept(); }
+        } else if (typeof onCancel === "function") {
+            onCancel();
+        }
+    }
+
+    checkbox.addEventListener("change", syncAcceptanceState);
+    cancelButton.onclick = function() { closeWarning(false); };
+    acceptButton.onclick = function() {
+        if (acceptButton.disabled) { return; }
+        closeWarning(true);
+    };
+
+    timer = setInterval(function() {
+        remaining = Math.max(0, remaining - 1);
+        syncAcceptanceState();
+        if (remaining === 0 && timer) {
+            clearInterval(timer);
+            timer = null;
+        }
+    }, 1000);
+    syncAcceptanceState();
+    cancelButton.focus();
 }
 
 
@@ -4733,8 +5068,36 @@ function buildDacSection() {
 
     var desc = document.createElement("div");
     desc.className   = "settingsSectionDesc";
-    desc.textContent = "Choose the ALSA output used by SROVA's existing bit-perfect path. Release the DAC before changing output; then save and use Exclusive Mode to reacquire it.";
+    desc.textContent = "Choose the ALSA output used by SROVA's existing bit-perfect path. Release the DAC before changing output; unlocked selections validate and save automatically.";
     sec.appendChild(desc);
+
+    var recommendedOnly = true;
+    var filterSaveInFlight = false;
+    var audioOutputSafetyReady = false;
+    var filterRow = document.createElement("div");
+    filterRow.className = "settingsToggleRow dacDeviceFilterRow";
+
+    var filterCopy = document.createElement("div");
+    filterCopy.className = "settingsToggleCopy";
+    var filterLabel = document.createElement("div");
+    filterLabel.className = "settingsLabel";
+    filterLabel.textContent = "Only show recommended devices";
+    var filterSub = document.createElement("div");
+    filterSub.className = "settingsToggleSub";
+    filterSub.textContent = "Enabled \u2014 external USB DACs and supported audio HATs only";
+    filterCopy.appendChild(filterLabel);
+    filterCopy.appendChild(filterSub);
+
+    var filterToggle = document.createElement("button");
+    filterToggle.type = "button";
+    filterToggle.className = "settingsToggleSwitch active";
+    filterToggle.setAttribute("aria-label", "Only show recommended devices");
+    filterToggle.setAttribute("aria-pressed", "true");
+    filterToggle.innerHTML = "<span></span>";
+
+    filterRow.appendChild(filterCopy);
+    filterRow.appendChild(filterToggle);
+    sec.appendChild(filterRow);
 
     var currentBox = document.createElement("div");
     currentBox.className = "dacCurrentOutput";
@@ -4790,11 +5153,6 @@ function buildDacSection() {
     refreshBtn.textContent = "Refresh Devices";
     actionRow.appendChild(refreshBtn);
 
-    var saveBtn = document.createElement("button");
-    saveBtn.className = "settingsBtn";
-    saveBtn.textContent = "Save DAC";
-    actionRow.appendChild(saveBtn);
-
     var releaseBtn = document.createElement("button");
     releaseBtn.className   = "settingsBtn settingsBtnDanger";
     releaseBtn.textContent = "Release DAC";
@@ -4808,6 +5166,17 @@ function buildDacSection() {
     sec.appendChild(actionRow);
     sec.appendChild(buildSrovaVolumeSafetyPanel(true));
 
+    var dacSaveInFlight = false;
+
+    function setFilterVisual(enabled) {
+        recommendedOnly = !!enabled;
+        filterToggle.className = "settingsToggleSwitch" + (recommendedOnly ? " active" : "");
+        filterToggle.setAttribute("aria-pressed", recommendedOnly ? "true" : "false");
+        filterSub.textContent = recommendedOnly ?
+            "Enabled \u2014 external USB DACs and supported audio HATs only" :
+            "Disabled \u2014 all detected system outputs are visible";
+    }
+
     function selectedDeviceName() {
         var opt = deviceSelect.options[deviceSelect.selectedIndex];
         return opt ? (opt.getAttribute("data-name") || "") : "";
@@ -4815,9 +5184,13 @@ function buildDacSection() {
 
     function setLockedState(state) {
         var locked = !!(state && state.dac_locked);
-        driverSelect.disabled = locked;
-        deviceSelect.disabled = locked;
-        saveBtn.disabled = locked;
+        var hasSelectedDevice = !!deviceSelect.value;
+        var hasAvailableDevice = Array.prototype.some.call(
+            deviceSelect.options,
+            function(opt) { return !!opt.value; }
+        );
+        driverSelect.disabled = locked || dacSaveInFlight || !hasSelectedDevice;
+        deviceSelect.disabled = locked || dacSaveInFlight || !hasAvailableDevice;
         currentDacName = _dacDisplayName(state && state.dac_name, state && state.alsa_driver, state && state.alsa_device);
         currentDacLocked = locked;
         syncDacNameDisplay();
@@ -4825,28 +5198,71 @@ function buildDacSection() {
             lockNotice.textContent = "Unlock DAC to change audio output. Use Release DAC to stop playback and release the current device.";
             lockNotice.classList.add("dacLocked");
         } else {
-            lockNotice.textContent = "DAC released. Choose an output, save it, then use Exclusive Mode when you are ready.";
+            lockNotice.textContent = "DAC released. Choose an output; the selection saves automatically. Then use Exclusive Mode when you are ready.";
             lockNotice.classList.remove("dacLocked");
         }
     }
 
-    function renderDevices(devices, current) {
+    function renderDevices(devices, current, showRecommendedOnly) {
         var currentDevice = (current && (current.device || current.alsa_device)) || "hw:0,0";
         var currentDriver = (current && (current.driver || current.alsa_driver)) || "ALSA";
-        var currentName   = (current && current.dac_name) || "";
         deviceSelect.innerHTML = "";
         if (!devices || !devices.length) {
-            devices = [{ label: (currentName || "Current output") + " — " + currentDevice, name: currentName || "Current output", driver: currentDriver, device: currentDevice }];
+            var emptyOption = document.createElement("option");
+            emptyOption.value = "";
+            emptyOption.textContent = showRecommendedOnly ?
+                "No recommended devices detected" :
+                "No audio output devices detected";
+            emptyOption.disabled = true;
+            emptyOption.selected = true;
+            deviceSelect.appendChild(emptyOption);
         }
-        devices.forEach(function(d) {
+
+        var recommendedGroup = null;
+        var otherGroup = null;
+        if (!showRecommendedOnly && devices && devices.length) {
+            recommendedGroup = document.createElement("optgroup");
+            recommendedGroup.label = "Recommended devices";
+            otherGroup = document.createElement("optgroup");
+            otherGroup.label = "Other system outputs";
+        }
+
+        (devices || []).forEach(function(d) {
             var opt = document.createElement("option");
             opt.value = d.device;
-            opt.textContent = d.label || ((d.name || "ALSA output") + " — " + d.device);
+            var recommendationLabel = (!showRecommendedOnly && d.recommended) ?
+                " (Recommended)" : "";
+            opt.textContent = (d.name || "ALSA output") + recommendationLabel + " \u2014 " + d.device;
             opt.setAttribute("data-name", d.name || "");
-            deviceSelect.appendChild(opt);
+            opt.setAttribute("data-recommended", d.recommended ? "true" : "false");
+            if (showRecommendedOnly) {
+                deviceSelect.appendChild(opt);
+            } else if (d.recommended) {
+                recommendedGroup.appendChild(opt);
+            } else {
+                otherGroup.appendChild(opt);
+            }
         });
+        if (!showRecommendedOnly && recommendedGroup) {
+            if (recommendedGroup.children.length) { deviceSelect.appendChild(recommendedGroup); }
+            if (otherGroup.children.length) { deviceSelect.appendChild(otherGroup); }
+        }
         driverSelect.value = currentDriver;
-        deviceSelect.value = currentDevice;
+        var currentOption = Array.prototype.some.call(deviceSelect.options, function(opt) {
+            return opt.value === currentDevice;
+        });
+        if (currentOption) {
+            deviceSelect.value = currentDevice;
+        } else if (devices && devices.length) {
+            var chooseOption = document.createElement("option");
+            chooseOption.value = "";
+            chooseOption.textContent = showRecommendedOnly ?
+                "Select a recommended output" :
+                "Select an audio output";
+            chooseOption.disabled = true;
+            chooseOption.selected = true;
+            deviceSelect.insertBefore(chooseOption, deviceSelect.firstChild);
+        }
     }
 
     function loadDacUi(message) {
@@ -4857,22 +5273,113 @@ function buildDacSection() {
         ]).then(function(results) {
             var output = results[0] || {};
             var devicesPayload = results[1] || {};
-            var devices = devicesPayload.devices || [];
+            audioOutputSafetyReady =
+                Number(devicesPayload.warning_version || 0) ===
+                    SROVA_OTHER_AUDIO_OUTPUT_WARNING_VERSION &&
+                typeof devicesPayload.recommended_only === "boolean";
+            var devices = audioOutputSafetyReady ?
+                (devicesPayload.devices || []) :
+                [];
+            var nextRecommendedOnly = audioOutputSafetyReady ?
+                devicesPayload.recommended_only !== false :
+                true;
+            setFilterVisual(nextRecommendedOnly);
             renderDevices(devices, {
                 driver: output.alsa_driver,
                 device: output.alsa_device,
                 dac_name: output.dac_name
-            });
+            }, nextRecommendedOnly);
             var display = _dacDisplayName(output.dac_name, output.alsa_driver, output.alsa_device);
+            var recommendationNote = "";
+            if (output.device_available === false) {
+                recommendationNote =
+                    '<div class="dacOtherOutputNotice">Saved output is currently unavailable.</div>';
+            } else if (output.device_recommended === false) {
+                recommendationNote =
+                    '<div class="dacOtherOutputNotice">Current output is an Other system device. Turn off the recommended-device filter to manage or reselect it.</div>';
+            } else if (output.device_recommended === true) {
+                recommendationNote =
+                    '<div class="dacRecommendedOutputNotice">Recommended output</div>';
+            }
             currentBox.innerHTML = '<div class="settingsLabel">Current Output</div>' +
-                '<div class="dacCurrentMain">' + (output.alsa_driver || "ALSA") + ' / ' + (output.alsa_device || "hw:0,0") + '</div>' +
-                '<div class="dacCurrentName">' + (display || "Unknown DAC") + '</div>';
+                '<div class="dacCurrentMain">' + _escapeText(output.alsa_driver || "ALSA") + ' / ' + _escapeText(output.alsa_device || "hw:0,0") + '</div>' +
+                '<div class="dacCurrentName">' + _escapeText(display || "Unknown DAC") + '</div>' +
+                recommendationNote;
             setLockedState(output);
-            if (!message) { status.textContent = ""; }
+            filterToggle.disabled = filterSaveInFlight || !audioOutputSafetyReady;
+            if (!audioOutputSafetyReady) {
+                status.textContent =
+                    "Restart SROVA to activate the new audio-output safety controls.";
+                return;
+            }
+            if (!message) {
+                if (output.device_recommended === false && nextRecommendedOnly) {
+                    status.textContent =
+                        "Your current output is not recommended. Turn off Only show recommended devices to view Other outputs.";
+                } else if (!devices.length && nextRecommendedOnly) {
+                    status.textContent =
+                        "No recommended DAC is connected. You can show Other outputs after accepting the Volume Safety warning.";
+                } else {
+                    status.textContent = "";
+                }
+            }
         }).catch(function() {
             status.textContent = "Could not load DAC devices. Check the server is reachable.";
         });
     }
+
+    function saveDeviceFilter(enabled, warningAcknowledged) {
+        filterSaveInFlight = true;
+        filterToggle.disabled = true;
+        status.textContent = enabled ?
+            "Showing recommended devices only\u2026" :
+            "Enabling Other output devices\u2026";
+        fetch("/api/audio/device-filter", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                recommended_only: !!enabled,
+                warning_acknowledged: warningAcknowledged === true,
+                warning_version: SROVA_OTHER_AUDIO_OUTPUT_WARNING_VERSION
+            })
+        })
+        .then(function(res) { return res.json(); })
+        .then(function(data) {
+            if (!data || data.error || data.ok === false) {
+                throw new Error((data && data.error) || "Could not update device visibility.");
+            }
+            setFilterVisual(data.recommended_only !== false);
+            return loadDacUi(
+                data.recommended_only !== false ?
+                    "Only recommended devices are shown." :
+                    "All detected devices are shown. Recommended devices remain at the top."
+            );
+        })
+        .catch(function(error) {
+            setFilterVisual(recommendedOnly);
+            status.textContent = error && error.message ?
+                error.message :
+                "Could not update device visibility.";
+        })
+        .then(function() {
+            filterSaveInFlight = false;
+            filterToggle.disabled = false;
+        });
+    }
+
+    filterToggle.onclick = function() {
+        if (filterSaveInFlight || !audioOutputSafetyReady) { return; }
+        if (recommendedOnly) {
+            showOtherAudioOutputsWarning(function() {
+                saveDeviceFilter(false, true);
+            }, function() {
+                setFilterVisual(true);
+                status.textContent = "Recommended-device filtering remains enabled.";
+            });
+        } else {
+            saveDeviceFilter(true, false);
+        }
+    };
 
     refreshBtn.onclick = function() {
         refreshBtn.disabled = true;
@@ -4885,10 +5392,16 @@ function buildDacSection() {
         });
     };
 
-    saveBtn.onclick = function() {
-        saveBtn.disabled = true;
-        saveBtn.textContent = "Saving…";
-        status.textContent = "";
+    function saveSelectedDac() {
+        if (dacSaveInFlight || currentDacLocked || !deviceSelect.value) { return; }
+        dacSaveInFlight = true;
+        driverSelect.disabled = true;
+        deviceSelect.disabled = true;
+        filterToggle.disabled = true;
+        refreshBtn.disabled = true;
+        releaseBtn.disabled = true;
+        exclusiveBtn.disabled = true;
+        status.textContent = "Validating and saving selected DAC...";
         fetch("/api/audio/output", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -4900,22 +5413,28 @@ function buildDacSection() {
         })
         .then(function(res) { return res.json(); })
         .then(function(d) {
-            saveBtn.disabled = false;
-            saveBtn.textContent = "Save DAC";
+            dacSaveInFlight = false;
+            filterToggle.disabled = false;
+            refreshBtn.disabled = false;
+            releaseBtn.disabled = false;
+            exclusiveBtn.disabled = false;
             if (d.error) {
-                status.textContent = d.error;
-                loadDacUi();
-                return;
+                return loadDacUi("DAC was not saved: " + d.error);
             }
-            status.textContent = "DAC saved. Use Exclusive Mode to reacquire the selected output.";
-            loadDacUi("DAC saved. Use Exclusive Mode to reacquire the selected output.");
+            return loadDacUi("DAC saved automatically. Use Exclusive Mode to reacquire the selected output.");
         })
         .catch(function() {
-            saveBtn.disabled = false;
-            saveBtn.textContent = "Save DAC";
-            status.textContent = "Save failed. Check the server is reachable.";
+            dacSaveInFlight = false;
+            filterToggle.disabled = false;
+            refreshBtn.disabled = false;
+            releaseBtn.disabled = false;
+            exclusiveBtn.disabled = false;
+            loadDacUi("DAC was not saved. Check the server is reachable.");
         });
-    };
+    }
+
+    driverSelect.addEventListener("change", saveSelectedDac);
+    deviceSelect.addEventListener("change", saveSelectedDac);
 
     releaseBtn.onclick = function() {
         if (!confirm("Stop playback and release the DAC now?")) { return; }
@@ -5504,6 +6023,11 @@ function updateLoginBtn(loggedIn, options) {
     options = options || {};
     var changed = (isLoggedIn !== loggedIn);
     isLoggedIn = loggedIn;
+    if (!loggedIn) {
+        globalSearchTidalRequestSerial += 1;
+        globalSearchTidalReady = false;
+        setGlobalSearchVisible(globalSearchRequestedVisible);
+    }
     // loginBtn is no longer in the header -- only update DOM if it still exists
     if (loginBtn) {
         var icon = loginBtn.querySelector(".material-icons");
@@ -6289,6 +6813,10 @@ function pollStatus() {
                 totalTimeEl.textContent  = formatTime(s.duration || 0);
                 playerBar.classList.remove("hidden");
             }
+            // Keep navigation IDs in the same status snapshot as the visible
+            // player-bar metadata. Missing IDs deliberately clear stale links
+            // while a new TIDAL track is still resolving.
+            _updatePlayerBarLinks(s);
             syncPlayerTrayTrackInfo(s);
             if (nowPlayingView && !nowPlayingView.classList.contains("hidden")) {
                 syncNowPlayingButtons();
@@ -7138,6 +7666,7 @@ function loadHome() {
     showView("home");
     setCurrentSourceSection("");
     setGlobalSearchVisible(true);
+    refreshGlobalSearchAvailability();
     _cancelHomeSlotPolls();
     if (!homeSections) { return; }
     homeSections.innerHTML =
@@ -7315,7 +7844,6 @@ function requireSrovaRadioDac(onReady) {
 
         var dacName = String(data.dac_name || "").trim();
         var device = String(data.alsa_device || "").trim();
-
         if (dacName && device) {
             if (typeof onReady === "function") { onReady(); }
             return;
@@ -7768,6 +8296,7 @@ function fetchLocalLibraryStatus() {
     return fetch("/api/local/library/status")
         .then(function(res) { return res.json(); })
         .then(function(data) {
+            applyGlobalSearchLocalStatus(data || {});
             applyLocalLibraryMaintenanceState(data || {});
             return data || {};
         });
@@ -7912,6 +8441,20 @@ function openLocalArtistFromGlobalSearch(artist, artistCover, artistAlbumArtwork
         artistAlbumArtwork || {}
     );
     setLocalMusicGlobalSearchBackMode();
+}
+
+function openLocalArtistFromPlayerBar(artist, artistCover) {
+    artist = String(artist || "").trim();
+    if (!artist) { return; }
+    showView("localmusic");
+    setCurrentSourceSection("music");
+    setGlobalSearchVisible(false);
+    renderLocalMusicShell();
+    loadLocalArtist(artist, artistCover || "");
+    var backBtn = document.querySelector(".srovaMusicSourcePage .srovaSourceBack");
+    if (backBtn) {
+        backBtn.onclick = function() { loadHome(); };
+    }
 }
 
 function restoreLocalMusicSearchResults() {
@@ -8743,6 +9286,13 @@ function playLocalLibraryTrack(track, indexInContext) {
           playerArt.src = localCover || localAlbumArtDataUri(track.album || data.album || "Local Library", data.artist || track.artist || "");
           playerTrack.textContent = data.title || track.title || "";
           playerArtist.textContent = data.artist || track.artist || "";
+          _updatePlayerBarLinks({
+              source: "local",
+              current_track_id: currentPlayingId,
+              artist: data.artist || track.artist || "",
+              album: data.album || track.album || "",
+              cover: playerArt.src || ""
+          });
           syncPlayerTrayTrackInfo({
               source: "local",
               title: data.title || track.title || "",
@@ -10122,19 +10672,28 @@ function clearSearch() {
 
 function doSearch(query, opts) {
     opts = opts || {};
+    if (!globalSearchHasReadySource()) {
+        setGlobalSearchVisible(true);
+        showView("home");
+        return;
+    }
     lastSearchQuery = String(query || "").trim();
     showView("search");
     if (!opts.restore) { currentSearchTab = "top"; }
     searchResults.innerHTML = '<div class="searchLoading">Searching SROVA...</div>';
     var encoded = encodeURIComponent(query);
-    var localRequest = fetch("/api/local/library/search?q=" + encoded + "&limit=100")
-        .then(function(res) { return res.json(); })
-        .then(function(data) { return { ok: true, data: data || {} }; })
-        .catch(function() { return { ok: false, data: {} }; });
-    var tidalRequest = fetchWithTimeout("/tidal/search?q=" + encoded + "&limit=" + TIDAL_SEARCH_LIMIT, {}, 4500)
-        .then(function(res) { return res.json(); })
-        .then(function(data) { return { ok: true, data: data || {} }; })
-        .catch(function() { return { ok: false, data: {} }; });
+    var localRequest = globalSearchLocalReady
+        ? fetch("/api/local/library/search?q=" + encoded + "&limit=100")
+            .then(function(res) { return res.json(); })
+            .then(function(data) { return { ok: true, data: data || {} }; })
+            .catch(function() { return { ok: false, data: {} }; })
+        : Promise.resolve({ok: true, data: {}});
+    var tidalRequest = globalSearchTidalReady
+        ? fetchWithTimeout("/tidal/search?q=" + encoded + "&limit=" + TIDAL_SEARCH_LIMIT, {}, 4500)
+            .then(function(res) { return res.json(); })
+            .then(function(data) { return { ok: true, data: data || {} }; })
+            .catch(function() { return { ok: false, data: {} }; })
+        : Promise.resolve({ok: true, data: {}});
 
     Promise.all([localRequest, tidalRequest]).then(function(parts) {
         renderGlobalSearchResults({
@@ -13512,6 +14071,35 @@ function _updateNowPlayingLinks(s) {
 }
 
 function _updatePlayerBarLinks(s) {
+    s = s || {};
+    var source = String(s.source || "").toLowerCase();
+    var contextType = String(s.context_type || "").toLowerCase();
+    var statusTrackId = String(s.current_track_id || s.track_id || "");
+    var isLocal = source === "local" ||
+        contextType.indexOf("local") === 0 ||
+        statusTrackId.indexOf("local:") === 0;
+
+    if (isLocal) {
+        var localArtist = String(s.artist || "").trim();
+        if (playerArtist && localArtist) {
+            playerArtist.style.cursor = "pointer";
+            playerArtist.title = localArtist;
+            playerArtist.onclick = function() {
+                openLocalArtistFromPlayerBar(localArtist, s.cover || "");
+            };
+        } else if (playerArtist) {
+            playerArtist.style.cursor = "";
+            playerArtist.title = "";
+            playerArtist.onclick = null;
+        }
+        if (playerTrack) {
+            playerTrack.style.cursor = "";
+            playerTrack.title = "";
+            playerTrack.onclick = null;
+        }
+        return;
+    }
+
     // Make player bar artist clickable -> artist page
     if (playerArtist && s.artist_id) {
         playerArtist.style.cursor = "pointer";
