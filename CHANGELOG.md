@@ -1,5 +1,32 @@
 # SROVA Changelog
 
+## 1.1 (`1.1-1`) — 2026-08-06
+
+- Settings → About now reports the installed SROVA release version from package metadata instead of a stale hard-coded label.
+
+### Improved
+
+- Global Search now remains hidden until TIDAL is authenticated and online or My Music has a completed, non-empty, currently available searchable index
+- Global Search availability now follows TIDAL login/logout, network availability, Local Music scan completion, and music-folder availability
+- Unlocked DAC driver and output selections now validate and save automatically, while the existing release safety gate remains in place
+- DAC selection now shows recommended external USB and supported audio HAT outputs by default, with consent-gated access to all other detected system outputs
+- Other audio outputs now require an explicit hearing and equipment safety acknowledgement, while recommended devices remain labelled and grouped first
+- My Music now marks edited folder choices as unsaved and uses one Save & Scan action that saves successfully before scanning
+
+### Fixed
+
+- Removed a stale browser reference to the nonexistent legacy `ui.css` asset, eliminating its harmless 404 without changing rendered styles
+- Player-bar TIDAL artist and album links now follow the same status snapshot as the visible track metadata, preventing stale navigation after album switches
+- Local Music player-bar artist names now open the existing Local artist page, while Local track titles no longer route into broken TIDAL album pages
+- Local artist pages now populate album-card artwork and stable Local album IDs through the existing read-only album grouping path
+- Local artist page track rows now display their Local album artwork instead of the generic music-note tile
+- Direct Local track selections now synchronize the Play Queue and player-bar status with the file that actually started playing
+
+### Validation
+
+- Recommended-device filtering, the consent-gated Other-output flow, and live audio-output classification passed on an AMD64 NUC with a Topping DX5 II USB DAC and the internal `pcsp` output
+- ARM64 audio HAT validation remains a separate release target
+
 ## 1.0 (`1.0-1`) — 2026-07-27
 
 ### Added

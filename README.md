@@ -7,23 +7,23 @@ Internet Radio from a browser on another device.
 SROVA is designed around high-quality playback, a responsive browser interface
 and clear Bit-Perfect signal-path reporting.
 
-## Version 1 release
+## Version 1.1 release
 
 This public source snapshot corresponds to:
 
-- SROVA Version 1.0
-- Debian package version `1.0-1`
+- SROVA Version 1.1
+- Debian package version `1.1-1`
 - web and control port `8081`
 - qualified Debian package architectures: AMD64 and ARM64
 
-The clean public snapshot was derived from the private release tag `v1.0.0`,
-which resolves to commit
-`3209b033b75928d01ebb594955e32d0b64f4a9f9`.
+This Version 1.1 public source update was derived from the private
+package-ready release tag `v1.1.0-release`, which resolves to commit
+`2dbc72eeef81404420b8fd5cb72e6dd52659489d`.
 
-Private Git history is not included. Changes made while preparing this public
-snapshot are limited to source curation, comment and branding cleanup,
-test-harness repairs, documentation, and replacement of the obsolete RC1 ARM64
-builder with a thin Version 1 wrapper around the shared package builder.
+Private Git history is not included. The public repository contains the curated
+release source, build materials and tests. Private-only development files,
+generated artifacts, binaries, logs, databases and SROVA Cast work are
+excluded.
 
 ## Features
 
@@ -41,14 +41,14 @@ builder with a thin Version 1 wrapper around the shared package builder.
 
 ## Supported release targets
 
-The Version 1 release-qualified package format is Debian `.deb`.
+The Version 1.1 release-qualified package format is Debian `.deb`.
 
 - AMD64: tested on Debian and Debian-family PC or NUC systems
 - ARM64: built natively on ARM64 Debian systems and tested on Raspberry Pi
 
 Other inherited packaging and desktop-oriented source may remain in the tree
 for compatibility or future work, but RPM, Arch and Flatpak packages are not
-qualified Version 1 release targets.
+qualified Version 1.1 release targets.
 
 ## Accessing SROVA
 
@@ -78,7 +78,7 @@ The installed application runtime is under `/opt/srova`.
 - `packaging/arm64/build_deb.sh` — native ARM64 wrapper
 - `package.sh` — authoritative Debian package builder
 - `tests/` — automated test suite
-- `CHANGELOG.md` — Version 1 and release-candidate history
+- `CHANGELOG.md` — release and release-candidate history
 - `NOTICE.md` — upstream attribution and modification notice
 
 ## Building an AMD64 Debian package
@@ -90,9 +90,9 @@ From the repository root:
 
     ./package.sh deb "$(cat version.txt)"
 
-For Version 1 this produces:
+For Version 1.1 this produces:
 
-    dist/srova_1.0-1_amd64.deb
+    dist/srova_1.1-1_amd64.deb
 
 ## Building an ARM64 Debian package
 
@@ -104,9 +104,9 @@ The wrapper verifies that the host architecture is ARM64, reads `version.txt`,
 and delegates to the same authoritative `package.sh` Debian build path used for
 AMD64.
 
-For Version 1 this produces:
+For Version 1.1 this produces:
 
-    dist/srova_1.0-1_arm64.deb
+    dist/srova_1.1-1_arm64.deb
 
 See `packaging/arm64/README.md` for the ARM64 build contract.
 
@@ -114,11 +114,11 @@ See `packaging/arm64/README.md` for the ARM64 build contract.
 
 Install the package matching the machine architecture:
 
-    sudo apt install ./dist/srova_1.0-1_amd64.deb
+    sudo apt install ./dist/srova_1.1-1_amd64.deb
 
 or:
 
-    sudo apt install ./dist/srova_1.0-1_arm64.deb
+    sudo apt install ./dist/srova_1.1-1_arm64.deb
 
 The resulting package must be validated on a separate clean target system
 before publication.

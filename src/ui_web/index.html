@@ -14,7 +14,7 @@
 <link rel="manifest" href="/ui_web/manifest.webmanifest" crossorigin="use-credentials">
 <meta name="theme-color" content="#050505">
 
-<link rel="stylesheet" href="/ui_web/srova.css?v=20260727_v1_scrobbling_signup3">
+<link rel="stylesheet" href="/ui_web/srova.css?v=20260806_v1_1_audio_output_safety1">
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Josefin+Sans:wght@100;200;300;400&family=Outfit:wght@300;400&display=swap" rel="stylesheet">
 </head>
@@ -30,7 +30,7 @@
 
   <div id="srovaInstanceLabel" class="hidden" aria-live="polite"></div>
 
-  <div id="searchBox">
+  <div id="searchBox" class="hidden" style="display:none !important">
     <input
       id="searchInput"
       name="srova_global_search"
@@ -429,7 +429,7 @@
   </div>
 </div>
 
-<script src="/ui_web/ui.js?v=20260727_v1_first_run1"></script>
+<script src="/ui_web/ui.js?v=20260806_v1_1_about_version1"></script>
 <script>
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", function() {
