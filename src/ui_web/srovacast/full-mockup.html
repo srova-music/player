@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SROVA Cast</title>
+
+<style>
+* {
+  box-sizing: border-box;
+  cursor: none !important;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: #090807;
+  color: #f2ead7;
+  font-family: "DejaVu Sans", Arial, sans-serif;
+}
+
+.screen {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  padding: 85px 110px;
+  gap: 105px;
+}
+
+/* Album artwork — raster image only */
+.artwork {
+  position: relative;
+  width: 650px;
+  height: 650px;
+  flex: 0 0 650px;
+}
+
+.artwork img {
+  display: block;
+  width: 650px;
+  height: 650px;
+  object-fit: cover;
+}
+
+.artwork-label {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 650px;
+  height: 650px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  color: #d9b766;
+  font-size: 76px;
+  font-weight: 600;
+  letter-spacing: .16em;
+  padding-left: .16em;
+}
+
+/* Track information */
+.details {
+  flex: 1;
+  min-width: 0;
+}
+
+.heading {
+  color: #c8a85d;
+  font-size: 25px;
+  letter-spacing: .24em;
+  margin-bottom: 55px;
+}
+
+.title {
+  color: #f7f0df;
+  font-size: 72px;
+  line-height: 1.05;
+  font-weight: 600;
+  margin-bottom: 22px;
+}
+
+.artist {
+  color: #d2b56e;
+  font-size: 40px;
+  margin-bottom: 14px;
+}
+
+.album {
+  color: #aaa394;
+  font-size: 27px;
+  margin-bottom: 60px;
+}
+
+.quality {
+  display: inline-block;
+  border: 1px solid #b6924b;
+  color: #d8bb72;
+  padding: 11px 20px;
+  font-size: 19px;
+  letter-spacing: .04em;
+  margin-bottom: 52px;
+}
+
+.progress {
+  width: 100%;
+  height: 5px;
+  background: #39342b;
+}
+
+.progress-fill {
+  width: 43%;
+  height: 5px;
+  background: #c8a85d;
+}
+
+.times {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 10px;
+  color: #817b70;
+  font-size: 17px;
+}
+
+.footer {
+  margin-top: 48px;
+  color: #706a5f;
+  font-size: 15px;
+  letter-spacing: .15em;
+}
+</style>
+</head>
+
+<body>
+  <main class="screen">
+
+    <section class="artwork">
+      <img src="art-test.png" alt="Album artwork">
+      <div class="artwork-label">SROVA</div>
+    </section>
+
+    <section class="details">
+      <div class="heading">NOW PLAYING</div>
+
+      <div class="title">The Long Road Home</div>
+      <div class="artist">SROVA Test Artist</div>
+      <div class="album">Display Receiver Prototype</div>
+
+      <div class="quality">FLAC · 24-bit / 96 kHz</div>
+
+      <div class="progress">
+        <div class="progress-fill"></div>
+      </div>
+
+      <div class="times">
+        <span>2:14</span>
+        <span>5:11</span>
+      </div>
+
+      <div class="footer">SROVA CAST</div>
+    </section>
+
+  </main>
+</body>
+</html>

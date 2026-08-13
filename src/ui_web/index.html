@@ -14,7 +14,7 @@
 <link rel="manifest" href="/ui_web/manifest.webmanifest" crossorigin="use-credentials">
 <meta name="theme-color" content="#050505">
 
-<link rel="stylesheet" href="/ui_web/srova.css?v=20260806_v1_1_audio_output_safety1">
+<link rel="stylesheet" href="/ui_web/srova.css?v=20260812_v1_2_queue_drag2">
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Josefin+Sans:wght@100;200;300;400&family=Outfit:wght@300;400&display=swap" rel="stylesheet">
 </head>
@@ -58,6 +58,7 @@
 
   <button id="settingsBtn" onclick="showSettings()" title="Settings">
     <span class="material-icons">settings</span>
+    <img id="settingsUpdateDot" class="srovaUpdateDot hidden" src="/ui_web/assets/srova-red-update-dot.png" alt="" aria-hidden="true">
   </button>
 
 </header>
@@ -429,7 +430,7 @@
   </div>
 </div>
 
-<script src="/ui_web/ui.js?v=20260806_v1_1_about_version1"></script>
+<script src="/ui_web/ui.js?v=20260812_v1_2_queue_drag2"></script>
 <script>
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", function() {

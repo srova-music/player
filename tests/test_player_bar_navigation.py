@@ -162,4 +162,4 @@ def test_local_player_bar_artist_uses_the_existing_local_artist_page():
 
 
 def test_player_navigation_cache_token_is_current():
-    assert "/ui_web/ui.js?v=20260806_v1_1_about_version1" in HTML
+    assert "/ui_web/ui.js?v=20260812_v1_2_queue_drag2" in HTML

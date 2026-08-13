@@ -115,4 +115,4 @@ def test_save_and_scan_copy_and_cache_token_are_current():
         "Music folders saved. Select Save & Scan to update the SROVA index."
         in BACKEND
     )
-    assert "/ui_web/ui.js?v=20260806_v1_1_about_version1" in HTML
+    assert "/ui_web/ui.js?v=20260812_v1_2_queue_drag2" in HTML

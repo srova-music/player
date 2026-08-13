@@ -9,17 +9,9 @@ fn resolve_app_dir() -> PathBuf {
         return flatpak_packaged;
     }
 
-    let packaged = PathBuf::from("/usr/share/hiresti");
-    if packaged.join("src/main.py").is_file() {
-        return packaged;
-    }
-
-    // Also check old structure for backwards compatibility
+    // Also check the Flatpak legacy layout for backwards compatibility.
     if flatpak_packaged.join("main.py").is_file() {
         return flatpak_packaged;
-    }
-    if packaged.join("main.py").is_file() {
-        return packaged;
     }
 
     if let Ok(exe) = env::current_exe() {
@@ -87,7 +79,10 @@ fn main() -> ExitCode {
     } else if app_dir.join("main.py").is_file() {
         app_dir.join("main.py")
     } else {
-        eprintln!("hiresti launcher error: main.py not found in {}", app_dir.display());
+        eprintln!(
+            "hiresti launcher error: main.py not found in {}",
+            app_dir.display()
+        );
         return ExitCode::from(1);
     };
 

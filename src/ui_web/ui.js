@@ -90,6 +90,7 @@ var loginBtn      = document.getElementById("loginBtn");
 var playlistsBtn  = document.getElementById("playlistsBtn");
 var queueBtn      = document.getElementById("queueBtn");
 var settingsBtn   = document.getElementById("settingsBtn");
+var settingsUpdateDot = document.getElementById("settingsUpdateDot");
 
 var searchInput = document.getElementById("searchInput");
 var searchClear = document.getElementById("searchClear");
@@ -1837,6 +1838,7 @@ var LOCAL_LIBRARY_SCAN_ACTIVITY_MIN_MS = 2500;
 var currentSettingsTab = "audio";
 var _settingsRenderToken = 0;
 var _tidalStatusRequestToken = 0;
+var srovaUpdateState = null;
 var SROVA_VOLUME_SAFETY_DISMISSED_KEY = "srovaVolumeSafetyWarningDismissedV1";
 var SROVA_OTHER_AUDIO_OUTPUT_WARNING_VERSION = 1;
 var SETTINGS_TABS = [
@@ -1895,10 +1897,22 @@ function buildSettingsTabs() {
         var btn = document.createElement("button");
         btn.type = "button";
         btn.className = "settingsTab";
-        btn.textContent = tabDef.label;
+        var label = document.createElement("span");
+        label.className = "settingsTabLabel";
+        label.textContent = tabDef.label;
+        btn.appendChild(label);
         btn.setAttribute("role", "tab");
         btn.setAttribute("data-settings-tab", tabDef.id);
         btn.setAttribute("aria-controls", "settings-tab-panel-" + tabDef.id);
+        if (tabDef.id === "about") {
+            var dot = document.createElement("img");
+            dot.className = "srovaUpdateDot settingsTabUpdateDot hidden";
+            dot.src = "/ui_web/assets/srova-red-update-dot.png";
+            dot.alt = "";
+            dot.setAttribute("aria-hidden", "true");
+            dot.classList.toggle("hidden", !updateAvailableNow());
+            btn.appendChild(dot);
+        }
         btn.onclick = function() { setSettingsTab(tabDef.id); };
         tabs.appendChild(btn);
     });
@@ -1962,6 +1976,73 @@ function loadAboutVersion(versionEl) {
         });
 }
 
+function updateAvailableNow() {
+    return !!(srovaUpdateState && srovaUpdateState.update_available === true);
+}
+
+function syncUpdateIndicators() {
+    var available = updateAvailableNow();
+    if (settingsUpdateDot) { settingsUpdateDot.classList.toggle("hidden", !available); }
+    if (settingsBtn) {
+        settingsBtn.title = available ? "Settings — SROVA update available" : "Settings";
+        settingsBtn.setAttribute("aria-label", settingsBtn.title);
+    }
+    var tabDots = settingsView ? settingsView.querySelectorAll(".settingsTabUpdateDot") : [];
+    Array.prototype.forEach.call(tabDots, function(dot) {
+        dot.classList.toggle("hidden", !available);
+    });
+}
+
+function checkSrovaUpdate() {
+    if (typeof fetch !== "function") { return; }
+    fetchWithTimeout("/api/update-status", {cache: "no-store"}, 6000)
+        .then(function(res) {
+            if (!res.ok) { throw new Error("Update status unavailable"); }
+            return res.json();
+        })
+        .then(function(data) {
+            srovaUpdateState = data || null;
+            syncUpdateIndicators();
+            var about = document.querySelector(".settingsAboutSection");
+            if (about) { renderAboutUpdateStatus(about); }
+        })
+        .catch(function() {
+            srovaUpdateState = null;
+            syncUpdateIndicators();
+        });
+}
+
+function renderAboutUpdateStatus(section) {
+    if (!section) { return; }
+    var previous = section.querySelector(".settingsAboutUpdate");
+    if (previous) { previous.remove(); }
+    if (!updateAvailableNow()) { return; }
+
+    var latest = String(srovaUpdateState.latest_version || "").trim();
+    if (!latest || latest === "unknown") { return; }
+    var update = document.createElement("div");
+    update.className = "settingsAboutUpdate";
+
+    var message = document.createElement("div");
+    message.className = "settingsAboutUpdateMessage";
+    message.textContent = "Update available — Version " + latest;
+    update.appendChild(message);
+
+    var url = String(srovaUpdateState.download_url || "").trim();
+    if (url) {
+        var action = document.createElement("a");
+        action.className = "settingsBtn settingsAboutUpdateAction";
+        action.href = url;
+        action.target = "_blank";
+        action.rel = "noopener";
+        action.textContent = srovaUpdateState.download_kind === "package"
+            ? "Download " + String(srovaUpdateState.architecture || "").toUpperCase() + " package"
+            : "Open download page";
+        update.appendChild(action);
+    }
+    section.appendChild(update);
+}
+
 function buildAboutSection() {
     var sec = document.createElement("div");
     sec.className = "settingsSection settingsAboutSection";
@@ -2000,6 +2081,8 @@ function buildAboutSection() {
     websiteRow.appendChild(website);
 
     sec.appendChild(websiteRow);
+
+    renderAboutUpdateStatus(sec);
 
     return sec;
 }
@@ -7542,34 +7625,262 @@ function persistRadioStationOrder(items) {
     });
 }
 
-function moveRadioStation(items, index, direction) {
-    if (_radioOrderSavePending) { return; }
-    var target = index + direction;
-    if (target < 0 || target >= items.length) { return; }
-
-    var reordered = items.slice();
-    var moved = reordered[index];
-    reordered[index] = reordered[target];
-    reordered[target] = moved;
-
-    _radioOrderSavePending = true;
-    persistRadioStationOrder(reordered)
-        .then(function() {
-            _radioOrderSavePending = false;
-            showRadioSource(true);
-        })
-        .catch(function(err) {
-            _radioOrderSavePending = false;
-            showQueueActionToast(
-                (err && err.message) || "Could not save Radio station order.",
-                true
-            );
-        });
-}
-
 function enhanceRadioShelfOrdering(block, items) {
     if (!block) { return; }
     block.classList.add("radioShelf");
+
+    var cards = Array.prototype.slice.call(
+        block.querySelectorAll(".homeRow .album")
+    );
+    var row = cards.length ? cards[0].parentNode : null;
+    var originalCards = cards.slice();
+    var activeCard = null;
+    var activeHandle = null;
+    var activePointerId = null;
+    var dragPlaceholder = null;
+    var dragReturnBefore = null;
+    var dragOffsetX = 0;
+    var dragOffsetY = 0;
+    var dragInlineStyleText = null;
+    var toggle = null;
+
+    function currentCards() {
+        if (!row) { return []; }
+        return Array.prototype.slice.call(
+            row.querySelectorAll(".album:not(.radioDragPlaceholder)")
+        );
+    }
+
+    function currentItems() {
+        return currentCards().map(function(card) {
+            return card._radioOrderItem;
+        }).filter(function(item) {
+            return !!item;
+        });
+    }
+
+    function orderChanged() {
+        var ordered = currentCards();
+        if (ordered.length !== originalCards.length) { return true; }
+        for (var i = 0; i < ordered.length; i++) {
+            if (ordered[i] !== originalCards[i]) { return true; }
+        }
+        return false;
+    }
+
+    function removeActivePointerListeners() {
+        window.removeEventListener(
+            "pointermove",
+            handleActivePointerMove,
+            true
+        );
+        window.removeEventListener(
+            "pointerup",
+            handleActivePointerEnd,
+            true
+        );
+        window.removeEventListener(
+            "pointercancel",
+            handleActivePointerEnd,
+            true
+        );
+        window.removeEventListener("blur", handleActiveBlur, true);
+    }
+
+    function positionActiveCard(e) {
+        if (!activeCard) { return; }
+
+        activeCard.style.setProperty(
+            "--radio-drag-left",
+            String(e.clientX - dragOffsetX) + "px"
+        );
+        activeCard.style.setProperty(
+            "--radio-drag-top",
+            String(e.clientY - dragOffsetY) + "px"
+        );
+    }
+
+    function moveDragPlaceholder(e) {
+        if (!row || !dragPlaceholder || !activeCard) { return; }
+
+        var hit = document.elementFromPoint(e.clientX, e.clientY);
+        var target = hit && hit.closest ? hit.closest(".album") : null;
+
+        if (
+            !target ||
+            target === activeCard ||
+            target === dragPlaceholder ||
+            target.parentNode !== row
+        ) {
+            return;
+        }
+
+        var children = Array.prototype.slice.call(row.children);
+        var placeholderIndex = children.indexOf(dragPlaceholder);
+        var targetIndex = children.indexOf(target);
+
+        if (placeholderIndex < 0 || targetIndex < 0) { return; }
+
+        if (placeholderIndex < targetIndex) {
+            row.insertBefore(dragPlaceholder, target.nextSibling);
+        } else {
+            row.insertBefore(dragPlaceholder, target);
+        }
+    }
+
+    function handleActivePointerMove(e) {
+        if (
+            activePointerId === null ||
+            activePointerId !== e.pointerId
+        ) {
+            return;
+        }
+
+        e.preventDefault();
+        positionActiveCard(e);
+        moveDragPlaceholder(e);
+    }
+
+    function handleActivePointerEnd(e) {
+        if (
+            activePointerId === null ||
+            activePointerId !== e.pointerId
+        ) {
+            return;
+        }
+
+        e.preventDefault();
+        e.stopPropagation();
+        finishDrag(e.type === "pointerup");
+    }
+
+    function handleActiveBlur() {
+        if (activePointerId !== null) {
+            finishDrag(false);
+        }
+    }
+
+    function finishDrag(commitOrder) {
+        removeActivePointerListeners();
+
+        var card = activeCard;
+        var placeholder = dragPlaceholder;
+        var returnBefore = dragReturnBefore;
+        var originalInlineStyle = dragInlineStyleText;
+
+        activeCard = null;
+        activeHandle = null;
+        activePointerId = null;
+        dragPlaceholder = null;
+        dragReturnBefore = null;
+        dragOffsetX = 0;
+        dragOffsetY = 0;
+        dragInlineStyleText = null;
+
+        if (card && row) {
+            if (placeholder && placeholder.parentNode === row) {
+                if (commitOrder !== false) {
+                    row.insertBefore(card, placeholder);
+                } else if (
+                    returnBefore &&
+                    returnBefore.parentNode === row
+                ) {
+                    row.insertBefore(card, returnBefore);
+                } else {
+                    row.appendChild(card);
+                }
+            }
+
+            card.classList.remove("is-radio-dragging");
+
+            if (originalInlineStyle === null) {
+                card.removeAttribute("style");
+            } else {
+                card.setAttribute("style", originalInlineStyle);
+            }
+        }
+
+        if (placeholder && placeholder.parentNode) {
+            placeholder.parentNode.removeChild(placeholder);
+        }
+
+        block.classList.remove("is-radio-drag-active");
+        if (document.body) {
+            document.body.classList.remove("is-radio-reordering-drag");
+        }
+    }
+
+    function restoreOriginalOrder() {
+        if (!row) { return; }
+        originalCards.forEach(function(card) {
+            row.appendChild(card);
+        });
+    }
+
+    function updateModeUi() {
+        block.classList.toggle("is-reordering", _radioReorderMode);
+        if (!toggle) { return; }
+
+        toggle.setAttribute(
+            "aria-pressed",
+            _radioReorderMode ? "true" : "false"
+        );
+        toggle.textContent = _radioReorderMode ? "Done" : "Reorder";
+    }
+
+    function exitWithoutSaving() {
+        finishDrag();
+        _radioReorderMode = false;
+        updateModeUi();
+    }
+
+    function saveStagedOrder() {
+        if (_radioOrderSavePending) { return; }
+        finishDrag();
+
+        if (!orderChanged()) {
+            exitWithoutSaving();
+            return;
+        }
+
+        var reordered = currentItems();
+        if (reordered.length !== items.length) {
+            restoreOriginalOrder();
+            exitWithoutSaving();
+            showQueueActionToast(
+                "Could not prepare the Radio station order.",
+                true
+            );
+            return;
+        }
+
+        _radioOrderSavePending = true;
+        if (toggle) {
+            toggle.disabled = true;
+            toggle.textContent = "Saving";
+        }
+
+        persistRadioStationOrder(reordered)
+            .then(function() {
+                _radioOrderSavePending = false;
+                originalCards = currentCards();
+                _radioReorderMode = false;
+                if (toggle) { toggle.disabled = false; }
+                updateModeUi();
+            })
+            .catch(function(err) {
+                _radioOrderSavePending = false;
+                restoreOriginalOrder();
+                _radioReorderMode = false;
+                if (toggle) { toggle.disabled = false; }
+                updateModeUi();
+                showQueueActionToast(
+                    (err && err.message) ||
+                        "Could not save Radio station order.",
+                    true
+                );
+            });
+    }
 
     var heading = block.querySelector("h2");
     if (heading && heading.parentNode) {
@@ -7578,55 +7889,236 @@ function enhanceRadioShelfOrdering(block, items) {
         heading.parentNode.insertBefore(header, heading);
         header.appendChild(heading);
 
-        var toggle = document.createElement("button");
+        toggle = document.createElement("button");
         toggle.type = "button";
         toggle.className = "radioReorderToggle";
-        toggle.setAttribute("aria-pressed", _radioReorderMode ? "true" : "false");
-        toggle.textContent = _radioReorderMode ? "Done" : "Reorder";
         toggle.onclick = function(e) {
+            e.preventDefault();
             e.stopPropagation();
-            _radioReorderMode = !_radioReorderMode;
-            block.classList.toggle("is-reordering", _radioReorderMode);
-            toggle.setAttribute("aria-pressed", _radioReorderMode ? "true" : "false");
-            toggle.textContent = _radioReorderMode ? "Done" : "Reorder";
+
+            if (_radioOrderSavePending) { return; }
+
+            if (_radioReorderMode) {
+                saveStagedOrder();
+                return;
+            }
+
+            originalCards = currentCards();
+            _radioReorderMode = true;
+            updateModeUi();
         };
         header.appendChild(toggle);
     }
 
-    var cards = block.querySelectorAll(".homeRow .album");
-    for (var i = 0; i < cards.length; i++) {
-        (function(card, index) {
-            var controls = document.createElement("div");
-            controls.className = "radioReorderControls";
+    function moveCardByKeyboard(card, direction) {
+        if (!row || !_radioReorderMode) { return; }
 
-            function addMoveButton(icon, label, direction, disabled) {
-                var btn = document.createElement("button");
-                btn.type = "button";
-                btn.className = "radioReorderBtn";
-                btn.title = label;
-                btn.setAttribute("aria-label", label);
-                btn.disabled = disabled;
-                btn.innerHTML = '<span class="material-icons">' + icon + '</span>';
-                btn.onclick = function(e) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    moveRadioStation(items, index, direction);
-                };
-                controls.appendChild(btn);
-            }
+        var ordered = currentCards();
+        var index = ordered.indexOf(card);
+        var targetIndex = index + direction;
 
-            addMoveButton("chevron_left", "Move station left", -1, index === 0);
-            addMoveButton(
-                "chevron_right",
-                "Move station right",
-                1,
-                index === items.length - 1
-            );
-            card.appendChild(controls);
-        })(cards[i], i);
+        if (index < 0 || targetIndex < 0 || targetIndex >= ordered.length) {
+            return;
+        }
+
+        var target = ordered[targetIndex];
+        if (direction < 0) {
+            row.insertBefore(card, target);
+        } else {
+            row.insertBefore(card, target.nextSibling);
+        }
     }
 
-    block.classList.toggle("is-reordering", _radioReorderMode);
+    cards.forEach(function(card, index) {
+        card._radioOrderItem = items[index];
+
+        var handle = document.createElement("button");
+        handle.type = "button";
+        handle.className = "radioDragHandle";
+        handle.title = "Drag to reorder station";
+        handle.setAttribute(
+            "aria-label",
+            "Drag to reorder " +
+                String((items[index] && items[index].name) || "station")
+        );
+        handle.innerHTML =
+            '<span class="material-icons">drag_indicator</span>';
+
+        handle.addEventListener("click", function(e) {
+            if (_radioReorderMode) {
+                e.preventDefault();
+                e.stopPropagation();
+            }
+        });
+
+        handle.addEventListener("pointerdown", function(e) {
+            if (
+                !_radioReorderMode ||
+                _radioOrderSavePending ||
+                e.isPrimary === false ||
+                (e.pointerType === "mouse" && e.button !== 0)
+            ) {
+                return;
+            }
+
+            e.preventDefault();
+            e.stopPropagation();
+
+            if (activePointerId !== null) {
+                finishDrag(false);
+            }
+
+            var rect = card.getBoundingClientRect();
+
+            /*
+             * Preserve the complete pre-drag inline style. This lets the
+             * lifted tile use strict viewport-independent dimensions while
+             * restoring the card exactly after drop or cancellation.
+             */
+            dragInlineStyleText = card.getAttribute("style");
+
+            dragPlaceholder = document.createElement("div");
+            dragPlaceholder.className =
+                "album radioDragPlaceholder";
+            dragPlaceholder.setAttribute("aria-hidden", "true");
+            dragPlaceholder.style.setProperty(
+                "--radio-placeholder-width",
+                String(rect.width) + "px"
+            );
+            dragPlaceholder.style.setProperty(
+                "--radio-placeholder-height",
+                String(rect.height) + "px"
+            );
+
+            dragReturnBefore = card.nextSibling;
+            row.insertBefore(dragPlaceholder, card);
+
+            activeCard = card;
+            activeHandle = handle;
+            activePointerId = e.pointerId;
+            dragOffsetX = e.clientX - rect.left;
+            dragOffsetY = e.clientY - rect.top;
+
+            card.style.setProperty(
+                "--radio-drag-left",
+                String(rect.left) + "px"
+            );
+            card.style.setProperty(
+                "--radio-drag-top",
+                String(rect.top) + "px"
+            );
+            var dragWidth = String(rect.width) + "px";
+            var dragHeight = String(rect.height) + "px";
+
+            card.style.setProperty(
+                "--radio-drag-width",
+                dragWidth
+            );
+            card.style.setProperty(
+                "--radio-drag-height",
+                dragHeight
+            );
+
+            /*
+             * Inline-important current/min/max dimensions outrank every
+             * desktop, tablet and mobile grid rule. The fixed-position tile
+             * therefore remains exactly the size measured before lifting.
+             */
+            card.style.setProperty(
+                "box-sizing",
+                "border-box",
+                "important"
+            );
+            card.style.setProperty(
+                "width",
+                dragWidth,
+                "important"
+            );
+            card.style.setProperty(
+                "min-width",
+                dragWidth,
+                "important"
+            );
+            card.style.setProperty(
+                "max-width",
+                dragWidth,
+                "important"
+            );
+            card.style.setProperty(
+                "height",
+                dragHeight,
+                "important"
+            );
+            card.style.setProperty(
+                "min-height",
+                dragHeight,
+                "important"
+            );
+            card.style.setProperty(
+                "max-height",
+                dragHeight,
+                "important"
+            );
+
+            card.classList.add("is-radio-dragging");
+            block.classList.add("is-radio-drag-active");
+            if (document.body) {
+                document.body.classList.add(
+                    "is-radio-reordering-drag"
+                );
+            }
+
+            window.addEventListener(
+                "pointermove",
+                handleActivePointerMove,
+                {capture: true, passive: false}
+            );
+            window.addEventListener(
+                "pointerup",
+                handleActivePointerEnd,
+                true
+            );
+            window.addEventListener(
+                "pointercancel",
+                handleActivePointerEnd,
+                true
+            );
+            window.addEventListener(
+                "blur",
+                handleActiveBlur,
+                true
+            );
+        });
+
+        handle.addEventListener("keydown", function(e) {
+            if (!_radioReorderMode || _radioOrderSavePending) { return; }
+
+            var direction = 0;
+            if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+                direction = -1;
+            } else if (
+                e.key === "ArrowRight" ||
+                e.key === "ArrowDown"
+            ) {
+                direction = 1;
+            }
+
+            if (!direction) { return; }
+
+            e.preventDefault();
+            e.stopPropagation();
+            moveCardByKeyboard(card, direction);
+        });
+
+        handle.addEventListener("click", function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+        });
+
+        card.appendChild(handle);
+    });
+
+    updateModeUi();
 }
 
 
@@ -12863,12 +13355,234 @@ function renderQueue(data) {
         unHeader.appendChild(unTime);
         queueView.appendChild(unHeader);
         for (var i = 0; i < upcoming.length; i++) {
-            queueView.appendChild(buildQueueRow(upcoming[i], queueIndex + 1 + i, false, false));
+            queueView.appendChild(buildQueueRow(upcoming[i], queueIndex + 1 + i, false, false, true));
         }
     }
 }
 
-function buildQueueRow(track, absIdx, isNowPlaying, isPlayed) {
+function persistUpcomingQueueMove(fromIndex, toIndex) {
+    return fetch("/tidal/queue/reorder", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({from_index: fromIndex, to_index: toIndex})
+    })
+    .then(function(res) { return res.json().catch(function() { return {}; }); })
+    .then(function(data) {
+        if (!data || data.ok === false || data.error) {
+            throw new Error((data && data.error) || "Could not reorder the Play Queue.");
+        }
+        return data;
+    });
+}
+
+function enableUpcomingQueueDrag(row, handle, absIdx) {
+    row.setAttribute("data-queue-reorderable", "true");
+    row.setAttribute("data-queue-index", String(absIdx));
+
+    function moveByKeyboard(direction) {
+        var destination = absIdx + direction;
+        var target = queueView.querySelector(
+            '.queueRow[data-queue-reorderable="true"][data-queue-index="' +
+            String(destination) + '"]'
+        );
+        if (!target) { return; }
+        handle.disabled = true;
+        persistUpcomingQueueMove(absIdx, destination)
+            .then(loadQueue)
+            .catch(function(err) {
+                loadQueue();
+                showQueueActionToast(err.message || "Could not reorder the Play Queue.", true);
+            });
+    }
+
+    handle.addEventListener("keydown", function(e) {
+        var direction = 0;
+        if (e.key === "ArrowUp" || e.key === "ArrowLeft") {
+            direction = -1;
+        } else if (e.key === "ArrowDown" || e.key === "ArrowRight") {
+            direction = 1;
+        }
+        if (!direction) { return; }
+        e.preventDefault();
+        e.stopPropagation();
+        moveByKeyboard(direction);
+    });
+
+    handle.addEventListener("click", function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+    });
+
+    handle.addEventListener("pointerdown", function(e) {
+        if (e.isPrimary === false || (e.pointerType === "mouse" && e.button !== 0)) {
+            return;
+        }
+        e.preventDefault();
+        e.stopPropagation();
+
+        var parent = row.parentNode;
+        if (!parent) { return; }
+        var rect = row.getBoundingClientRect();
+        var originalStyle = row.getAttribute("style");
+        var originalIndexes = Array.prototype.map.call(
+            parent.querySelectorAll('.queueRow[data-queue-reorderable="true"]'),
+            function(item) { return Number(item.getAttribute("data-queue-index")); }
+        ).sort(function(a, b) { return a - b; });
+        var placeholder = document.createElement("div");
+        placeholder.className = "queueRow queueDragPlaceholder";
+        placeholder.setAttribute("aria-hidden", "true");
+        placeholder.style.setProperty("--queue-placeholder-height", String(rect.height) + "px");
+        parent.insertBefore(placeholder, row);
+
+        var pointerId = e.pointerId;
+        var offsetX = e.clientX - rect.left;
+        var offsetY = e.clientY - rect.top;
+        row.style.setProperty("--queue-drag-left", String(rect.left) + "px");
+        row.style.setProperty("--queue-drag-top", String(rect.top) + "px");
+        row.style.setProperty("--queue-drag-width", String(rect.width) + "px");
+        row.style.setProperty("--queue-drag-height", String(rect.height) + "px");
+        row.style.setProperty("width", String(rect.width) + "px", "important");
+        row.style.setProperty("min-width", String(rect.width) + "px", "important");
+        row.style.setProperty("max-width", String(rect.width) + "px", "important");
+        row.style.setProperty("height", String(rect.height) + "px", "important");
+        row.style.setProperty("min-height", String(rect.height) + "px", "important");
+        row.style.setProperty("max-height", String(rect.height) + "px", "important");
+        row.classList.add("is-queue-dragging");
+        document.body.classList.add("is-queue-reordering-drag");
+
+        function movePlaceholder(moveEvent) {
+            var hit = document.elementFromPoint(moveEvent.clientX, moveEvent.clientY);
+            var target = hit && hit.closest ? hit.closest('.queueRow[data-queue-reorderable="true"]') : null;
+            if (!target || target === row || target.parentNode !== parent) { return; }
+            var targetRect = target.getBoundingClientRect();
+            if (moveEvent.clientY < targetRect.top + targetRect.height / 2) {
+                parent.insertBefore(placeholder, target);
+            } else {
+                parent.insertBefore(placeholder, target.nextSibling);
+            }
+        }
+
+        function onMove(moveEvent) {
+            if (moveEvent.pointerId !== pointerId) { return; }
+            moveEvent.preventDefault();
+            row.style.setProperty("--queue-drag-left", String(moveEvent.clientX - offsetX) + "px");
+            row.style.setProperty("--queue-drag-top", String(moveEvent.clientY - offsetY) + "px");
+            movePlaceholder(moveEvent);
+        }
+
+        function finish(endEvent, commit) {
+            if (endEvent && endEvent.pointerId !== pointerId) { return; }
+            window.removeEventListener("pointermove", onMove, true);
+            window.removeEventListener("pointerup", onUp, true);
+            window.removeEventListener("pointercancel", onCancel, true);
+            window.removeEventListener("blur", onBlur, true);
+
+            var position = 0;
+            var sibling = placeholder.previousSibling;
+            while (sibling) {
+                if (sibling !== row && sibling.getAttribute && sibling.getAttribute("data-queue-reorderable") === "true") {
+                    position += 1;
+                }
+                sibling = sibling.previousSibling;
+            }
+            var toIndex = originalIndexes[Math.min(position, originalIndexes.length - 1)];
+            parent.insertBefore(row, placeholder);
+            placeholder.remove();
+            row.classList.remove("is-queue-dragging");
+            document.body.classList.remove("is-queue-reordering-drag");
+            if (originalStyle === null) { row.removeAttribute("style"); }
+            else { row.setAttribute("style", originalStyle); }
+            row._suppressQueueClickUntil = Date.now() + 350;
+
+            if (!commit || toIndex === absIdx) { return; }
+            handle.disabled = true;
+            persistUpcomingQueueMove(absIdx, toIndex)
+                .then(loadQueue)
+                .catch(function(err) {
+                    loadQueue();
+                    showQueueActionToast(err.message || "Could not reorder the Play Queue.", true);
+                });
+        }
+
+        function onUp(upEvent) {
+            upEvent.preventDefault();
+            upEvent.stopPropagation();
+            finish(upEvent, true);
+        }
+        function onCancel(cancelEvent) { finish(cancelEvent, false); }
+        function onBlur() { finish(null, false); }
+
+        window.addEventListener("pointermove", onMove, {capture: true, passive: false});
+        window.addEventListener("pointerup", onUp, true);
+        window.addEventListener("pointercancel", onCancel, true);
+        window.addEventListener("blur", onBlur, true);
+    });
+}
+
+function openQueueRemoveConfirm(track, onConfirm) {
+    var modal = document.createElement("div");
+    modal.className = "localLibraryCleanupModal queueRemoveConfirmModal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-labelledby", "queueRemoveConfirmTitle");
+    modal.setAttribute("aria-describedby", "queueRemoveConfirmBody");
+
+    var card = document.createElement("div");
+    card.className = "localLibraryCleanupCard";
+
+    var title = document.createElement("div");
+    title.id = "queueRemoveConfirmTitle";
+    title.className = "localLibraryCleanupTitle";
+    title.textContent = "Remove from Play Queue?";
+    card.appendChild(title);
+
+    var body = document.createElement("div");
+    body.id = "queueRemoveConfirmBody";
+    body.className = "localLibraryCleanupBody";
+    body.textContent = 'Remove "' + String((track && track.title) || "this track") + '" from the Play Queue?';
+    card.appendChild(body);
+
+    var actions = document.createElement("div");
+    actions.className = "localLibraryCleanupActions";
+
+    var cancelBtn = document.createElement("button");
+    cancelBtn.className = "settingsBtn";
+    cancelBtn.type = "button";
+    cancelBtn.textContent = "Cancel";
+    actions.appendChild(cancelBtn);
+
+    var confirmBtn = document.createElement("button");
+    confirmBtn.className = "settingsBtn settingsBtnDanger localLibraryCleanupConfirm";
+    confirmBtn.type = "button";
+    confirmBtn.textContent = "Remove Track";
+    actions.appendChild(confirmBtn);
+
+    card.appendChild(actions);
+    modal.appendChild(card);
+    document.body.appendChild(modal);
+
+    function closeModal() {
+        document.removeEventListener("keydown", onKeyDown);
+        if (modal.parentNode) { modal.parentNode.removeChild(modal); }
+    }
+
+    function onKeyDown(e) {
+        if (e.key === "Escape") { closeModal(); }
+    }
+
+    cancelBtn.onclick = closeModal;
+    confirmBtn.onclick = function() {
+        closeModal();
+        if (typeof onConfirm === "function") { onConfirm(); }
+    };
+    modal.addEventListener("click", function(e) {
+        if (e.target === modal) { closeModal(); }
+    });
+    document.addEventListener("keydown", onKeyDown);
+    setTimeout(function() { cancelBtn.focus(); }, 0);
+}
+
+function buildQueueRow(track, absIdx, isNowPlaying, isPlayed, isUpcoming) {
     var row = document.createElement("div");
     row.className = "queueRow" +
         (isNowPlaying ? " queueRowPlaying" : "") +
@@ -12914,17 +13628,25 @@ function buildQueueRow(track, absIdx, isNowPlaying, isPlayed) {
     (function(idx) {
         removeBtn.onclick = function(e) {
             e.stopPropagation();
-            fetch("/tidal/queue/remove/" + idx)
-            .then(function(res) {
-                return res.json().catch(function() { return {}; });
-            })
-            .then(function(data) {
-                loadQueue();
-                if (data && data.stopped === true) {
-                    applyStandbyPlayerBar();
-                    pollStatus();
-                }
-            });
+            function removeTrack() {
+                fetch("/tidal/queue/remove/" + idx)
+                .then(function(res) {
+                    return res.json().catch(function() { return {}; });
+                })
+                .then(function(data) {
+                    loadQueue();
+                    if (data && data.stopped === true) {
+                        applyStandbyPlayerBar();
+                        pollStatus();
+                    }
+                });
+            }
+
+            if (isPlayed) {
+                removeTrack();
+                return;
+            }
+            openQueueRemoveConfirm(track, removeTrack);
         };
     }(absIdx));
 
@@ -12933,9 +13655,26 @@ function buildQueueRow(track, absIdx, isNowPlaying, isPlayed) {
     row.appendChild(dur);
     row.appendChild(removeBtn);
 
+    if (isUpcoming) {
+        var dragHandle = document.createElement("button");
+        dragHandle.type = "button";
+        dragHandle.className = "queueDragHandle";
+        dragHandle.title = "Drag to reorder track";
+        dragHandle.setAttribute(
+            "aria-label",
+            "Drag to reorder " + String((track && track.title) || "track")
+        );
+        dragHandle.innerHTML = '<span class="material-icons">drag_indicator</span>';
+        row.appendChild(dragHandle);
+        enableUpcomingQueueDrag(row, dragHandle, absIdx);
+    }
+
     // Tap row = jump to that track
     (function(idx) {
         row.onclick = function() {
+            if (row._suppressQueueClickUntil && Date.now() < row._suppressQueueClickUntil) {
+                return;
+            }
             fetch("/tidal/queue/jump/" + idx)
             .then(function(res) { return res.json().catch(function() { return {}; }); })
             .then(function(data) {
@@ -13785,6 +14524,7 @@ window.addEventListener("DOMContentLoaded", function() {
     initPlayerTechTray();
     initPlayerInfinitePlayControl();
     showSrovaVolumeSafetyModal();
+    checkSrovaUpdate();
     setTimeout(restoreSrovaRestartReturnView, 0);
 });
 

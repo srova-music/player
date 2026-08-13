@@ -1,7 +1,8 @@
 /* ================================================================
-   SROVA VERSION 1 INTERFACE STYLES
+   SROVA BROWSER UI
    ----------------------------------------------------------------
-   This stylesheet contains the complete SROVA web interface styling.
+   Canonical stylesheet for the headless browser interface. Keep
+   layout and visual changes scoped, responsive, and reversible.
    ================================================================ */
 
 :root {
@@ -17,7 +18,8 @@
     --srova-gold-dim:   #7A6028;
     --srova-gold-glow:  rgba(201, 168, 76, 0.12);
 
-    /* Cyan (CD) aliases for playback state and per-tile painting. */
+    /* Cyan (CD). --accent remains the legacy playback-state alias;
+       these are the hard aliases for per-tile painting. */
     --srova-cyan:       #00BFFF;
     --srova-cyan-light: #66DAFF;
     --srova-cyan-dim:   #0A5C7A;
@@ -35,7 +37,7 @@
     --srova-display: 'Josefin Sans', sans-serif;
     --srova-body:    'Outfit', sans-serif;
 
-    /* Version 1 tile geometry. */
+    /* Tile geometry used by the horizontal Home carousels. */
     --srova-tile-size: 140px;
     --srova-tile-gap:  14px;
 }
@@ -505,6 +507,21 @@ header > #settingsBtn.active {
     color: inherit !important;
 }
 
+#settingsBtn { position: relative !important; }
+.srovaUpdateDot {
+    display: block;
+    width: 22px;
+    height: 22px;
+    object-fit: contain;
+    pointer-events: none;
+}
+#settingsBtn > .srovaUpdateDot {
+    position: absolute;
+    top: -10px;
+    right: -12px;
+}
+.srovaUpdateDot.hidden { display: none !important; }
+
 
 /* ================================================================
    HOME VIEW -- spacing & bottom padding to clear player bar
@@ -923,8 +940,8 @@ header > #settingsBtn.active {
 /* ================================================================
    LOGIN MODAL -- reinforce fixed-overlay positioning
    ----------------------------------------------------------------
-   Keep #loginModal fixed to the viewport with explicit specificity so
-   no other cascade path can displace it into the page flow.
+   Keep #loginModal as a fixed full-screen overlay so no other cascade
+   path can displace it into the page flow.
    ================================================================ */
 
 #loginModal {
@@ -1009,8 +1026,8 @@ header > #settingsBtn.active {
     padding-top: 4px;
 }
 
-/* Force horizontal layout at every viewport with a strict 140px
-   flex basis so tile geometry remains consistent. */
+/* Force horizontal layout at every viewport with a strict 140px flex
+   basis so the design stays pixel-exact. */
 .homeRow {
     display: flex !important;
     flex-direction: row !important;
@@ -1098,7 +1115,7 @@ header > #settingsBtn.active {
     position: relative;
     flex: 0 0 var(--srova-tile-size) !important;
     width:        var(--srova-tile-size) !important;
-    min-width:    var(--srova-tile-size) !important;   /* preserve fixed tile width */
+    min-width:    var(--srova-tile-size) !important;   /* prevents breakpoint widening */
     max-width:    var(--srova-tile-size) !important;
     cursor: pointer;
     /* fade-out timing for outer glow (short) -- overridden on :hover */
@@ -1252,7 +1269,7 @@ header > #settingsBtn.active {
 .playerTop > .playerControls { grid-column: 2 !important; justify-self: center !important; }
 .playerTop > .playerRight    { grid-column: 3 !important; justify-self: end    !important; }
 
-/* Use grid placement rather than absolute centering for transport controls. */
+/* Use grid placement instead of absolute centering for the transport. */
 .playerControls {
     position: static !important;
     left: auto !important;
@@ -1264,7 +1281,7 @@ header > #settingsBtn.active {
     display: flex !important;
 }
 
-/* Keep the left cluster unconstrained within the player grid. */
+/* Leave the left cluster unconstrained inside the player grid. */
 .playerLeft {
     flex: initial !important;
     min-width: 0 !important;
@@ -1582,7 +1599,8 @@ body:not(.hires) #waveformBars span {
      - sharp corners (no border-radius)
      - consistent button chrome
      - consistent track/list row styling
-   This section standardizes the visual surface and list treatments.
+   Existing component rules continue to drive layout; this section
+   restyles the surface.
    ================================================================ */
 
 /* All view containers sit on the same near-black base */
@@ -2275,6 +2293,10 @@ body:not(.hires) #waveformBars span {
     cursor: pointer !important;
 }
 
+.queueRow[data-queue-reorderable="true"] {
+    grid-template-columns: 44px minmax(0, 1fr) auto 36px 42px !important;
+}
+
 .playlistsCreateBtn:hover {
     color: var(--srova-gold) !important;
     border-color: rgba(201, 168, 76, 0.70) !important;
@@ -2678,6 +2700,16 @@ body:not(.hires) #waveformBars span {
     cursor: pointer !important;
     box-sizing: border-box !important;
     transition: color 0.18s, border-color 0.18s, background 0.18s, box-shadow 0.18s !important;
+}
+.settingsTabUpdateDot {
+    flex: 0 0 auto;
+    width: 20px;
+    height: 20px;
+    margin-left: 7px;
+}
+.settingsTabLabel {
+    display: inline-block;
+    transform: translateY(1px);
 }
 
 .settingsTab:hover {
@@ -4304,6 +4336,73 @@ a:hover { color: var(--srova-gold-light); }
     color: inherit !important;
 }
 
+.queueDragHandle {
+    justify-self: end !important;
+    width: 40px !important;
+    height: 40px !important;
+    min-width: 40px !important;
+    min-height: 40px !important;
+    padding: 0 !important;
+    border: 1px solid rgba(201, 168, 76, 0.58) !important;
+    border-radius: 0 !important;
+    background: rgba(5, 5, 5, 0.72) !important;
+    color: var(--srova-gold-light) !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    cursor: grab !important;
+    touch-action: none !important;
+    user-select: none !important;
+    -webkit-user-select: none !important;
+}
+
+.queueDragHandle:hover,
+.queueDragHandle:focus-visible {
+    color: var(--srova-cream) !important;
+    border-color: var(--srova-gold-light) !important;
+    background: rgba(201, 168, 76, 0.18) !important;
+}
+
+.queueDragHandle:active {
+    cursor: grabbing !important;
+}
+
+.queueDragHandle .material-icons {
+    font-size: 25px !important;
+    color: inherit !important;
+}
+
+.queueDragPlaceholder {
+    min-height: var(--queue-placeholder-height) !important;
+    height: var(--queue-placeholder-height) !important;
+    border: 1px dashed rgba(201, 168, 76, 0.64) !important;
+    background: rgba(201, 168, 76, 0.06) !important;
+    box-shadow: inset 0 0 18px rgba(201, 168, 76, 0.06) !important;
+    pointer-events: none !important;
+}
+
+.queueRow.is-queue-dragging {
+    position: fixed !important;
+    z-index: 20000 !important;
+    left: var(--queue-drag-left) !important;
+    top: var(--queue-drag-top) !important;
+    width: var(--queue-drag-width) !important;
+    height: var(--queue-drag-height) !important;
+    margin: 0 !important;
+    opacity: 0.96 !important;
+    transform: scale(1) !important;
+    pointer-events: none !important;
+    cursor: grabbing !important;
+    transition: none !important;
+    filter: drop-shadow(0 18px 24px rgba(0, 0, 0, 0.72)) !important;
+}
+
+body.is-queue-reordering-drag {
+    cursor: grabbing !important;
+    user-select: none !important;
+    -webkit-user-select: none !important;
+}
+
 .queueSectionHeaderRow {
     display: flex !important;
     align-items: baseline !important;
@@ -4623,6 +4722,14 @@ a:hover { color: var(--srova-gold-light); }
     .queueRow {
         grid-template-columns: 42px minmax(0, 1fr) auto 32px !important;
         gap: 10px !important;
+    }
+
+    .queueRow[data-queue-reorderable="true"] {
+        grid-template-columns: 42px minmax(0, 1fr) 32px 40px !important;
+    }
+
+    .queueRow[data-queue-reorderable="true"] .queueDuration {
+        display: none !important;
     }
 
     .playlistRow {
@@ -9269,60 +9376,100 @@ body:not(.hires) #vuPanel #vpbFill {
     position: relative !important;
 }
 
-.radioReorderControls {
+.radioDragHandle {
     display: none !important;
     position: absolute !important;
     z-index: 8 !important;
     top: 12px !important;
     right: 12px !important;
     align-items: center !important;
-    gap: 6px !important;
-}
-
-.radioShelf.is-reordering .radioReorderControls {
-    display: flex !important;
-}
-
-.radioShelf.is-reordering .album {
-    cursor: default !important;
-}
-
-.radioShelf.is-reordering .album img {
-    box-shadow:
-        inset 0 0 0 1px rgba(201, 168, 76, 0.48),
-        0 0 14px rgba(201, 168, 76, 0.12) !important;
-}
-
-.radioReorderBtn {
-    display: inline-flex !important;
-    align-items: center !important;
     justify-content: center !important;
-    width: 38px !important;
-    height: 38px !important;
-    min-width: 38px !important;
-    min-height: 38px !important;
+    width: 42px !important;
+    height: 42px !important;
+    min-width: 42px !important;
+    min-height: 42px !important;
     padding: 0 !important;
     border: 1px solid rgba(201, 168, 76, 0.72) !important;
     border-radius: 0 !important;
     background: rgba(5, 5, 5, 0.92) !important;
     color: var(--srova-gold-light) !important;
     box-shadow: 0 3px 12px rgba(0, 0, 0, 0.56) !important;
+    cursor: grab !important;
+    touch-action: none !important;
+    user-select: none !important;
+    -webkit-user-select: none !important;
 }
 
-.radioReorderBtn .material-icons {
-    font-size: 24px !important;
+.radioShelf.is-reordering .radioDragHandle {
+    display: inline-flex !important;
 }
 
-.radioReorderBtn:hover:not(:disabled),
-.radioReorderBtn:focus-visible:not(:disabled) {
+.radioShelf.is-reordering .album {
+    cursor: default !important;
+}
+
+/* Reorder mode must not decorate every station image. */
+
+.radioDragHandle .material-icons {
+    font-size: 25px !important;
+}
+
+.radioDragHandle:hover,
+.radioDragHandle:focus-visible {
     color: var(--srova-cream) !important;
     border-color: var(--srova-gold-light) !important;
     background: rgba(201, 168, 76, 0.18) !important;
 }
 
-.radioReorderBtn:disabled {
-    opacity: 0.28 !important;
-    cursor: default !important;
+.radioDragHandle:active {
+    cursor: grabbing !important;
+}
+
+body.is-radio-reordering-drag {
+    cursor: grabbing !important;
+    user-select: none !important;
+    -webkit-user-select: none !important;
+}
+
+.radioShelf.is-radio-drag-active {
+    user-select: none !important;
+    -webkit-user-select: none !important;
+}
+
+.radioShelf .radioDragPlaceholder {
+    width: var(--radio-placeholder-width) !important;
+    min-width: var(--radio-placeholder-width) !important;
+    height: var(--radio-placeholder-height) !important;
+    min-height: var(--radio-placeholder-height) !important;
+    box-sizing: border-box !important;
+    border: 1px dashed rgba(201, 168, 76, 0.64) !important;
+    background: rgba(201, 168, 76, 0.06) !important;
+    box-shadow: inset 0 0 18px rgba(201, 168, 76, 0.06) !important;
+    pointer-events: none !important;
+}
+
+.radioShelf .album.is-radio-dragging {
+    position: fixed !important;
+    z-index: 20000 !important;
+    left: var(--radio-drag-left) !important;
+    top: var(--radio-drag-top) !important;
+    width: var(--radio-drag-width) !important;
+    height: var(--radio-drag-height) !important;
+    margin: 0 !important;
+    opacity: 0.96 !important;
+    transform: scale(1) !important;
+    transform-origin: center !important;
+    pointer-events: none !important;
+    cursor: grabbing !important;
+    transition: none !important;
+    will-change: left, top, transform !important;
+    filter: drop-shadow(0 18px 24px rgba(0, 0, 0, 0.72)) !important;
+}
+
+.radioShelf .album.is-radio-dragging img {
+    box-shadow:
+        inset 0 0 0 2px rgba(201, 168, 76, 0.82),
+        0 0 22px rgba(201, 168, 76, 0.26) !important;
 }
 
 @media (max-width: 700px) {
@@ -9338,9 +9485,13 @@ body:not(.hires) #vuPanel #vpbFill {
         font-size: 10px !important;
     }
 
-    .radioReorderControls {
+    .radioDragHandle {
         top: 8px !important;
         right: 8px !important;
+        width: 40px !important;
+        height: 40px !important;
+        min-width: 40px !important;
+        min-height: 40px !important;
     }
 }
 
@@ -21371,6 +21522,27 @@ img.icon {
 #settings-tab-panel-about > .settingsAboutSection > .settingsAboutWebsiteRow > .settingsAboutWebsiteLink:hover {
     color: var(--srova-gold) !important;
     text-decoration-color: var(--srova-gold) !important;
+}
+
+#settings-tab-panel-about > .settingsAboutSection > .settingsAboutUpdate {
+    max-width: 520px !important;
+    margin-top: 24px !important;
+    padding: 18px !important;
+    border: 1px solid rgba(201, 168, 76, 0.45) !important;
+    background: rgba(201, 168, 76, 0.07) !important;
+}
+
+.settingsAboutUpdateMessage {
+    color: var(--srova-cream) !important;
+    font-family: var(--srova-display) !important;
+    font-size: 15px !important;
+    letter-spacing: 0.06em !important;
+}
+
+.settingsAboutUpdateAction {
+    display: inline-flex !important;
+    margin-top: 14px !important;
+    text-decoration: none !important;
 }
 
 @media (max-width: 640px) {

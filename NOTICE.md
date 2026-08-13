@@ -22,9 +22,9 @@ The inclusion of the upstream project name in attribution, retained source
 identifiers or compatibility paths does not imply endorsement by the upstream
 project.
 
-This public snapshot corresponds to SROVA Version 1.1, Debian package
-`1.1-1`. It was derived from the private SROVA package-ready release tag
-`v1.1.0-release` at commit `2dbc72eeef81404420b8fd5cb72e6dd52659489d` without importing private Git history.
+This public snapshot corresponds to SROVA Version 1.2, Debian package
+1.2-1. It was derived from the locked private release source at commit
+f05b4e475382af34196fbc87429c48d10a74da4c without importing private Git history.
 
 The SROVA Remote Android application, APK source, Google Cast receiver source
 and passive Cast display source are separate projects and are not included in
