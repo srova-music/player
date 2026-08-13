@@ -112,6 +112,6 @@ def test_failed_setup_checks_return_home_and_use_existing_toast():
 
 def test_ui_cache_token_updated():
     assert (
-        "/ui_web/ui.js?v=20260806_v1_1_about_version1"
+        "/ui_web/ui.js?v=20260812_v1_2_queue_drag2"
         in HTML
     )

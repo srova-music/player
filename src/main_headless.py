@@ -27,6 +27,7 @@ from local_library import LocalLibraryBusyError, LocalLibraryIndex, local_librar
 import network_music
 from network_root_state import add_exact_managed_root, remove_exact_managed_root
 from version_info import read_version_payload
+from update_info import read_update_payload
 
 logger = logging.getLogger(__name__)
 
@@ -2916,6 +2917,36 @@ def _queue_remove_active_index_locked(index):
 def _queue_remove_active_indices_locked(indices):
     for idx in sorted(set(indices), reverse=True):
         _queue_remove_active_index_locked(idx)
+
+
+def _queue_move_upcoming_index_locked(from_index, to_index):
+    """Move one future queue item without changing the active item.
+
+    Caller must hold _QUEUE_LOCK. Both indexes are absolute PLAY_QUEUE
+    indexes and must remain strictly after QUEUE_INDEX.
+    """
+    src = int(from_index)
+    dst = int(to_index)
+    if not (0 <= src < len(PLAY_QUEUE) and 0 <= dst < len(PLAY_QUEUE)):
+        raise ValueError("queue index out of range")
+    if src <= QUEUE_INDEX or dst <= QUEUE_INDEX:
+        raise ValueError("only upcoming queue items can be reordered")
+    if src == dst:
+        return
+
+    previous_active_order = list(PLAY_QUEUE)
+    moved_id = PLAY_QUEUE.pop(src)
+    PLAY_QUEUE.insert(dst, moved_id)
+
+    # When canonical and active order already match, mirror the exact move.
+    # If shuffle or another queue transform made them diverge, the user's
+    # visible manual order becomes canonical so refresh/shuffle-off cannot
+    # silently undo it.
+    if list(ORIGINAL_QUEUE) == previous_active_order:
+        original_moved_id = ORIGINAL_QUEUE.pop(src)
+        ORIGINAL_QUEUE.insert(dst, original_moved_id)
+    else:
+        ORIGINAL_QUEUE[:] = PLAY_QUEUE
 
 
 # =========================================================================
@@ -8052,7 +8083,7 @@ def _safe_artwork(backend, obj, size=320):
 def _safe_str(value, fallback=""):
     """Safely convert a tidalapi attribute to a string.
     Guards against callable values (e.g. bound methods returned instead of
-    plain strings by some tidalapi object types).
+    plain strings by some tidalapi object types) -- fix from hiresTI v1.7.2.
     """
     if value is None:
         return fallback
@@ -8475,6 +8506,10 @@ class ControlHandler(BaseHTTPRequestHandler):
         # -- Application release metadata ----------------------------------
         if static_path == "/api/version":
             self._send_json(read_version_payload(), no_store=True)
+            return
+
+        if static_path == "/api/update-status":
+            self._send_json(read_update_payload(), no_store=True)
             return
 
         # -- Network / Remote Access ---------------------------------------
@@ -10365,6 +10400,31 @@ class ControlHandler(BaseHTTPRequestHandler):
             self.send_error(400)
             return
 
+        # -- Queue: reorder one upcoming track -----------------------------
+        if self.path == "/tidal/queue/reorder":
+            try:
+                from_index = int(payload.get("from_index"))
+                to_index = int(payload.get("to_index"))
+            except (TypeError, ValueError):
+                self.send_error(400)
+                return
+            try:
+                with _QUEUE_LOCK:
+                    _queue_ensure_canonical_locked()
+                    _queue_move_upcoming_index_locked(from_index, to_index)
+            except ValueError as e:
+                self._send_json({"ok": False, "error": str(e)})
+                return
+            save_queue()
+            self._send_json({
+                "ok": True,
+                "from_index": from_index,
+                "to_index": to_index,
+                "queue_index": QUEUE_INDEX,
+                "queue_length": len(PLAY_QUEUE),
+            })
+            return
+
 
         # -- Network / Remote Access ---------------------------------------
         if self.path == "/api/settings/web-port":
@@ -10565,7 +10625,6 @@ class ControlHandler(BaseHTTPRequestHandler):
                 return
             with _QUEUE_LOCK:
                 _queue_ensure_canonical_locked()
-                _trim_future_local_cue_album_queue_locked("append")
                 for t in tracks:
                     tid = str(t.get("id", "")).strip()
                     if tid:

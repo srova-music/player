@@ -1,0 +1,1373 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SROVA Cast</title>
+
+<style>
+* {
+  box-sizing: border-box;
+  cursor: none !important;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: #090807;
+  color: #f2ead7;
+  font-family: "DejaVu Sans", Arial, sans-serif;
+}
+
+.screen {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  padding: 85px 110px;
+  gap: 105px;
+}
+
+/* Album artwork — raster image only */
+.artwork {
+  position: relative;
+  width: 650px;
+  height: 650px;
+  flex: 0 0 650px;
+}
+
+.artwork img {
+  display: block;
+  width: 650px;
+  height: 650px;
+  object-fit: cover;
+}
+
+.artwork-label {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 650px;
+  height: 650px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  color: #d9b766;
+  font-size: 76px;
+  font-weight: 600;
+  letter-spacing: .16em;
+  padding-left: .16em;
+}
+
+/* Track information */
+.details {
+  flex: 1;
+  min-width: 0;
+}
+
+.heading {
+  color: #c8a85d;
+  font-size: 25px;
+  letter-spacing: .24em;
+  margin-bottom: 55px;
+}
+
+.title {
+  color: #f7f0df;
+  font-size: 72px;
+  line-height: 1.05;
+  font-weight: 600;
+  margin-bottom: 22px;
+}
+
+.artist {
+  color: #d2b56e;
+  font-size: 40px;
+  margin-bottom: 14px;
+}
+
+.album {
+  color: #aaa394;
+  font-size: 27px;
+  margin-bottom: 60px;
+}
+
+.quality {
+  display: inline-block;
+  border: 1px solid #b6924b;
+  color: #d8bb72;
+  padding: 11px 20px;
+  font-size: 19px;
+  letter-spacing: .04em;
+  margin-bottom: 52px;
+}
+
+.progress {
+  width: 100%;
+  height: 5px;
+  background: #39342b;
+}
+
+.progress-fill {
+  width: 43%;
+  height: 5px;
+  background: #c8a85d;
+}
+
+.times {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 10px;
+  color: #817b70;
+  font-size: 17px;
+}
+
+.footer {
+  margin-top: 48px;
+  color: #706a5f;
+  font-size: 15px;
+  letter-spacing: .15em;
+}
+</style>
+
+<style>
+/* SROVACAST_SPLIT_LAYOUT_V1 */
+
+/* True 50/50 full-screen split */
+.screen {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  align-items: stretch;
+  padding: 0;
+  gap: 0;
+}
+
+/* Left half: artwork fills the entire side */
+.artwork {
+  position: relative;
+  width: 50vw;
+  height: 100vh;
+  flex: 0 0 50vw;
+  overflow: hidden;
+}
+
+.artwork img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.artwork-label {
+  width: 100%;
+  height: 100%;
+}
+
+/* Right half: SROVA information panel */
+.details {
+  position: relative;
+  width: 50vw;
+  height: 100vh;
+  flex: 0 0 50vw;
+  min-width: 0;
+
+  padding:
+    225px
+    72px
+    150px
+    72px;
+
+  background: #090807;
+  overflow: hidden;
+}
+
+/* Leather header with raster SROVA wordmark */
+.details::before {
+  content: "";
+  position: absolute;
+  z-index: 0;
+
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 150px;
+
+  background-image:
+    url("srova-wordmark.png"),
+    url("../assets/srova-leather-dark-brown.jpg");
+
+  background-repeat:
+    no-repeat,
+    no-repeat;
+
+  background-position:
+    52px center,
+    center center;
+
+  background-size:
+    250px auto,
+    cover;
+}
+
+/* Leather footer */
+.details::after {
+  content: "";
+  position: absolute;
+  z-index: 0;
+
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 100px;
+
+  background-image:
+    url("../assets/srova-leather-dark-brown.jpg");
+
+  background-repeat: no-repeat;
+  background-position: center center;
+  background-size: cover;
+}
+
+/* Keep live Now Playing content above decorative layers */
+.heading,
+.title,
+.artist,
+.album,
+.quality,
+.progress,
+.times,
+.footer {
+  position: relative;
+  z-index: 1;
+}
+
+/* Re-home existing footer text onto the leather footer */
+.footer {
+  position: absolute;
+  z-index: 1;
+
+  left: 72px;
+  bottom: 40px;
+
+  margin: 0;
+}
+</style>
+
+
+<style>
+/* SROVACAST_LAYOUT_V2 */
+
+/*
+ * LP-cover geometry:
+ * artwork width always equals screen height.
+ * At 1920x1080 this gives 1080x1080 artwork + 840px information panel.
+ */
+.screen {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  align-items: stretch;
+  padding: 0;
+  gap: 0;
+}
+
+.artwork {
+  position: relative;
+  width: 100vh;
+  height: 100vh;
+  flex: 0 0 100vh;
+  overflow: hidden;
+  background: #000;
+}
+
+.artwork img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.artwork-label {
+  width: 100%;
+  height: 100%;
+}
+
+/* Remaining screen width becomes the information panel */
+.details {
+  position: relative;
+  width: auto;
+  height: 100vh;
+  flex: 1 1 auto;
+  min-width: 0;
+
+  padding:
+    225px
+    62px
+    150px
+    62px;
+
+  background: #090807;
+  overflow: hidden;
+}
+
+/* Exact SROVA dark-leather header treatment */
+.details::before {
+  content: "";
+  position: absolute;
+  z-index: 0;
+
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 150px;
+
+  background:
+    url("srova-wordmark.png") 48px center / 250px auto no-repeat,
+    linear-gradient(180deg, rgba(10, 6, 3, 0.58) 0%, rgba(3, 3, 3, 0.84) 100%),
+    radial-gradient(circle at 50% 0%, rgba(201, 168, 76, 0.085), transparent 60%),
+    url("../assets/srova-leather-dark-brown.jpg") center 42% / cover no-repeat;
+
+  border-bottom: 1px solid rgba(201, 168, 76, 0.30);
+
+  box-shadow:
+    0 14px 34px rgba(0, 0, 0, 0.50),
+    inset 0 1px 0 rgba(255, 232, 170, 0.075),
+    inset 0 -1px 0 rgba(201, 168, 76, 0.08);
+}
+
+/* Exact SROVA dark-leather footer treatment */
+.details::after {
+  content: "";
+  position: absolute;
+  z-index: 0;
+
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 100px;
+
+  background:
+    linear-gradient(180deg, rgba(15, 9, 4, 0.76) 0%, rgba(5, 3, 2, 0.94) 100%),
+    radial-gradient(circle at 50% 0%, rgba(212, 175, 55, 0.075), transparent 54%),
+    url("../assets/srova-leather-dark-brown.jpg") center center / cover no-repeat;
+
+  border-top: 1px solid rgba(201, 168, 76, 0.30);
+
+  box-shadow:
+    0 -20px 48px rgba(0, 0, 0, 0.62),
+    inset 0 1px 0 rgba(255, 232, 170, 0.075),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.86);
+}
+
+/* Radio station identity: deliberately secondary to track metadata */
+.radio-station {
+  display: none;
+  position: relative;
+  z-index: 1;
+
+  color: #9d927d;
+  font-size: 18px;
+  line-height: 1.2;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+
+  margin-top: -34px;
+  margin-bottom: 30px;
+}
+
+/* Existing information remains above the chrome */
+.heading,
+.title,
+.artist,
+.album,
+.quality,
+.progress,
+.times,
+.footer {
+  position: relative;
+  z-index: 1;
+}
+
+/* Footer: SROVA CAST left / LIVE FROM ... right */
+.footer {
+  position: absolute;
+  z-index: 1;
+
+  left: 62px;
+  right: 62px;
+  bottom: 40px;
+
+  margin: 0;
+
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+
+  color: #8d8679;
+}
+
+.footer .live-from {
+  color: #b7aa8d;
+  text-align: right;
+}
+</style>
+
+
+<style>
+/* SROVACAST_LAYOUT_V2_1 */
+
+/* Balanced 100px header / 100px footer */
+.details {
+  padding-top: 175px;
+}
+
+.details::before {
+  height: 100px;
+}
+
+/* Let the LP cover sit subtly above the information panel */
+.artwork {
+  z-index: 2;
+  box-shadow: 12px 0 28px rgba(0, 0, 0, 0.38);
+}
+
+.details {
+  z-index: 1;
+}
+
+/* SROVACAST_QUALITY_COLOURS_V1
+   Shared SROVA quality language: Radio, TIDAL and My Music. */
+.quality.quality-hires {
+  color: #C9A84C !important;
+  border-color: rgba(201, 168, 76, 0.55) !important;
+}
+
+.quality.quality-cd {
+  color: #00BFFF !important;
+  border-color: rgba(0, 191, 255, 0.55) !important;
+}
+
+.progress-fill.progress-hires {
+  background: #C9A84C !important;
+  box-shadow: 0 0 8px rgba(201, 168, 76, 0.22);
+}
+
+.progress-fill.progress-cd {
+  background: #00BFFF !important;
+  box-shadow: 0 0 8px rgba(0, 191, 255, 0.20);
+}
+
+
+/* SROVACAST_FONT_PARITY_V1
+   Canonical SROVA typography.
+   Family-only pass: no size, colour, spacing or intentional weight changes.
+   Fonts self-hosted by SROVA Cast. */
+
+@font-face {
+  font-family: "Josefin Sans";
+  font-style: normal;
+  font-weight: 100;
+  font-display: swap;
+  src: url("fonts/josefin-sans-vietnamese.woff2") format("woff2");
+  unicode-range: U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB;
+}
+
+@font-face {
+  font-family: "Josefin Sans";
+  font-style: normal;
+  font-weight: 100;
+  font-display: swap;
+  src: url("fonts/josefin-sans-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: "Josefin Sans";
+  font-style: normal;
+  font-weight: 100;
+  font-display: swap;
+  src: url("fonts/josefin-sans-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "Josefin Sans";
+  font-style: normal;
+  font-weight: 200;
+  font-display: swap;
+  src: url("fonts/josefin-sans-vietnamese.woff2") format("woff2");
+  unicode-range: U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB;
+}
+
+@font-face {
+  font-family: "Josefin Sans";
+  font-style: normal;
+  font-weight: 200;
+  font-display: swap;
+  src: url("fonts/josefin-sans-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: "Josefin Sans";
+  font-style: normal;
+  font-weight: 200;
+  font-display: swap;
+  src: url("fonts/josefin-sans-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "Josefin Sans";
+  font-style: normal;
+  font-weight: 300;
+  font-display: swap;
+  src: url("fonts/josefin-sans-vietnamese.woff2") format("woff2");
+  unicode-range: U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB;
+}
+
+@font-face {
+  font-family: "Josefin Sans";
+  font-style: normal;
+  font-weight: 300;
+  font-display: swap;
+  src: url("fonts/josefin-sans-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: "Josefin Sans";
+  font-style: normal;
+  font-weight: 300;
+  font-display: swap;
+  src: url("fonts/josefin-sans-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "Josefin Sans";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/josefin-sans-vietnamese.woff2") format("woff2");
+  unicode-range: U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB;
+}
+
+@font-face {
+  font-family: "Josefin Sans";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/josefin-sans-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: "Josefin Sans";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/josefin-sans-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "Outfit";
+  font-style: normal;
+  font-weight: 300;
+  font-display: swap;
+  src: url("fonts/outfit-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: "Outfit";
+  font-style: normal;
+  font-weight: 300;
+  font-display: swap;
+  src: url("fonts/outfit-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "Outfit";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/outfit-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: "Outfit";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/outfit-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+/* SROVA display / identity typography */
+.heading,
+.radio-station,
+.quality,
+.footer {
+  font-family: "Josefin Sans", sans-serif !important;
+}
+
+/* SROVA content typography */
+.title,
+.artist,
+.album,
+.times {
+  font-family: "Outfit", sans-serif !important;
+}
+
+
+/* SROVACAST_TYPOGRAPHY_WEIGHTS_V1
+   Weight-only refinement after canonical SROVA font-family alignment.
+   No size, spacing, colour or layout changes. */
+
+.heading,
+.radio-station {
+  font-weight: 300;
+}
+
+.title {
+  font-weight: 400;
+}
+
+.artist {
+  font-weight: 400;
+}
+
+.album,
+.times {
+  font-weight: 300;
+}
+
+.quality {
+  font-weight: 400;
+}
+
+.footer {
+  font-weight: 300;
+}
+
+
+/* SROVACAST_FONT_SIZE_PLUS8_V1
+   Uniform +8px total readability pass for the 15.6-inch 1080p display.
+   No family, weight, colour, spacing or layout changes. */
+
+.heading {
+  font-size: 33px;
+}
+
+.radio-station {
+  font-size: 26px;
+}
+
+.title {
+  font-size: 80px;
+}
+
+.artist {
+  font-size: 48px;
+}
+
+.album {
+  font-size: 35px;
+}
+
+.quality {
+  font-size: 27px;
+}
+
+.times {
+  font-size: 25px;
+}
+
+.footer {
+  font-size: 23px;
+}
+
+
+/* SROVACAST_TEXT_BRIGHTNESS_V1
+   Distance-readability brightness pass.
+   Hue families, typography, size and layout remain unchanged. */
+
+.heading {
+  color: #F0D27A;
+}
+
+.radio-station {
+  color: #d2c6ae;
+}
+
+.artist {
+  color: #e4c77d;
+}
+
+.album {
+  color: #c9c1b1;
+}
+
+.times {
+  color: #aaa397;
+}
+
+.footer {
+  color: #aaa295;
+}
+
+.footer .live-from {
+  color: #c9bda2;
+}
+
+
+/* SROVACAST_BIT_PERFECT_DAC_BOX_V1
+   Backend-confirmed Bit Perfect + DAC identity.
+   Shares the existing SROVA CD/Hi-Res badge colour language. */
+
+.tech-row {
+  display: grid;
+  grid-template-columns: max-content max-content;
+  align-items: center;
+  column-gap: 18px;
+  row-gap: 10px;
+  min-width: 0;
+  margin-bottom: 52px;
+}
+
+.tech-row .quality {
+  margin-bottom: 0;
+}
+
+.output-info {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.output-info.output-info-stacked {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  justify-self: start;
+}
+
+</style>
+
+</head>
+
+<body>
+  <main class="screen" style="visibility:hidden">
+
+    <section class="artwork">
+      <img src="../assets/srova-square-logo.png" alt="Album artwork">
+      <div class="artwork-label" style="display:none"></div>
+    </section>
+
+    <section class="details">
+      <div class="heading">NOW PLAYING</div>
+
+      <div class="title">The Long Road Home</div>
+      <div class="artist">SROVA Test Artist</div>
+      <div class="album">Display Receiver Prototype</div>
+
+      <div class="tech-row">
+        <div class="quality">FLAC · 24-bit / 96 kHz</div>
+        <div class="quality output-info" style="display:none"></div>
+      </div>
+
+      <div class="progress">
+        <div class="progress-fill"></div>
+      </div>
+
+      <div class="times">
+        <span>2:14</span>
+        <span>5:11</span>
+      </div>
+
+      <div class="footer">SROVA CAST</div>
+    </section>
+
+  </main>
+
+<script>
+/* SROVACAST_LIVE_STATUS_V1 */
+(() => {
+  "use strict";
+
+  const heading = document.querySelector(".heading");
+  const title = document.querySelector(".title");
+  const artist = document.querySelector(".artist");
+  const album = document.querySelector(".album");
+  const quality = document.querySelector(".quality");
+  const outputInfo = document.querySelector(".output-info");
+  const progress = document.querySelector(".progress");
+  const progressFill = document.querySelector(".progress-fill");
+  const times = document.querySelector(".times");
+  const timeNodes = document.querySelectorAll(".times span");
+  const artwork = document.querySelector(".artwork img");
+  const artworkLabel = document.querySelector(".artwork-label");
+  const footer = document.querySelector(".footer");
+
+  /* SROVACAST_STARTUP_REVEAL_V1 */
+  const screen = document.querySelector(".screen");
+  let startupRevealPending = true;
+
+  /* SROVACAST_PARENT_READY_V1 */
+  function revealStartupScreen() {
+    if (!startupRevealPending) return;
+    startupRevealPending = false;
+    screen.style.visibility = "visible";
+
+    if (window.parent !== window) {
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => {
+          window.parent.postMessage(
+            "SROVACAST_DISPLAY_READY_V1",
+            "*"
+          );
+        });
+      });
+    }
+  }
+
+  const radioStation = document.createElement("div");
+  radioStation.className = "radio-station";
+  heading.insertAdjacentElement("afterend", radioStation);
+
+  const liveFrom = document.createElement("span");
+  liveFrom.className = "live-from";
+
+  const fallbackArtwork = "../assets/srova-square-logo.png";
+
+  let artworkRequestId = 0;
+  let activeArtworkUrl = "";
+  let haveStatus = false;
+
+  let progressPlaying = false;
+  let progressDuration = 0;
+  let progressPosition = 0;
+  let progressStartTime = 0;
+
+  function firstNonBlank(...values) {
+    for (const value of values) {
+      if (value === null || value === undefined) continue;
+
+      const text = String(value).trim();
+
+      if (text && text.toLowerCase() !== "null") {
+        return text;
+      }
+    }
+
+    return "";
+  }
+
+  function initialiseFooter() {
+    const playerName = firstNonBlank(
+      new URLSearchParams(window.location.search).get("player")
+    );
+
+    if (!footer) return;
+
+    const left = document.createElement("span");
+    left.textContent = "SROVA CAST";
+
+    footer.textContent = "";
+    footer.appendChild(left);
+
+    if (playerName) {
+      liveFrom.textContent = `LIVE FROM ${playerName.toUpperCase()}`;
+      footer.appendChild(liveFrom);
+    }
+  }
+
+  function positiveNumber(value) {
+    const number = Number(value);
+    return Number.isFinite(number) && number > 0 ? number : 0;
+  }
+
+  function formatTime(value) {
+    const total = Math.max(0, Math.floor(Number(value) || 0));
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const seconds = total % 60;
+
+    if (hours > 0) {
+      return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+    }
+
+    return `${minutes}:${String(seconds).padStart(2, "0")}`;
+  }
+
+  function formatSampleRate(value) {
+    const rate = positiveNumber(value);
+
+    if (!rate) return "";
+
+    if (rate % 1000 === 0) {
+      return `${rate / 1000} kHz`;
+    }
+
+    return `${(rate / 1000).toFixed(1)} kHz`;
+  }
+
+  function buildQualityLabel(status) {
+    const codec = firstNonBlank(
+      status.source_format,
+      status.codec
+    ).toUpperCase();
+
+    const bitDepth = positiveNumber(
+      status.source_bit_depth || status.bit_depth
+    );
+
+    const sampleRate = positiveNumber(
+      status.source_sample_rate || status.sample_rate
+    );
+
+    const parts = [];
+
+    if (codec) parts.push(codec);
+    if (bitDepth) parts.push(`${bitDepth}-bit`);
+    if (sampleRate) parts.push(formatSampleRate(sampleRate));
+
+    return parts.join(" · ");
+  }
+
+  function isHiresStatus(status) {
+    const bitDepth = positiveNumber(
+      status.source_bit_depth || status.bit_depth
+    );
+
+    const sampleRate = positiveNumber(
+      status.source_sample_rate || status.sample_rate
+    );
+
+    return (
+      bitDepth >= 24 ||
+      sampleRate > 48000
+    );
+  }
+
+  function normalizeStatus(status) {
+    const rawSource = firstNonBlank(status.source).toLowerCase();
+
+    const radio =
+      status.radio_mode === true ||
+      rawSource === "radio";
+
+    const radioMetadata =
+      status.radio_metadata &&
+      typeof status.radio_metadata === "object"
+        ? status.radio_metadata
+        : {};
+
+    const currentTrackValid =
+      status.current_track_valid === true;
+
+    const playing =
+      status.playing === true;
+
+    return {
+      currentTrackValid,
+      playing,
+      radio,
+
+      radioStation: radio
+        ? firstNonBlank(
+            status.radio_station &&
+            typeof status.radio_station === "object"
+              ? status.radio_station.name
+              : status.radio_station,
+            status.station
+          )
+        : rawSource === "tidal"
+          ? "TIDAL"
+          : (
+              rawSource === "local" ||
+              rawSource === "local_music" ||
+              rawSource === "my music" ||
+              rawSource === "mymusic"
+            )
+            ? "MY MUSIC"
+            : "",
+
+      title: radio
+        ? firstNonBlank(
+            radioMetadata.title,
+            status.radio_cover_art_title,
+            status.title,
+            "SROVA"
+          )
+        : firstNonBlank(
+            status.title,
+            status.track,
+            status.name,
+            "SROVA"
+          ),
+
+      artist: radio
+        ? firstNonBlank(
+            radioMetadata.artist,
+            status.radio_cover_art_artist,
+            status.artist,
+            "Radio"
+          )
+        : firstNonBlank(
+            status.artist,
+            status.album_artist,
+            status.station,
+            status.source,
+            "SROVA"
+          ),
+
+      album: radio
+        ? firstNonBlank(
+            status.radio_cover_art_album,
+            status.context_title,
+            status.quality_label
+          )
+        : firstNonBlank(
+            status.album,
+            status.context_title,
+            status.quality_label,
+            status.quality,
+            status.codec
+          ),
+
+      artwork: radio
+        ? firstNonBlank(
+            status.radio_cover_art_url
+          )
+        : firstNonBlank(
+            status.cover,
+            status.artwork,
+            status.image
+          ),
+
+      position: Math.max(
+        0,
+        Number(status.position) || 0
+      ),
+
+      duration: Math.max(
+        0,
+        Number(status.duration) || 0
+      ),
+
+      quality: buildQualityLabel(status),
+      hires: isHiresStatus(status),
+
+      dacName: firstNonBlank(
+        status.dac_name,
+        status.alsa_driver && status.alsa_device
+          ? String(status.alsa_driver) + " / " + String(status.alsa_device)
+          : "",
+        status.alsa_device
+      ),
+
+      bitPerfect:
+        status.bit_perfect_path_confirmed === true
+    };
+  }
+
+  function showFallbackArtwork() {
+    artworkRequestId += 1;
+    activeArtworkUrl = "";
+    artwork.src = fallbackArtwork;
+    artworkLabel.style.display = "none";
+    revealStartupScreen();
+  }
+
+  function updateArtwork(rawUrl) {
+    if (!rawUrl) {
+      showFallbackArtwork();
+      return;
+    }
+
+    let resolvedUrl;
+
+    try {
+      resolvedUrl =
+        new URL(rawUrl, window.location.href).href;
+    } catch (_) {
+      showFallbackArtwork();
+      return;
+    }
+
+    if (resolvedUrl === activeArtworkUrl) {
+      revealStartupScreen();
+      return;
+    }
+
+    const requestId = ++artworkRequestId;
+    const candidate = new Image();
+
+    candidate.onload = () => {
+      if (requestId !== artworkRequestId) return;
+
+      artwork.src = resolvedUrl;
+      artworkLabel.style.display = "none";
+      activeArtworkUrl = resolvedUrl;
+      revealStartupScreen();
+    };
+
+    candidate.onerror = () => {
+      if (requestId !== artworkRequestId) return;
+      showFallbackArtwork();
+    };
+
+    candidate.src = resolvedUrl;
+  }
+
+  function paintProgress(position, duration) {
+    const safeDuration = Math.max(
+      0,
+      Number(duration) || 0
+    );
+
+    if (!safeDuration) return;
+
+    const safePosition = Math.max(
+      0,
+      Math.min(
+        Number(position) || 0,
+        safeDuration
+      )
+    );
+
+    progressFill.style.width =
+      `${(safePosition / safeDuration) * 100}%`;
+
+    if (timeNodes.length >= 2) {
+      const elapsedText =
+        formatTime(safePosition);
+
+      const durationText =
+        formatTime(safeDuration);
+
+      if (timeNodes[0].textContent !== elapsedText) {
+        timeNodes[0].textContent = elapsedText;
+      }
+
+      if (timeNodes[1].textContent !== durationText) {
+        timeNodes[1].textContent = durationText;
+      }
+    }
+  }
+
+  function syncProgress(state) {
+    progressDuration = Math.max(
+      0,
+      Number(state.duration) || 0
+    );
+
+    progressPosition =
+      progressDuration > 0
+        ? Math.max(
+            0,
+            Math.min(
+              Number(state.position) || 0,
+              progressDuration
+            )
+          )
+        : 0;
+
+    progressPlaying =
+      state.playing === true &&
+      progressDuration > 0;
+
+    progressStartTime =
+      Date.now() / 1000 - progressPosition;
+
+    if (progressDuration > 0) {
+      paintProgress(
+        progressPosition,
+        progressDuration
+      );
+    }
+  }
+
+  function clearProgressState() {
+    progressPlaying = false;
+    progressDuration = 0;
+    progressPosition = 0;
+    progressStartTime = 0;
+    progressFill.style.width = "0%";
+  }
+
+  function progressLoop() {
+    if (progressDuration > 0) {
+      let displayPosition = progressPosition;
+
+      if (progressPlaying) {
+        displayPosition =
+          Date.now() / 1000 - progressStartTime;
+      }
+
+      paintProgress(
+        Math.min(
+          displayPosition,
+          progressDuration
+        ),
+        progressDuration
+      );
+    }
+
+    window.requestAnimationFrame(progressLoop);
+  }
+
+  function render(status) {
+    const state = normalizeStatus(status);
+
+    haveStatus = true;
+
+    if (!state.currentTrackValid) {
+      heading.textContent = "READY";
+      title.textContent = "SROVA";
+      artist.textContent = "Waiting for playback";
+      album.textContent = "";
+      radioStation.textContent = "";
+      radioStation.style.display = "none";
+
+      quality.style.display = "none";
+      outputInfo.textContent = "";
+      outputInfo.classList.remove("output-info-stacked");
+      outputInfo.style.display = "none";
+      clearProgressState();
+      progress.style.display = "none";
+      times.style.display = "none";
+
+      showFallbackArtwork();
+      return;
+    }
+
+    heading.textContent =
+      state.playing ? "NOW PLAYING" : "PAUSED";
+
+    title.textContent = state.title;
+    artist.textContent = state.artist;
+    album.textContent = state.album;
+
+    if (state.radioStation) {
+      radioStation.textContent = state.radioStation;
+      radioStation.style.display = "block";
+    } else {
+      radioStation.textContent = "";
+      radioStation.style.display = "none";
+    }
+
+    quality.classList.remove(
+      "quality-hires",
+      "quality-cd"
+    );
+
+    progressFill.classList.remove(
+      "progress-hires",
+      "progress-cd"
+    );
+
+    quality.classList.add(
+      state.hires
+        ? "quality-hires"
+        : "quality-cd"
+    );
+
+    progressFill.classList.add(
+      state.hires
+        ? "progress-hires"
+        : "progress-cd"
+    );
+
+    if (state.quality) {
+      quality.textContent = state.quality;
+      quality.style.display = "inline-block";
+    } else {
+      quality.style.display = "none";
+    }
+
+    outputInfo.classList.remove(
+      "quality-hires",
+      "quality-cd"
+    );
+
+    if (state.bitPerfect && state.dacName) {
+      const stackOutputInfo =
+        String(state.dacName).trim().length > 18;
+
+      outputInfo.classList.toggle(
+        "output-info-stacked",
+        stackOutputInfo
+      );
+
+      outputInfo.textContent =
+        ("BIT PERFECT · " + state.dacName).toUpperCase();
+
+      outputInfo.classList.add(
+        state.hires
+          ? "quality-hires"
+          : "quality-cd"
+      );
+
+      outputInfo.style.display = "inline-block";
+    } else {
+      outputInfo.textContent = "";
+      outputInfo.classList.remove("output-info-stacked");
+      outputInfo.style.display = "none";
+    }
+
+    if (state.duration > 0) {
+      progress.style.display = "block";
+      times.style.display = "flex";
+      syncProgress(state);
+    } else {
+      clearProgressState();
+      progress.style.display = "none";
+      times.style.display = "none";
+    }
+
+    updateArtwork(state.artwork);
+  }
+
+  async function refresh() {
+    try {
+      const response = await fetch(
+        `/status?_=${Date.now()}`,
+        {
+          cache: "no-store"
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(
+          `HTTP ${response.status}`
+        );
+      }
+
+      render(await response.json());
+    } catch (_) {
+      if (!haveStatus) {
+        heading.textContent = "CONNECTING";
+      }
+    }
+  }
+
+  initialiseFooter();
+  refresh();
+  window.requestAnimationFrame(progressLoop);
+  window.setInterval(refresh, 3000);
+})();
+</script>
+
+</body>
+</html>

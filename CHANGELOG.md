@@ -1,5 +1,19 @@
 # SROVA Changelog
 
+## 1.2 (`1.2-1`) — 2026-08-13
+
+### Added
+
+- Lightweight update checks with the SROVA red-dot indicator on Settings and About
+- Installed-version-aware update details and AMD64/ARM64 package links in About
+- Saved Internet Radio presets can be reordered directly with drag handles
+- SROVA Cast display-player assets are included for receiver and Android Remote playback
+- Play Queue Up Next tracks can be reordered directly from accessible drag handles, with safer SROVA-styled removal confirmation
+
+### Fixed
+
+- Local Music Add to Queue now preserves the playing album and appends new tracks at the end
+
 ## 1.1 (`1.1-1`) — 2026-08-06
 
 - Settings → About now reports the installed SROVA release version from package metadata instead of a stale hard-coded label.

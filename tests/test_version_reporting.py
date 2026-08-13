@@ -13,9 +13,9 @@ from version_info import read_version_payload
 
 
 def test_final_debian_package_version_has_clean_display_version():
-    assert build_version_payload("1.1-1") == {
-        "package_version": "1.1-1",
-        "display_version": "1.1",
+    assert build_version_payload("1.2-1") == {
+        "package_version": "1.2-1",
+        "display_version": "1.2",
     }
 
 
@@ -29,11 +29,11 @@ def test_version_reader_uses_first_readable_nonempty_candidate(tmp_path):
     valid = tmp_path / "version.txt"
 
     empty.write_text("\n", encoding="utf-8")
-    valid.write_text("1.1-1\n", encoding="utf-8")
+    valid.write_text("1.2-1\n", encoding="utf-8")
 
     assert read_version_payload((missing, empty, valid)) == {
-        "package_version": "1.1-1",
-        "display_version": "1.1",
+        "package_version": "1.2-1",
+        "display_version": "1.2",
     }
 
 
@@ -55,7 +55,7 @@ def test_ui_cache_key_tracks_about_version_change():
     index = index_path.read_text(encoding="utf-8")
 
     assert (
-        '/ui_web/ui.js?v=20260806_v1_1_about_version1'
+        '/ui_web/ui.js?v=20260812_v1_2_queue_drag2'
         in index
     )
 

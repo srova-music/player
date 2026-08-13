@@ -74,7 +74,6 @@ class _RustAudioCore:
         ]
         installed_candidates = [
             Path("/app/share/hiresti/src_rust/rust_audio_core/target/release/librust_audio_core.so"),
-            Path("/usr/share/hiresti/src_rust/rust_audio_core/target/release/librust_audio_core.so"),
         ]
         existing_local = [p for p in local_candidates if p.exists()]
         so_path = None

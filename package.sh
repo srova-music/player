@@ -212,6 +212,7 @@ HEADLESS_RUNTIME_REQUIRED=(
     src/network_music.py
     src/network_root_state.py
     src/version_info.py
+    src/update_info.py
     src/radio_metadata.py
     src/app/__init__.py
     src/core/__init__.py
@@ -242,8 +243,8 @@ SROVA_INSTALL_DIR="$BUILD_ROOT/opt/$SROVA_NAME"
 install_srova_headless_rust_audio_core() {
     # Headless/runtime package fix:
     # _rust/audio.py loads the native Rust core from /opt/srova/src_rust first.
-    # Ensure the .deb includes that file so it never falls back to legacy
-    # /usr/share/hiresti paths.
+    # Ensure the .deb includes that file from the canonical
+    # /opt/srova runtime tree.
     local script_dir
     local source_root
     local rust_audio_so=""
