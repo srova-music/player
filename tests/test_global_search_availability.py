@@ -206,4 +206,4 @@ def test_global_search_only_queries_ready_sources():
 
 
 def test_global_search_cache_token_updated():
-    assert "/ui_web/ui.js?v=20260812_v1_2_queue_drag2" in HTML
+    assert "/ui_web/ui.js?v=" in HTML

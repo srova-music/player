@@ -116,6 +116,7 @@ var npBtnHeart  = document.getElementById("npBtnHeart");
 var npBtnNext   = document.getElementById("npBtnNext");
 var npBtnPrev   = document.getElementById("npBtnPrev");
 var npBtnLyrics = document.getElementById("npBtnLyrics");
+var npBtnAlbum  = document.getElementById("npBtnAlbum");
 var btnNext     = document.getElementById("btnNext");
 var btnPrev     = document.getElementById("btnPrev");
 var nowPlayingProgressWrap = document.getElementById("nowPlayingProgressWrap");
@@ -395,6 +396,20 @@ var _addRadioModal = document.getElementById("add-radio-modal");
 var _editingRadioStationId = "";
 var _radioReorderMode = false;
 var _radioOrderSavePending = false;
+
+/*
+ * Point 4: retain the rendered Radio source page between source switches.
+ *
+ * The station artwork URLs are remote URLs, so destroying/recreating the
+ * Radio DOM makes browsers/WebViews create fresh <img> elements and repeat
+ * image load/decode work on every return. Keep the actual DOM node alive and
+ * validate the saved station data in the background before deciding whether
+ * a rebuild is necessary.
+ */
+var _radioSourcePageCache = null;
+var _radioSourceStationSignature = "";
+var _radioSourceRefreshInFlight = false;
+var _radioSourceCacheGeneration = 0;
 var SROVA_STANDBY_ART = "/ui_web/assets/srova-square-logo.png";
 if (_addRadioModal) {
     _addRadioModal.addEventListener("click", function(e) {
@@ -453,6 +468,13 @@ function skipRadioRestoreSeek() {
 
 var previousQueueView = "home";   // view active before entering queue view
 var nowPlayingFromView = "home";  // view active when now playing was opened
+
+// Point 8: the album action exists only after the current metadata signature
+// resolves to one confident TIDAL album.
+var nowPlayingAlbumResolved = null;
+var nowPlayingAlbumWatchKey = "";
+var nowPlayingAlbumWatchSerial = 0;
+var nowPlayingAlbumReturnState = null;
 
 var searchTimer    = null;
 var loginPollTimer = null;
@@ -661,7 +683,7 @@ function syncPlayerBarRadioProgressState() {
     if (!playerBar) { return; }
     var browsingRadio = currentSourceSection === "radio";
     var activeRadio = playerBarActivePlaybackSource === "radio";
-    var radioContext = browsingRadio || activeRadio;
+    var radioContext = activeRadio || (!playerHasActiveMedia && browsingRadio);
     playerBar.classList.toggle("srovaPlayerBarRadioProgressHidden", radioContext);
     playerBar.classList.toggle("srovaPlayerBarRadioControlsMuted", radioContext);
 }
@@ -1265,6 +1287,250 @@ function syncNowPlayingButtons() {
 
 
 
+
+function hideNowPlayingAlbumAction() {
+    nowPlayingAlbumResolved = null;
+    if (npBtnAlbum) {
+        npBtnAlbum.classList.add("hidden");
+    }
+}
+
+function nowPlayingAlbumWatchSignature(s) {
+    s = s || {};
+    var source = inferStatusPlaybackSource(s);
+    var radio = s.radio_metadata || {};
+    var station = s.radio_station || {};
+    return [
+        s.logged_in === true ? "logged-in" : "logged-out",
+        source || "",
+        String(s.current_track_id || s.track_id || ""),
+        String(s.context_id || ""),
+        String(s.album_id || ""),
+        String(s.artist || ""),
+        String(s.title || ""),
+        String(s.album || ""),
+        String(radio.raw || ""),
+        String(radio.artist || ""),
+        String(radio.title || ""),
+        String(station.id || station.name || "")
+    ].join("\0");
+}
+
+function syncNowPlayingAlbumWatcher(s) {
+    if (!npBtnAlbum) { return; }
+
+    s = s || {};
+    var valid = (
+        s.logged_in === true &&
+        s.current_track_valid !== false &&
+        s.playback_state !== "idle"
+    );
+
+    if (!valid) {
+        nowPlayingAlbumWatchKey = "";
+        nowPlayingAlbumWatchSerial += 1;
+        hideNowPlayingAlbumAction();
+        return;
+    }
+
+    var signature = nowPlayingAlbumWatchSignature(s);
+    if (!signature || signature === nowPlayingAlbumWatchKey) {
+        return;
+    }
+
+    nowPlayingAlbumWatchKey = signature;
+    var serial = ++nowPlayingAlbumWatchSerial;
+    hideNowPlayingAlbumAction();
+
+    fetchWithTimeout(
+        "/tidal/now-playing-album",
+        {cache: "no-store"},
+        8000
+    )
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+        if (serial !== nowPlayingAlbumWatchSerial) { return; }
+        if (signature !== nowPlayingAlbumWatchKey) { return; }
+
+        var latest = lastKnownPlaybackStatus || {};
+        if (nowPlayingAlbumWatchSignature(latest) !== signature) { return; }
+
+        data = data || {};
+        var albumId = String(data.album_id || "").trim();
+        if (data.available !== true || !albumId) {
+            hideNowPlayingAlbumAction();
+            return;
+        }
+
+        nowPlayingAlbumResolved = {
+            signature: signature,
+            albumId: albumId,
+            albumTitle: String(data.album_title || latest.album || "").trim(),
+            albumArtist: String(data.album_artist || latest.artist || "").trim(),
+            albumCover: String(
+                data.album_cover ||
+                latest.cover ||
+                latest.radio_cover_art_url ||
+                ""
+            ).trim()
+        };
+        npBtnAlbum.classList.remove("hidden");
+    })
+    .catch(function() {
+        if (serial === nowPlayingAlbumWatchSerial) {
+            hideNowPlayingAlbumAction();
+        }
+    });
+}
+
+function copyNowPlayingPlaybackSource() {
+    return {
+        type: playbackSource.type || "",
+        id: playbackSource.id || "",
+        title: playbackSource.title || ""
+    };
+}
+
+function copyNowPlayingCurrentContext() {
+    if (!currentContext || typeof currentContext !== "object") {
+        return null;
+    }
+    var out = {};
+    Object.keys(currentContext).forEach(function(key) {
+        out[key] = currentContext[key];
+    });
+    return out;
+}
+
+function applyNowPlayingPlaybackContextSnapshot(state) {
+    state = state || {};
+    var savedSource = state.playbackSource || {};
+    playbackSource.type = savedSource.type || "";
+    playbackSource.id = savedSource.id || "";
+    playbackSource.title = savedSource.title || "";
+    currentContext = state.currentContext ?
+        copyObjectShallow(state.currentContext) :
+        null;
+}
+
+function copyObjectShallow(source) {
+    if (!source || typeof source !== "object") { return null; }
+    var out = {};
+    Object.keys(source).forEach(function(key) {
+        out[key] = source[key];
+    });
+    return out;
+}
+
+function applyNowPlayingPlaybackContextFromStatus(s) {
+    s = s || {};
+    if (s.current_track_valid === false || s.playback_state === "idle") {
+        playbackSource.type = "";
+        playbackSource.id = "";
+        playbackSource.title = "";
+        currentContext = null;
+        return;
+    }
+
+    var source = inferStatusPlaybackSource(s);
+    var type = String(s.context_type || "").trim();
+    if (source === "radio") {
+        type = "radio";
+    } else if (!type) {
+        type = source || "";
+    }
+
+    var station = s.radio_station || {};
+    var contextTitle = String(
+        s.context_title ||
+        s.album ||
+        station.name ||
+        ""
+    );
+
+    playbackSource.type = type;
+    playbackSource.id = String(
+        s.context_id ||
+        s.album_id ||
+        s.current_track_id ||
+        ""
+    );
+    playbackSource.title = contextTitle;
+
+    currentContext = {
+        id: playbackSource.id,
+        title: contextTitle,
+        artist: String(s.artist || ""),
+        cover: String(s.cover || s.radio_cover_art_url || "")
+    };
+}
+
+function openNowPlayingResolvedAlbum() {
+    var resolved = nowPlayingAlbumResolved;
+    var status = lastKnownPlaybackStatus || {};
+
+    if (
+        !resolved ||
+        !resolved.albumId ||
+        resolved.signature !== nowPlayingAlbumWatchSignature(status)
+    ) {
+        hideNowPlayingAlbumAction();
+        syncNowPlayingAlbumWatcher(status);
+        return;
+    }
+
+    nowPlayingAlbumReturnState = {
+        underlyingView: nowPlayingFromView || "home",
+        signature: resolved.signature,
+        playbackSource: copyNowPlayingPlaybackSource(),
+        currentContext: copyNowPlayingCurrentContext()
+    };
+
+    closeMetaPanel();
+    closeLyricsPanel();
+    closeVuPanel();
+
+    nowPlayingView.classList.add("hidden");
+    document.body.classList.remove("nowPlayingOpen");
+
+    // Restore the view that was underneath Now Playing before using the normal
+    // album detail renderer. The album renderer may temporarily set browsing
+    // context; the Back path below restores the live playback context.
+    showView(nowPlayingAlbumReturnState.underlyingView);
+
+    loadTrackList(
+        {
+            id: resolved.albumId,
+            cover: resolved.albumCover || "",
+            title: resolved.albumTitle || "TIDAL Album",
+            artist: resolved.albumArtist || ""
+        },
+        "/tidal/album/" + resolved.albumId,
+        "nowplaying"
+    );
+}
+
+function goBackToNowPlayingFromAlbum() {
+    var state = nowPlayingAlbumReturnState || {};
+    nowPlayingAlbumReturnState = null;
+
+    var status = lastKnownPlaybackStatus || {};
+    var currentSignature = nowPlayingAlbumWatchSignature(status);
+
+    // If playback did not change while browsing the album, restore the exact
+    // pre-drill-down playback context. Otherwise rebuild it from the newest
+    // authoritative status snapshot.
+    if (state.signature && state.signature === currentSignature) {
+        applyNowPlayingPlaybackContextSnapshot(state);
+    } else {
+        applyNowPlayingPlaybackContextFromStatus(status);
+    }
+
+    showView(state.underlyingView || nowPlayingFromView || "home");
+    openNowPlaying();
+}
+
+
 var HOME_GATEWAY_APP_PANEL_CLASS = "srovaHomeGatewayAppPanel";
 var homeGatewayAppPanelResizeBound = false;
 var homeGatewayAppPanelResizeObserver = null;
@@ -1769,6 +2035,10 @@ function restoreSearchView() {
 }
 
 function goBack() {
+    if (previousView === "nowplaying") {
+        goBackToNowPlayingFromAlbum();
+        return;
+    }
     if (previousView === "search") {
         restoreSearchView();
         restoreDetailReturnScroll("search");
@@ -6107,6 +6377,7 @@ function updateLoginBtn(loggedIn, options) {
     var changed = (isLoggedIn !== loggedIn);
     isLoggedIn = loggedIn;
     if (!loggedIn) {
+        hideNowPlayingAlbumAction();
         globalSearchTidalRequestSerial += 1;
         globalSearchTidalReady = false;
         setGlobalSearchVisible(globalSearchRequestedVisible);
@@ -6555,6 +6826,12 @@ function resetTidalInfinitePlayGuard() {
     tidalInfinitePlayLastRefillKey = "";
 }
 
+function releaseTidalInfinitePlayRefillKey(refillKey) {
+    if (tidalInfinitePlayLastRefillKey === refillKey) {
+        tidalInfinitePlayLastRefillKey = "";
+    }
+}
+
 function normalizeTidalInfinitePlayMode(mode) {
     mode = String(mode || "").toLowerCase();
     if (mode === "same_artist" || mode === "similar_artist" || mode === "surprise_me") {
@@ -6722,8 +6999,9 @@ function maybeRefillTidalInfinitePlay(s) {
     })
     .then(function(res) { return res.json().catch(function() { return {}; }); })
     .then(function(data) {
-        if (!data || data.ok === false) {
+        if (!data || data.ok !== true) {
             console.info("Infinite Play refill skipped:", (data && data.error) || "no recommendation seed");
+            releaseTidalInfinitePlayRefillKey(refillKey);
             return;
         }
         console.info("Infinite Play appended " + (data.added || 0) + " recommended tracks.");
@@ -6733,6 +7011,7 @@ function maybeRefillTidalInfinitePlay(s) {
     })
     .catch(function(e) {
         console.info("Infinite Play refill failed:", e);
+        releaseTidalInfinitePlayRefillKey(refillKey);
     })
     .then(function() {
         tidalInfinitePlayRefillInFlight = false;
@@ -6744,6 +7023,7 @@ function pollStatus() {
         .then(function(res) { return res.json(); })
         .then(function(s) {
             lastKnownPlaybackStatus = s;
+            syncNowPlayingAlbumWatcher(s);
             if (typeof s.tidal_infinite_play_enabled === "boolean") {
                 tidalInfinitePlayEnabled = s.tidal_infinite_play_enabled;
             }
@@ -6779,7 +7059,13 @@ function pollStatus() {
             setPlayerBarActivePlaybackSource(
                 (radioIdleStandbyApplied && !statusPlaying) ? "" : inferStatusPlaybackSource(s)
             );
+            var previousPlayingIdBeforeRadioTransition = String(currentPlayingId || "");
             var statusIsRadioLive = isRadioLiveStatus(s);
+            var refreshQueueForRadioTransition = !!(
+                previousPlayingIdBeforeRadioTransition &&
+                statusIsRadioLive &&
+                (s.radio_mode || s.source === "radio" || s.context_type === "radio")
+            );
             if (statusIsRadioLive && (s.radio_mode || s.source === "radio" || s.context_type === "radio")) {
                 if (currentPlayingId || currentDuration > 0 || (progressFill && progressFill._elapsed)) {
                     skipRadioRestoreSeek();
@@ -6790,6 +7076,9 @@ function pollStatus() {
                 seekInFlight = false;
                 pendingSessionPositionResetTrackId = "";
                 seekGuardTrackId = "";
+                if (refreshQueueForRadioTransition && queueView && queueView.style.display !== "none") {
+                    loadQueue();
+                }
             }
             if (statusPlaying !== playing) {
                 playing = statusPlaying;
@@ -7864,6 +8153,8 @@ function enhanceRadioShelfOrdering(block, items) {
             .then(function() {
                 _radioOrderSavePending = false;
                 originalCards = currentCards();
+                _radioSourceStationSignature = radioStationSignature(reordered);
+                _radioSourceCacheGeneration += 1;
                 _radioReorderMode = false;
                 if (toggle) { toggle.disabled = false; }
                 updateModeUi();
@@ -8122,11 +8413,72 @@ function enhanceRadioShelfOrdering(block, items) {
 }
 
 
+function radioStationSignature(stations) {
+    stations = Array.isArray(stations) ? stations : [];
+    return stations.map(function(station) {
+        station = station || {};
+        return [
+            String(station.id || ""),
+            String(station.name || ""),
+            String(station.url || ""),
+            String(station.icon || station.image_url || "")
+        ].join("\u001f");
+    }).join("\u001e");
+}
+
+function invalidateRadioSourceCache() {
+    _radioSourcePageCache = null;
+    _radioSourceStationSignature = "";
+    _radioSourceCacheGeneration += 1;
+}
+
+function refreshRadioSourceCache() {
+    if (_radioSourceRefreshInFlight) { return; }
+
+    _radioSourceRefreshInFlight = true;
+    var refreshGeneration = _radioSourceCacheGeneration;
+
+    fetch("/api/radio/stations")
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            _radioSourceRefreshInFlight = false;
+
+            /*
+             * Ignore a response that began before an explicit add/edit/delete
+             * invalidation or a successful reorder.
+             */
+            if (refreshGeneration !== _radioSourceCacheGeneration) { return; }
+
+            var stations = (data && Array.isArray(data.stations)) ?
+                data.stations :
+                [];
+            var signature = radioStationSignature(stations);
+
+            if (signature === _radioSourceStationSignature) { return; }
+
+            /*
+             * The station set, order or artwork identity changed. Discard the
+             * retained Radio page. If Radio is currently visible, rebuild it
+             * immediately from authoritative station data; otherwise the next
+             * visit will build it normally.
+             */
+            invalidateRadioSourceCache();
+            if (currentSourceSection === "radio") {
+                showRadioSource(false, true);
+            }
+        })
+        .catch(function() {
+            _radioSourceRefreshInFlight = false;
+        });
+}
+
+
 function buildRadioShelf(onReady) {
     fetch("/api/radio/stations")
         .then(function(r) { return r.json(); })
         .then(function(data) {
             var stations = (data && data.stations) ? data.stations : [];
+            _radioSourceStationSignature = radioStationSignature(stations);
             if (!stations.length) {
                 onReady(null);
                 return;
@@ -8370,8 +8722,23 @@ function showRadioSource(preserveReorderMode, setupVerified) {
     setHomeGatewayAppPanel(false);
     setCurrentSourceSection("radio");
     setGlobalSearchVisible(false);
-    homeSections.innerHTML = "";
     _cancelHomeSlotPolls();
+
+    /*
+     * Fast path: reattach the exact Radio page and image elements that were
+     * already rendered. Do not recreate or reassign artwork src values.
+     */
+    if (_radioSourcePageCache) {
+        if (_radioSourcePageCache.parentNode !== homeSections) {
+            homeSections.innerHTML = "";
+            homeSections.appendChild(_radioSourcePageCache);
+        }
+        _syncHomePlayingTiles(_radioSourcePageCache);
+        refreshRadioSourceCache();
+        return;
+    }
+
+    homeSections.innerHTML = "";
     var shell = buildSourcePageShell("srovaRadioSourcePage", "SOURCE 01", "Radio", "Live Streams", "radio");
     var body = shell.querySelector(".srovaSourcePageBody");
     var slot = document.createElement("div");
@@ -8386,6 +8753,7 @@ function showRadioSource(preserveReorderMode, setupVerified) {
             slot.className = "srovaSourceEmpty";
             slot.textContent = "No radio stations configured.";
         }
+        _radioSourcePageCache = shell;
     });
 }
 
@@ -12085,6 +12453,7 @@ function loadTrackList(context, endpoint, fromView) {
 
     if (
         (fromView || "") !== "artistpage" &&
+        (fromView || "") !== "nowplaying" &&
         isTidalSourcePageVisible() &&
         endpoint.indexOf("/tidal/") === 0
     ) {
@@ -13187,11 +13556,25 @@ if (nowPlayingProgress) {
 
 // --- Queue view ---
 
-function loadQueue() {
+function loadQueue(options) {
     if (!queueView) { return; }
+    options = options || {};
+
+    var preserveScroll = options.preserveScroll === true;
+    var preservedScroller = preserveScroll ? getSrovaBestScrollContainer(queueView) : null;
+    var preservedScrollTop = preserveScroll ? getSrovaElementScrollTop(preservedScroller) : 0;
+
     fetch("/tidal/queue")
         .then(function(res) { return res.json(); })
-        .then(function(data) { renderQueue(data); })
+        .then(function(data) {
+            renderQueue(data, {skipAutoPosition: preserveScroll});
+
+            if (preserveScroll) {
+                requestAnimationFrame(function() {
+                    setSrovaElementScrollTop(preservedScroller, preservedScrollTop);
+                });
+            }
+        })
         .catch(function() {
             queueView.innerHTML = '<div class="queueEmpty">Could not load queue.</div>';
         });
@@ -13211,8 +13594,9 @@ function autoPositionPlayQueueOnCurrent(npRow) {
     });
 }
 
-function renderQueue(data) {
+function renderQueue(data, options) {
     if (!queueView) { return; }
+    options = options || {};
     var tracks     = data.tracks     || [];
     var queueIndex = data.queue_index || 0;
     var displayStartIndex = 0;
@@ -13334,7 +13718,9 @@ function renderQueue(data) {
         queueView.appendChild(npHeader);
         var npRow = buildQueueRow(tracks[queueIndex], queueIndex, true, false);
         queueView.appendChild(npRow);
-        autoPositionPlayQueueOnCurrent(npRow);
+        if (!options.skipAutoPosition) {
+            autoPositionPlayQueueOnCurrent(npRow);
+        }
     }
 
     // ---- Up Next section ------------------------------------------------
@@ -13388,9 +13774,11 @@ function enableUpcomingQueueDrag(row, handle, absIdx) {
         if (!target) { return; }
         handle.disabled = true;
         persistUpcomingQueueMove(absIdx, destination)
-            .then(loadQueue)
+            .then(function() {
+                loadQueue({preserveScroll: true});
+            })
             .catch(function(err) {
-                loadQueue();
+                loadQueue({preserveScroll: true});
                 showQueueActionToast(err.message || "Could not reorder the Play Queue.", true);
             });
     }
@@ -13437,6 +13825,13 @@ function enableUpcomingQueueDrag(row, handle, absIdx) {
         var pointerId = e.pointerId;
         var offsetX = e.clientX - rect.left;
         var offsetY = e.clientY - rect.top;
+        var dragScroller = getSrovaBestScrollContainer(queueView);
+        var lastPointerX = e.clientX;
+        var lastPointerY = e.clientY;
+        var edgeScrollFrame = 0;
+        var edgeScrollThreshold = 72;
+        var edgeScrollMaxStep = 18;
+
         row.style.setProperty("--queue-drag-left", String(rect.left) + "px");
         row.style.setProperty("--queue-drag-top", String(rect.top) + "px");
         row.style.setProperty("--queue-drag-width", String(rect.width) + "px");
@@ -13451,24 +13846,151 @@ function enableUpcomingQueueDrag(row, handle, absIdx) {
         document.body.classList.add("is-queue-reordering-drag");
 
         function movePlaceholder(moveEvent) {
+            var reorderableRows = Array.prototype.filter.call(
+                parent.querySelectorAll('.queueRow[data-queue-reorderable="true"]'),
+                function(item) { return item !== row; }
+            );
+            if (!reorderableRows.length) { return; }
+
             var hit = document.elementFromPoint(moveEvent.clientX, moveEvent.clientY);
-            var target = hit && hit.closest ? hit.closest('.queueRow[data-queue-reorderable="true"]') : null;
-            if (!target || target === row || target.parentNode !== parent) { return; }
-            var targetRect = target.getBoundingClientRect();
-            if (moveEvent.clientY < targetRect.top + targetRect.height / 2) {
-                parent.insertBefore(placeholder, target);
-            } else {
-                parent.insertBefore(placeholder, target.nextSibling);
+            var target = hit && hit.closest ?
+                hit.closest('.queueRow[data-queue-reorderable="true"]') : null;
+
+            if (target && target !== row && target.parentNode === parent) {
+                var targetRect = target.getBoundingClientRect();
+                if (moveEvent.clientY < targetRect.top + targetRect.height / 2) {
+                    parent.insertBefore(placeholder, target);
+                } else {
+                    parent.insertBefore(placeholder, target.nextSibling);
+                }
+                return;
             }
+
+            // The pointer may be over the sticky queue toolbar while scrolling
+            // upward, or below the final row while scrolling downward. In those
+            // areas elementFromPoint() cannot identify a queue row, so explicitly
+            // allow the placeholder to reach the first or final queue position.
+            var firstRow = reorderableRows[0];
+            var lastRow = reorderableRows[reorderableRows.length - 1];
+            var firstRect = firstRow.getBoundingClientRect();
+            var lastRect = lastRow.getBoundingClientRect();
+
+            if (moveEvent.clientY <= firstRect.top + firstRect.height / 2) {
+                parent.insertBefore(placeholder, firstRow);
+            } else if (moveEvent.clientY >= lastRect.top + lastRect.height / 2) {
+                parent.insertBefore(placeholder, lastRow.nextSibling);
+            }
+        }
+
+        function queueDragViewportBounds() {
+            var viewportH = window.innerHeight ||
+                (document.documentElement && document.documentElement.clientHeight) || 0;
+            var docScroller = getSrovaDocumentScrollElement();
+            var top = 0;
+            var bottom = viewportH;
+
+            if (dragScroller &&
+                dragScroller !== docScroller &&
+                dragScroller !== document.documentElement &&
+                dragScroller !== document.body) {
+                var scrollerRect = dragScroller.getBoundingClientRect();
+                top = Math.max(top, scrollerRect.top);
+                bottom = Math.min(bottom, scrollerRect.bottom);
+            }
+
+            var queueBar = queueView.querySelector(".queueBar");
+            if (queueBar) {
+                var queueBarRect = queueBar.getBoundingClientRect();
+                if (queueBarRect.height > 0) {
+                    top = Math.max(top, queueBarRect.bottom);
+                }
+            }
+
+            if (playerBar) {
+                var playerBarRect = playerBar.getBoundingClientRect();
+                if (playerBarRect.height > 0 &&
+                    playerBarRect.top > top &&
+                    playerBarRect.top < bottom) {
+                    bottom = playerBarRect.top;
+                }
+            }
+
+            return {
+                top: Math.max(0, Math.min(top, viewportH)),
+                bottom: Math.max(top, Math.min(bottom, viewportH))
+            };
+        }
+
+        function queueDragTopForPointer(clientY) {
+            var bounds = queueDragViewportBounds();
+            var minTop = bounds.top;
+            var maxTop = Math.max(minTop, bounds.bottom - rect.height);
+            return Math.min(
+                maxTop,
+                Math.max(minTop, clientY - offsetY)
+            );
+        }
+
+        function queueDragEdgeScrollStep() {
+            edgeScrollFrame = 0;
+
+            var bounds = queueDragViewportBounds();
+            var delta = 0;
+
+            if (lastPointerY < bounds.top + edgeScrollThreshold) {
+                var topStrength = Math.min(
+                    1,
+                    Math.max(
+                        0,
+                        (bounds.top + edgeScrollThreshold - lastPointerY) /
+                        edgeScrollThreshold
+                    )
+                );
+                delta = -Math.max(2, Math.round(edgeScrollMaxStep * topStrength));
+            } else if (lastPointerY > bounds.bottom - edgeScrollThreshold) {
+                var bottomStrength = Math.min(
+                    1,
+                    Math.max(
+                        0,
+                        (lastPointerY - (bounds.bottom - edgeScrollThreshold)) /
+                        edgeScrollThreshold
+                    )
+                );
+                delta = Math.max(2, Math.round(edgeScrollMaxStep * bottomStrength));
+            }
+
+            if (delta !== 0) {
+                var beforeScrollTop = getSrovaElementScrollTop(dragScroller);
+                setSrovaElementScrollTop(dragScroller, beforeScrollTop + delta);
+                var afterScrollTop = getSrovaElementScrollTop(dragScroller);
+
+                if (afterScrollTop !== beforeScrollTop) {
+                    movePlaceholder({
+                        clientX: lastPointerX,
+                        clientY: lastPointerY
+                    });
+                }
+            }
+
+            edgeScrollFrame = requestAnimationFrame(queueDragEdgeScrollStep);
         }
 
         function onMove(moveEvent) {
             if (moveEvent.pointerId !== pointerId) { return; }
             moveEvent.preventDefault();
+
+            lastPointerX = moveEvent.clientX;
+            lastPointerY = moveEvent.clientY;
+
             row.style.setProperty("--queue-drag-left", String(moveEvent.clientX - offsetX) + "px");
-            row.style.setProperty("--queue-drag-top", String(moveEvent.clientY - offsetY) + "px");
+            row.style.setProperty(
+                "--queue-drag-top",
+                String(queueDragTopForPointer(moveEvent.clientY)) + "px"
+            );
             movePlaceholder(moveEvent);
         }
+
+        edgeScrollFrame = requestAnimationFrame(queueDragEdgeScrollStep);
 
         function finish(endEvent, commit) {
             if (endEvent && endEvent.pointerId !== pointerId) { return; }
@@ -13476,6 +13998,11 @@ function enableUpcomingQueueDrag(row, handle, absIdx) {
             window.removeEventListener("pointerup", onUp, true);
             window.removeEventListener("pointercancel", onCancel, true);
             window.removeEventListener("blur", onBlur, true);
+
+            if (edgeScrollFrame) {
+                cancelAnimationFrame(edgeScrollFrame);
+                edgeScrollFrame = 0;
+            }
 
             var position = 0;
             var sibling = placeholder.previousSibling;
@@ -13497,9 +14024,11 @@ function enableUpcomingQueueDrag(row, handle, absIdx) {
             if (!commit || toIndex === absIdx) { return; }
             handle.disabled = true;
             persistUpcomingQueueMove(absIdx, toIndex)
-                .then(loadQueue)
+                .then(function() {
+                    loadQueue({preserveScroll: true});
+                })
                 .catch(function(err) {
-                    loadQueue();
+                    loadQueue({preserveScroll: true});
                     showQueueActionToast(err.message || "Could not reorder the Play Queue.", true);
                 });
         }
@@ -15025,6 +15554,7 @@ function submitAddRadio() {
             return;
         }
         closeAddRadioModal();
+        invalidateRadioSourceCache();
         loadRadioStations();
     })
     .catch(function() {
@@ -15034,7 +15564,10 @@ function submitAddRadio() {
 
 function deleteRadioStation(id) {
     fetch("/api/radio/stations/" + id, {method: "DELETE"})
-        .then(function() { loadRadioStations(); })
+        .then(function() {
+            invalidateRadioSourceCache();
+            loadRadioStations();
+        })
         .catch(function() { loadRadioStations(); });
 }
 

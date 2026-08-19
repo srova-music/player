@@ -169,6 +169,10 @@ _ONLINE_STATE_TCP_TIMEOUT = 0.75
 
 _RADIO_ART_LOCK = threading.RLock()
 _RADIO_ART_CACHE = {}        # "artist\0title" -> {"data": dict, "ts": float}
+# Point 8: successful Local/Radio -> TIDAL album matches.
+# Negative/ambiguous results are deliberately not persisted.
+_NOW_PLAYING_ALBUM_CACHE = {}
+_NOW_PLAYING_ALBUM_CACHE_LOCK = threading.Lock()
 _RADIO_ART_IN_FLIGHT = set()
 TTL_RADIO_ART = 7 * 86400
 TTL_RADIO_ART_MISS = 1800
@@ -196,8 +200,14 @@ def _is_radio_paradise_metadata_stream(stream_url):
 # Populated by POST queue endpoints; used by GET /tidal/queue and persisted to disk.
 PLAY_QUEUE_META_CACHE = {}
 
+# Bounded recommendation memory for Infinite Play. This intentionally survives
+# normal queue replacement and service restart so a new album/seed does not
+# immediately forget what Infinite Play recently served.
+INFINITE_PLAY_HISTORY = []
+
 # Protects queue globals from concurrent mutation by HTTP handler threads.
 _QUEUE_LOCK = threading.Lock()
+_INFINITE_PLAY_GENERATION_LOCK = threading.Lock()
 
 # TIDAL track and stream URL resolution performs network I/O. Keep that work
 # away from the GLib main loop and use a generation token so a late result
@@ -2627,7 +2637,8 @@ def save_queue():
                 "repeat_mode":    REPEAT_MODE,
                 "shuffle_on":     SHUFFLE_ON,
                 "original_queue": list(ORIGINAL_QUEUE),
-                "meta_cache":     dict(PLAY_QUEUE_META_CACHE)
+                "meta_cache":     dict(PLAY_QUEUE_META_CACHE),
+                "infinite_play_history": list(INFINITE_PLAY_HISTORY)
             }
             tmp = _QUEUE_FILE + ".tmp"
             with open(tmp, "w") as f:
@@ -2645,7 +2656,7 @@ def load_queue():
     Playback does NOT auto-resume (Option A). The user navigates to the
     queue view and taps a track to resume."""
     global PLAY_QUEUE, QUEUE_INDEX, REPEAT_MODE, SHUFFLE_ON, ORIGINAL_QUEUE
-    global PLAY_QUEUE_META_CACHE
+    global PLAY_QUEUE_META_CACHE, INFINITE_PLAY_HISTORY
     try:
         if not os.path.exists(_QUEUE_FILE):
             return
@@ -2662,7 +2673,21 @@ def load_queue():
         ORIGINAL_QUEUE.extend([str(x) for x in data.get("original_queue", [])])
         PLAY_QUEUE_META_CACHE.clear()
         PLAY_QUEUE_META_CACHE.update(data.get("meta_cache", {}))
-        logger.info("Queue restored: %d tracks, index %d", len(PLAY_QUEUE), QUEUE_INDEX)
+        restored_ip_history = [
+            entry
+            for entry in data.get("infinite_play_history", [])
+            if isinstance(entry, dict)
+        ]
+        INFINITE_PLAY_HISTORY.clear()
+        INFINITE_PLAY_HISTORY.extend(
+            restored_ip_history[-INFINITE_PLAY_HISTORY_LIMIT:]
+        )
+        logger.info(
+            "Queue restored: %d tracks, index %d, Infinite Play history %d",
+            len(PLAY_QUEUE),
+            QUEUE_INDEX,
+            len(INFINITE_PLAY_HISTORY),
+        )
     except Exception as e:
         logger.warning("load_queue failed: %s", e)
 
@@ -4095,6 +4120,286 @@ def build_current_scrobble_track(source=None):
         "title": title,
         "album": album,
         "duration": duration,
+    }
+
+
+
+def _now_playing_album_norm(value):
+    """Normalize catalogue metadata for strict equality checks."""
+    text = str(value or "").strip().casefold()
+    text = text.replace("’", "'").replace("`", "'")
+    text = re.sub(r"[\W_]+", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _now_playing_album_cache_key(source, artist, title, album="", duration=0):
+    try:
+        duration_bucket = int(round(float(duration or 0)))
+    except Exception:
+        duration_bucket = 0
+    return "\0".join([
+        str(source or "").strip().lower(),
+        _now_playing_album_norm(artist),
+        _now_playing_album_norm(title),
+        _now_playing_album_norm(album),
+        str(duration_bucket),
+    ])
+
+
+def _cached_now_playing_album(cache_key):
+    if not cache_key:
+        return ""
+    with _NOW_PLAYING_ALBUM_CACHE_LOCK:
+        return str(_NOW_PLAYING_ALBUM_CACHE.get(cache_key) or "")
+
+
+def _cache_now_playing_album(cache_key, album_id):
+    cache_key = str(cache_key or "")
+    album_id = str(album_id or "")
+    if not cache_key or not album_id:
+        return
+    with _NOW_PLAYING_ALBUM_CACHE_LOCK:
+        # Keep this process-memory cache intentionally small. Track changes
+        # naturally create new metadata signatures.
+        if len(_NOW_PLAYING_ALBUM_CACHE) >= 128:
+            try:
+                first_key = next(iter(_NOW_PLAYING_ALBUM_CACHE))
+                _NOW_PLAYING_ALBUM_CACHE.pop(first_key, None)
+            except Exception:
+                _NOW_PLAYING_ALBUM_CACHE.clear()
+        _NOW_PLAYING_ALBUM_CACHE[cache_key] = album_id
+
+
+def _strict_tidal_album_match(source, artist, title, album="", duration=0):
+    """Return one unambiguous TIDAL album ID, otherwise an empty string.
+
+    Local requires exact artist + title + album metadata. Radio first passes
+    SROVA's existing radio metadata rejection gate; when Radio also supplies an
+    album/release name it must match exactly. Without album metadata, an exact
+    artist/title search is accepted only if every qualifying result points to
+    the same TIDAL album.
+    """
+    source = str(source or "").strip().lower()
+    artist = str(artist or "").strip()
+    title = str(title or "").strip()
+    album = str(album or "").strip()
+
+    if source not in ("local", "radio") or not artist or not title:
+        return ""
+
+    if source == "local" and not album:
+        return ""
+
+    expected_artist = _now_playing_album_norm(artist)
+    expected_title = _now_playing_album_norm(title)
+    expected_album = _now_playing_album_norm(album)
+
+    try:
+        expected_duration = int(round(float(duration or 0)))
+    except Exception:
+        expected_duration = 0
+
+    backend = APP_INSTANCE.backend if APP_INSTANCE else None
+    session = getattr(backend, "session", None)
+    if not session:
+        return ""
+
+    query = " ".join(part for part in (artist, title) if part).strip()
+    if not query:
+        return ""
+
+    try:
+        raw = session.search(query, limit=30)
+        tracks = getattr(raw, "tracks", None)
+        if tracks is None and isinstance(raw, dict):
+            tracks = raw.get("tracks")
+        tracks = list(tracks or [])
+    except Exception as e:
+        logger.info(
+            "Point 8 album lookup unavailable source=%s artist=%r title=%r error=%s",
+            source,
+            artist,
+            title,
+            e,
+        )
+        return ""
+
+    album_ids = set()
+    for track in tracks:
+        candidate_title = str(getattr(track, "name", "") or "").strip()
+        artist_obj = getattr(track, "artist", None)
+        candidate_artist = str(getattr(artist_obj, "name", "") or "").strip() if artist_obj else ""
+        album_obj = getattr(track, "album", None)
+        candidate_album = str(getattr(album_obj, "name", "") or "").strip() if album_obj else ""
+        candidate_album_id = str(getattr(album_obj, "id", "") or "").strip() if album_obj else ""
+
+        if not candidate_album_id:
+            continue
+        if _now_playing_album_norm(candidate_artist) != expected_artist:
+            continue
+        if _now_playing_album_norm(candidate_title) != expected_title:
+            continue
+
+        # Local always requires the album tag to agree. Radio requires album
+        # agreement whenever its trusted metadata supplies one.
+        if expected_album and _now_playing_album_norm(candidate_album) != expected_album:
+            continue
+
+        # Duration is corroborating evidence for Local where both sides expose
+        # it. Small catalogue/tag differences are tolerated, but not a clearly
+        # different recording.
+        if source == "local" and expected_duration > 0:
+            try:
+                candidate_duration = int(round(float(getattr(track, "duration", 0) or 0)))
+            except Exception:
+                candidate_duration = 0
+            if candidate_duration > 0 and abs(candidate_duration - expected_duration) > 4:
+                continue
+
+        album_ids.add(candidate_album_id)
+
+    if len(album_ids) != 1:
+        if album_ids:
+            logger.info(
+                "Point 8 album lookup rejected ambiguous match source=%s artist=%r title=%r album=%r candidate_albums=%d",
+                source,
+                artist,
+                title,
+                album,
+                len(album_ids),
+            )
+        return ""
+
+    return next(iter(album_ids))
+
+
+def _resolve_now_playing_tidal_album():
+    """Resolve a confident TIDAL album for the active Now Playing item.
+
+    The frontend treats available=False as invisibility: no disabled action,
+    no approximate link and no fallback to a loosely related album.
+    """
+    if not _tidal_login_snapshot():
+        return {"available": False, "reason": "tidal_logged_out"}
+
+    app = APP_INSTANCE
+    player = getattr(app, "player", None) if app else None
+    if not app or not player:
+        return {"available": False, "reason": "player_unavailable"}
+
+    playback = _status_playback_context(player)
+    if not playback.get("current_track_valid"):
+        return {"available": False, "reason": "no_active_track"}
+
+    source = str(playback.get("source") or "").strip().lower()
+    context = playback.get("context") or {}
+
+    if source == "tidal":
+        album_id = str(context.get("album_id") or "").strip()
+        if not album_id:
+            return {"available": False, "source": "tidal", "reason": "album_id_unavailable"}
+        return {
+            "available": True,
+            "source": "tidal",
+            "album_id": album_id,
+            "album_title": str(context.get("album") or "").strip(),
+            "album_artist": str(context.get("artist") or "").strip(),
+            "album_cover": str(context.get("cover") or "").strip(),
+            "confidence": "direct",
+        }
+
+    if source == "radio":
+        track = build_current_scrobble_track("radio")
+        if not track:
+            return {
+                "available": False,
+                "source": "radio",
+                "reason": "radio_metadata_unreliable",
+            }
+        artist = str(track.get("artist") or "").strip()
+        title = str(track.get("title") or "").strip()
+        album = str(track.get("album") or "").strip()
+        duration = 0
+    elif source == "local":
+        artist = str(context.get("artist") or "").strip()
+        title = str(context.get("title") or "").strip()
+        album = str(context.get("album") or "").strip()
+        try:
+            duration = int(float(context.get("duration") or 0))
+        except Exception:
+            duration = 0
+        if not artist or not title or not album:
+            return {
+                "available": False,
+                "source": "local",
+                "reason": "local_metadata_insufficient",
+            }
+    else:
+        return {"available": False, "source": source, "reason": "unsupported_source"}
+
+    cache_key = _now_playing_album_cache_key(
+        source,
+        artist,
+        title,
+        album,
+        duration,
+    )
+    album_id = _cached_now_playing_album(cache_key)
+
+    if not album_id:
+        album_id = _strict_tidal_album_match(
+            source,
+            artist,
+            title,
+            album=album,
+            duration=duration,
+        )
+        if album_id:
+            _cache_now_playing_album(cache_key, album_id)
+
+    if not album_id:
+        return {
+            "available": False,
+            "source": source,
+            "reason": "no_confident_match",
+        }
+
+    resolved_album_title = album
+    resolved_album_artist = artist
+    resolved_album_cover = str(context.get("cover") or "").strip() if source == "local" else ""
+
+    if source == "radio":
+        artwork = _get_current_radio_artwork()
+        resolved_album_cover = str(artwork.get("url") or "").strip()
+        if not resolved_album_title:
+            # The strict search already proved one unique album ID. Fetch only
+            # its display metadata so the album view header is correct.
+            try:
+                backend = APP_INSTANCE.backend if APP_INSTANCE else None
+                session = getattr(backend, "session", None)
+                album_obj = session.album(album_id) if session else None
+                if album_obj:
+                    resolved_album_title = str(getattr(album_obj, "name", "") or "").strip()
+                    artist_obj = getattr(album_obj, "artist", None)
+                    resolved_album_artist = (
+                        str(getattr(artist_obj, "name", "") or "").strip()
+                        if artist_obj else resolved_album_artist
+                    )
+            except Exception as e:
+                logger.debug(
+                    "Point 8 matched Radio album display metadata unavailable album_id=%s: %s",
+                    album_id,
+                    e,
+                )
+
+    return {
+        "available": True,
+        "source": source,
+        "album_id": album_id,
+        "album_title": resolved_album_title,
+        "album_artist": resolved_album_artist,
+        "album_cover": resolved_album_cover,
+        "confidence": "strict_metadata",
     }
 
 
@@ -6712,8 +7017,350 @@ def _seed_artist_name_for_track(seed_id):
         return ""
 
 
+INFINITE_PLAY_HISTORY_LIMIT = 50
+
+
 def _normalise_infinite_play_title(title):
     return " ".join(str(title or "").strip().lower().split())
+
+
+def _normalise_infinite_play_artist(artist):
+    return " ".join(str(artist or "").strip().lower().split())
+
+
+def _normalise_infinite_play_album(album):
+    return " ".join(str(album or "").strip().lower().split())
+
+
+def _infinite_play_track_info(track):
+    """Return stable diversity metadata without performing network I/O."""
+    tid = str(getattr(track, "id", "") or "").strip()
+    title = _normalise_infinite_play_title(getattr(track, "name", ""))
+    artist = _normalise_infinite_play_artist(_tidal_track_artist_name(track))
+
+    album_obj = getattr(track, "album", None)
+    album_id = str(getattr(album_obj, "id", "") or "").strip() if album_obj else ""
+    album_name = _normalise_infinite_play_album(
+        getattr(album_obj, "name", "") if album_obj else ""
+    )
+    album_key = album_id or album_name
+
+    song_key = (artist, title) if artist and title else None
+
+    return {
+        "track": track,
+        "id": tid,
+        "title": title,
+        "artist": artist,
+        "album": album_key,
+        "song_key": song_key,
+    }
+
+
+def _infinite_play_history_entry_from_track(track):
+    """Create a compact persisted history entry from an existing TIDAL object."""
+    album_obj = getattr(track, "album", None)
+    return {
+        "id": str(getattr(track, "id", "") or "").strip(),
+        "title": _safe_str(getattr(track, "name", "")),
+        "artist": _tidal_track_artist_name(track),
+        "album_id": (
+            str(getattr(album_obj, "id", "") or "").strip()
+            if album_obj else ""
+        ),
+        "album": (
+            _safe_str(getattr(album_obj, "name", ""))
+            if album_obj else ""
+        ),
+    }
+
+
+def _record_infinite_play_history_tracks(tracks):
+    """Append successfully queued recommendations and keep only the newest 50."""
+    global INFINITE_PLAY_HISTORY
+
+    for track in tracks or []:
+        entry = _infinite_play_history_entry_from_track(track)
+        if not entry["id"]:
+            continue
+        INFINITE_PLAY_HISTORY.append(entry)
+
+    if len(INFINITE_PLAY_HISTORY) > INFINITE_PLAY_HISTORY_LIMIT:
+        del INFINITE_PLAY_HISTORY[:-INFINITE_PLAY_HISTORY_LIMIT]
+
+
+def _infinite_play_history_info(entry):
+    """Normalize one persisted/session Infinite Play history entry."""
+    if not isinstance(entry, dict):
+        return {
+            "id": "",
+            "title": "",
+            "artist": "",
+            "album": "",
+            "song_key": None,
+        }
+
+    tid = str(entry.get("id") or entry.get("track_id") or "").strip()
+    title = _normalise_infinite_play_title(
+        entry.get("title") or entry.get("name")
+    )
+    artist = _normalise_infinite_play_artist(entry.get("artist"))
+    album = str(entry.get("album_id") or "").strip()
+    if not album:
+        album = _normalise_infinite_play_album(entry.get("album"))
+    song_key = (artist, title) if artist and title else None
+
+    return {
+        "id": tid,
+        "title": title,
+        "artist": artist,
+        "album": album,
+        "song_key": song_key,
+    }
+
+
+def _select_infinite_play_diverse_tracks(
+    candidates,
+    limit,
+    mode,
+    recent_history=None,
+    existing_ids=None,
+    previous_entry=None,
+    rng=None,
+):
+    """Select a diverse Infinite Play batch from an already-fetched pool.
+
+    Candidate gathering remains mode-specific and network-backed. This helper
+    only performs local ordering/filtering so recommendation relevance remains
+    controlled by the existing Last.fm/TIDAL architecture.
+
+    recent_history is oldest -> newest and is bounded to the most recent
+    INFINITE_PLAY_HISTORY_LIMIT entries.
+    """
+    mode = _normalise_tidal_infinite_play_mode(mode)
+    target = max(0, int(limit or 0))
+    if target <= 0:
+        return []
+
+    rng = rng or random
+    existing = {str(value) for value in (existing_ids or []) if str(value)}
+
+    history = [
+        _infinite_play_history_info(entry)
+        for entry in list(recent_history or [])[-INFINITE_PLAY_HISTORY_LIMIT:]
+    ]
+    prior = (
+        _infinite_play_history_info(previous_entry)
+        if previous_entry
+        else None
+    )
+
+    recent_artist_counts = {}
+    recent_album_counts = {}
+    for item in history:
+        if item["artist"]:
+            recent_artist_counts[item["artist"]] = (
+                recent_artist_counts.get(item["artist"], 0) + 1
+            )
+        if item["album"]:
+            recent_album_counts[item["album"]] = (
+                recent_album_counts.get(item["album"], 0) + 1
+            )
+
+    history_split = len(history) // 2
+
+    def history_rank(info):
+        """0=fresh, 1=older half, 2=newer half."""
+        matched_indexes = []
+        for idx, previous in enumerate(history):
+            if info["id"] and info["id"] == previous["id"]:
+                matched_indexes.append(idx)
+                continue
+            if (
+                info["song_key"]
+                and previous["song_key"]
+                and info["song_key"] == previous["song_key"]
+            ):
+                matched_indexes.append(idx)
+
+        if not matched_indexes:
+            return 0
+        if any(idx >= history_split for idx in matched_indexes):
+            return 2
+        return 1
+
+    buckets = {0: [], 1: [], 2: []}
+    seen_ids = set()
+    seen_song_keys = set()
+
+    for track in candidates or []:
+        info = _infinite_play_track_info(track)
+        tid = info["id"]
+        if not tid or tid in existing or tid in seen_ids:
+            continue
+
+        # Multiple TIDAL catalogue entries for the same artist/title
+        # (remasters, duplicate editions, etc.) should not consume multiple
+        # positions in one candidate pool.
+        song_key = info["song_key"]
+        if song_key and song_key in seen_song_keys:
+            continue
+
+        seen_ids.add(tid)
+        if song_key:
+            seen_song_keys.add(song_key)
+        buckets[history_rank(info)].append(info)
+
+    selected = []
+    selected_ids = set()
+    selected_song_keys = set()
+    available = []
+
+    def choose_one():
+        pool = [
+            item
+            for item in available
+            if item["id"] not in selected_ids
+            and (
+                not item["song_key"]
+                or item["song_key"] not in selected_song_keys
+            )
+        ]
+        if not pool:
+            return None
+
+        # Apply adjacency rules across the refill boundary as well as within
+        # the newly generated batch. For the first selection, the active/seed
+        # queue item is the previous track.
+        previous = selected[-1] if selected else prior
+
+        # Hard adjacency rule for song title across ALL modes. Covers by
+        # different artists still must not place the same song title twice
+        # consecutively when another title is available.
+        if previous and previous["title"]:
+            different_title = [
+                item for item in pool
+                if item["title"] != previous["title"]
+            ]
+            if different_title:
+                pool = different_title
+
+        # Similar Artists / Surprise Me must not put the same artist back to
+        # back whenever another eligible artist is available.
+        if (
+            previous
+            and previous["artist"]
+            and mode in ("similar_artist", "surprise_me")
+        ):
+            different_artist = [
+                item for item in pool
+                if item["artist"] != previous["artist"]
+            ]
+            if different_artist:
+                pool = different_artist
+
+        batch_artist_counts = {}
+        batch_album_counts = {}
+        for item in selected:
+            if item["artist"]:
+                batch_artist_counts[item["artist"]] = (
+                    batch_artist_counts.get(item["artist"], 0) + 1
+                )
+            if item["album"]:
+                batch_album_counts[item["album"]] = (
+                    batch_album_counts.get(item["album"], 0) + 1
+                )
+
+        # Look ahead at what remains after the current adjacency filters.
+        # A purely "least-used artist first" strategy can consume the scarce
+        # alternate artists too early and strand several tracks by a dominant
+        # artist at the end. Prefer groups with more remaining supply when
+        # needed so an interleaved sequence remains achievable.
+        remaining_artist_counts = {}
+        remaining_title_counts = {}
+        for item in pool:
+            if item["artist"]:
+                remaining_artist_counts[item["artist"]] = (
+                    remaining_artist_counts.get(item["artist"], 0) + 1
+                )
+            if item["title"]:
+                remaining_title_counts[item["title"]] = (
+                    remaining_title_counts.get(item["title"], 0) + 1
+                )
+
+        def score(item):
+            album_count = (
+                batch_album_counts.get(item["album"], 0)
+                if item["album"] else 0
+            )
+            recent_album_count = (
+                recent_album_counts.get(item["album"], 0)
+                if item["album"] else 0
+            )
+            title_pressure = (
+                remaining_title_counts.get(item["title"], 0)
+                if item["title"] else 0
+            )
+
+            if mode == "same_artist":
+                # Same Artist cannot diversify by artist. Title pressure keeps
+                # cover/version clusters from being stranded at the tail;
+                # album spread remains the main diversity dimension.
+                return (
+                    -title_pressure,
+                    album_count,
+                    recent_album_count,
+                    rng.random(),
+                )
+
+            artist_count = (
+                batch_artist_counts.get(item["artist"], 0)
+                if item["artist"] else 0
+            )
+            recent_artist_count = (
+                recent_artist_counts.get(item["artist"], 0)
+                if item["artist"] else 0
+            )
+            artist_pressure = (
+                remaining_artist_counts.get(item["artist"], 0)
+                if item["artist"] else 0
+            )
+
+            # Balance dominant groups first so hard adjacency remains feasible.
+            # With the normally balanced 2/3-tracks-per-artist candidate pool,
+            # this still naturally yields a one-per-artist first pass.
+            return (
+                -artist_pressure,
+                -title_pressure,
+                artist_count,
+                recent_artist_count,
+                album_count,
+                recent_album_count,
+                rng.random(),
+            )
+
+        return min(pool, key=score)
+
+    # Stage 1: fresh candidates only.
+    # Stage 2: allow the older half of recent history.
+    # Stage 3: finally allow the newer half if the catalogue is genuinely
+    # sparse. Current queue IDs are never relaxed.
+    for rank in (0, 1, 2):
+        available.extend(buckets[rank])
+
+        while len(selected) < target:
+            chosen = choose_one()
+            if chosen is None:
+                break
+            selected.append(chosen)
+            selected_ids.add(chosen["id"])
+            if chosen["song_key"]:
+                selected_song_keys.add(chosen["song_key"])
+
+        if len(selected) >= target:
+            break
+
+    return [item["track"] for item in selected]
 
 
 def _infinite_play_artist_pool(seed_artist, mode):
@@ -6899,107 +7546,78 @@ def _append_infinite_play_recommendations(seed_id=None, limit=10, autoplay=False
 
         with _QUEUE_LOCK:
             existing = set(str(tid) for tid in PLAY_QUEUE)
-            denied_titles = set()
-            try:
-                if 0 <= QUEUE_INDEX < len(PLAY_QUEUE):
-                    recent_start = max(0, QUEUE_INDEX - 9)
-                    recent_ids = PLAY_QUEUE[recent_start:QUEUE_INDEX + 1]
-                else:
-                    recent_ids = PLAY_QUEUE[-10:]
-                for recent_id in recent_ids:
-                    recent_meta = PLAY_QUEUE_META_CACHE.get(str(recent_id), {}) or {}
-                    title_key = _normalise_infinite_play_title(
-                        recent_meta.get("title") or recent_meta.get("name")
-                    )
-                    if title_key:
-                        denied_titles.add(title_key)
-                seed_meta = PLAY_QUEUE_META_CACHE.get(seed_id, {}) or {}
-                seed_title_key = _normalise_infinite_play_title(
-                    seed_meta.get("title") or seed_meta.get("name")
+            seed_meta = dict(PLAY_QUEUE_META_CACHE.get(seed_id, {}) or {})
+
+            filtered = _select_infinite_play_diverse_tracks(
+                new_tracks,
+                limit=limit,
+                mode=mode,
+                recent_history=list(INFINITE_PLAY_HISTORY),
+                existing_ids=existing,
+                previous_entry=seed_meta,
+            )
+
+            if not filtered:
+                logger.warning(
+                    "Infinite Play: diversity selector found no usable tracks "
+                    "mode=%s candidates=%d history=%d",
+                    mode,
+                    len(new_tracks),
+                    len(INFINITE_PLAY_HISTORY),
                 )
-                if seed_title_key:
-                    denied_titles.add(seed_title_key)
-            except Exception as e:
-                logger.debug("Infinite Play title deny set build failed: %s", e)
-
-            id_filtered = [t for t in new_tracks if str(getattr(t, "id", "") or "") not in existing]
-            if not id_filtered:
-                # If the artist catalogue is tiny and everything is already in
-                # the queue, allow repeats rather than allowing Infinite Play to stop.
-                id_filtered = list(new_tracks)
-
-            filtered = []
-            filtered_ids = set()
-            skipped_titles = 0
-            for t in id_filtered:
-                tid_key = str(getattr(t, "id", "") or "").strip()
-                title_key = _normalise_infinite_play_title(getattr(t, "name", ""))
-                if title_key and title_key in denied_titles:
-                    skipped_titles += 1
-                    continue
-                filtered.append(t)
-                if tid_key:
-                    filtered_ids.add(tid_key)
-                if title_key:
-                    denied_titles.add(title_key)
-                if len(filtered) >= limit:
-                    break
-
-            if skipped_titles:
-                logger.info("Infinite Play: skipped %d repeated-title recommendations", skipped_titles)
-
-            if len(filtered) < limit:
-                relaxed_added = 0
-                for t in id_filtered:
-                    tid_key = str(getattr(t, "id", "") or "").strip()
-                    if tid_key and tid_key in filtered_ids:
-                        continue
-                    filtered.append(t)
-                    if tid_key:
-                        filtered_ids.add(tid_key)
-                    relaxed_added += 1
-                    if len(filtered) >= limit:
-                        break
-                if relaxed_added:
-                    logger.info(
-                        "Infinite Play: relaxed duplicate/title guard added %d tracks to keep queue alive",
-                        relaxed_added,
-                    )
-
-            if filtered and len(filtered) < limit:
-                # Final safety net for very small same-artist catalogues: recycle
-                # shuffled candidates so Infinite Play always appends the requested
-                # count instead of stopping at queue end.
-                recycle_source = list(filtered)
-                recycled = 0
-                while recycle_source and len(filtered) < limit:
-                    filtered.append(random.choice(recycle_source))
-                    recycled += 1
-                if recycled:
-                    logger.info(
-                        "Infinite Play: recycled %d same-artist candidates to keep queue alive",
-                        recycled,
-                    )
+                return {
+                    "ok": False,
+                    "error": "no usable recommended tracks",
+                    "added": 0,
+                }
 
             insert_start = len(PLAY_QUEUE)
             added = 0
+            added_tracks = []
+
             for t in filtered[:limit]:
                 tid = str(getattr(t, "id", "") or "").strip()
                 if not tid:
                     continue
+
+                album_obj = getattr(t, "album", None)
+                album_id = (
+                    str(getattr(album_obj, "id", "") or "").strip()
+                    if album_obj else ""
+                )
+                album_name = (
+                    _safe_str(getattr(album_obj, "name", ""))
+                    if album_obj else ""
+                )
+
                 meta = {
                     "id":       tid,
                     "title":    _safe_str(getattr(t, "name", "")),
                     "artist":   _tidal_track_artist_name(t),
+                    "album":    album_name,
+                    "album_id": album_id,
                     "cover":    _tidal_track_cover_url(t),
                     "duration": int(getattr(t, "duration", 0) or 0),
                     "quality":  _quality_badge(t)
                 }
+
                 PLAY_QUEUE.append(tid)
                 ORIGINAL_QUEUE.append(tid)
                 PLAY_QUEUE_META_CACHE[tid] = meta
+                added_tracks.append(t)
                 added += 1
+
+            _record_infinite_play_history_tracks(added_tracks)
             next_idx = insert_start
+
+            logger.info(
+                "Infinite Play diversity: mode=%s selected=%d candidates=%d "
+                "history=%d",
+                mode,
+                added,
+                len(new_tracks),
+                len(INFINITE_PLAY_HISTORY),
+            )
 
         if added <= 0:
             logger.warning("Infinite Play: recommendations had no usable track ids")
@@ -7015,13 +7633,79 @@ def _append_infinite_play_recommendations(seed_id=None, limit=10, autoplay=False
         return {"ok": False, "error": str(e), "added": 0}
 
 
-def _autofill_queue():
-    """Fetch similar tracks and append them when Infinite Play reaches queue end."""
-    try:
+def _coordinated_infinite_play_refill(seed_id=None, limit=10, autoplay=False, mode=None):
+    """Serialize Infinite Play generation across proactive refill, EOS and clients."""
+    mode = _normalise_tidal_infinite_play_mode(mode or _tidal_infinite_play_mode())
+
+    with _INFINITE_PLAY_GENERATION_LOCK:
         if not _tidal_infinite_play_enabled():
-            logger.info("Autofill skipped: Infinite Play disabled")
-            return
-        _append_infinite_play_recommendations(limit=10, autoplay=True, mode=_tidal_infinite_play_mode())
+            logger.info("Infinite Play generation skipped: disabled")
+            return {"ok": False, "error": "Infinite Play is disabled", "added": 0}
+
+        if RADIO_MODE:
+            logger.info("Infinite Play generation skipped: radio mode active")
+            return {"ok": False, "error": "radio mode active", "added": 0}
+
+        with _QUEUE_LOCK:
+            if not PLAY_QUEUE or not (0 <= QUEUE_INDEX < len(PLAY_QUEUE)):
+                return {"ok": False, "error": "no active queue", "added": 0}
+
+            active_index = int(QUEUE_INDEX)
+            active_id = str(PLAY_QUEUE[active_index])
+            active_meta = PLAY_QUEUE_META_CACHE.get(active_id, {}) or {}
+            active_source = str(active_meta.get("source") or "").lower()
+
+            if active_id.startswith("local:") or active_source == "local":
+                logger.info("Infinite Play generation skipped: active queue item is local")
+                return {"ok": False, "error": "active track is not TIDAL", "added": 0}
+
+            next_index = active_index + 1
+            if next_index < len(PLAY_QUEUE):
+                queue_length = len(PLAY_QUEUE)
+                logger.info(
+                    "Infinite Play: generation already satisfied current_index=%s queue_length=%s",
+                    active_index,
+                    queue_length,
+                )
+                if autoplay:
+                    GLib.idle_add(lambda idx=next_index: play_queue_index(idx))
+                return {
+                    "ok": True,
+                    "added": 0,
+                    "already_filled": True,
+                    "mode": mode,
+                    "queue_length": queue_length,
+                }
+
+            if seed_id and str(seed_id) != active_id:
+                logger.info(
+                    "Infinite Play generation seed mismatch: requested=%s active=%s",
+                    seed_id,
+                    active_id,
+                )
+            seed_id = active_id
+
+        return _append_infinite_play_recommendations(
+            seed_id=seed_id,
+            limit=limit,
+            autoplay=autoplay,
+            mode=mode,
+        )
+
+
+def _autofill_queue():
+    """Fetch recommendations at queue end without racing proactive refill."""
+    try:
+        result = _coordinated_infinite_play_refill(
+            limit=10,
+            autoplay=True,
+            mode=_tidal_infinite_play_mode(),
+        )
+        if not result.get("ok"):
+            logger.info(
+                "Autofill did not extend queue: %s",
+                result.get("error") or "unknown error",
+            )
     except Exception as e:
         logger.warning("Autofill failed: %s", e)
 
@@ -8015,27 +8699,109 @@ def _tidal_seek_payload(position):
             "queue_index": QUEUE_INDEX,
         }
     resumed = False
+    mmap_seek_state_machine = bool(
+        was_playing
+        and ALSA_DRIVER == "alsa_mmap"
+        and source in ("local", "tidal")
+    )
     try:
+        if mmap_seek_state_machine:
+            # Active FLUSH seeks can strand the custom mmap writer with the
+            # transport reporting Playing but no PCM data reaching ALSA.
+            #
+            # Reuse SROVA's proven user Pause -> paused Seek -> Resume state
+            # transitions instead of imitating them with raw player calls.
+            # These helpers preserve paused-position state, queue
+            # auto-advance, DAC idle-release handling, TIDAL stream-resolution
+            # invalidation, scrobbling, and playback-clock state.
+            _tidal_pause_payload()
+            time.sleep(0.35)
+
+            try:
+                pause_settled = not bool(player.is_playing())
+            except Exception as pe:
+                logger.warning(
+                    "ALSA mmap manual seek could not verify paused state: %s",
+                    pe,
+                )
+                pause_settled = False
+
+            if not pause_settled:
+                logger.warning(
+                    "ALSA mmap manual seek could not enter SROVA paused state "
+                    "target=%.1f",
+                    target,
+                )
+                try:
+                    _tidal_resume_payload()
+                except Exception as re:
+                    logger.warning(
+                        "ALSA mmap seek pause-failure recovery failed: %s",
+                        re,
+                    )
+                return {
+                    "ok": False,
+                    "error": "seek_pause_failed",
+                    "position": raw_before,
+                    "duration": duration,
+                    "playing": True,
+                    "source": source,
+                    "current_track_id": current_track_id,
+                    "queue_index": QUEUE_INDEX,
+                }
+
+            logger.info(
+                "ALSA mmap manual seek entered SROVA paused state target=%.1f",
+                target,
+            )
+
         result = player.seek(target)
-        if was_playing:
+
+        if mmap_seek_state_machine:
+            # Match a normal user seek performed while paused: Resume must see
+            # the new cursor rather than the position captured by Pause.
+            PAUSED_PLAYBACK_POSITION = target
+            PAUSED_PLAYBACK_TRACK_ID = str(current_track_id or "")
+            _disarm_queue_auto_advance("seek-while-paused")
+
+            time.sleep(0.35)
+            resume_payload = _tidal_resume_payload() or {}
+            resumed = (
+                str(resume_payload.get("result") or "").lower() == "playing"
+            )
+        elif was_playing:
             try:
                 player.play()
                 resumed = True
             except Exception as pe:
                 logger.warning("Seek resume play failed: %s", pe)
+
         raw_after = _player_position_seconds(player)
         playing_after = bool(player.is_playing())
-        if playing_after:
+
+        # A stock mmap Resume may legitimately return "playing" before the
+        # underlying player/ALSA writer reports Playing/RUNNING. Preserve the
+        # original user intent during that short reopen window instead of
+        # converting the seek into a paused state.
+        response_playing = (
+            bool(resumed)
+            if mmap_seek_state_machine
+            else playing_after
+        )
+
+        if response_playing:
             _set_playback_clock_position(target)
         else:
             PAUSED_PLAYBACK_POSITION = target
             PAUSED_PLAYBACK_TRACK_ID = str(current_track_id or "")
-        if was_playing and playing_after and source in ("local", "tidal"):
+
+        if was_playing and response_playing and source in ("local", "tidal"):
             _arm_active_queue_auto_advance()
-        elif not playing_after:
+        elif not response_playing:
             _disarm_queue_auto_advance("seek-while-paused")
+
         logger.info(
-            "SROVA seek complete source=%s index=%s title=%s target=%.1f duration=%.1f raw_after=%.1f playing_after=%s resumed=%s result=%s start_time=%.3f armed_key=%s",
+            "SROVA seek complete source=%s index=%s title=%s target=%.1f duration=%.1f raw_after=%.1f playing_after=%s response_playing=%s resumed=%s result=%s start_time=%.3f armed_key=%s",
             source,
             QUEUE_INDEX,
             title,
@@ -8043,6 +8809,7 @@ def _tidal_seek_payload(position):
             duration,
             raw_after,
             playing_after,
+            response_playing,
             resumed,
             str(result),
             float(PLAYBACK_START_TIME or 0),
@@ -8053,7 +8820,7 @@ def _tidal_seek_payload(position):
             "result": "ok",
             "position": target,
             "duration": duration,
-            "playing": playing_after,
+            "playing": response_playing,
             "source": source,
             "current_track_id": current_track_id,
             "queue_index": QUEUE_INDEX,
@@ -8061,12 +8828,37 @@ def _tidal_seek_payload(position):
         }
     except Exception as e:
         logger.warning("Seek failed: %s", e)
+        recovery_playing = False
+        if mmap_seek_state_machine:
+            try:
+                time.sleep(0.35)
+                recovery_payload = _tidal_resume_payload() or {}
+                recovery_playing = (
+                    str(recovery_payload.get("result") or "").lower()
+                    == "playing"
+                )
+                logger.info(
+                    "ALSA mmap failed seek restored SROVA playback state "
+                    "position=%.1f playing=%s",
+                    raw_before,
+                    recovery_playing,
+                )
+            except Exception as re:
+                logger.warning(
+                    "ALSA mmap failed seek could not restore SROVA playback "
+                    "state: %s",
+                    re,
+                )
         return {
             "ok": False,
             "error": str(e),
             "position": raw_before,
             "duration": duration,
-            "playing": bool(player.is_playing()),
+            "playing": (
+                recovery_playing
+                if mmap_seek_state_machine
+                else bool(player.is_playing())
+            ),
             "source": source,
             "current_track_id": current_track_id,
             "queue_index": QUEUE_INDEX,
@@ -9439,6 +10231,10 @@ class ControlHandler(BaseHTTPRequestHandler):
 
             threading.Thread(target=_bg_featured, daemon=True).start()
             return
+        if static_path == "/tidal/now-playing-album":
+            self._send_json(_resolve_now_playing_tidal_album(), no_store=True)
+            return
+
         if self.path.startswith("/tidal/search"):
             parsed = urlparse(self.path)
             params = parse_qs(parsed.query)
@@ -10710,7 +11506,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 if seed_id and seed_id != active_id:
                     logger.info("Infinite Play refill seed mismatch: requested=%s active=%s", seed_id, active_id)
                 seed_id = active_id
-            result = _append_infinite_play_recommendations(seed_id=seed_id, limit=limit, autoplay=False, mode=mode)
+            result = _coordinated_infinite_play_refill(seed_id=seed_id, limit=limit, autoplay=False, mode=mode)
             self._send_json(result, no_store=True)
             return
 

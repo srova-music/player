@@ -11,6 +11,10 @@ from pathlib import Path
 from threading import Thread, Lock
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Callable, Any
+
+import gi
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Gdk", "4.0")
 from gi.repository import GLib, GdkPixbuf, Gdk
 
 from core.http_session import get_global_session

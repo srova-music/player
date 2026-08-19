@@ -3647,6 +3647,7 @@ body:not(.hires) #waveformBars span {
 
 /* All header icon buttons in Now Playing -- consistent muted/gold */
 #nowPlayingDown,
+#npBtnAlbum,
 #npBtnQueue,
 #npBtnPip,
 #npBtnInfo,
@@ -3658,6 +3659,7 @@ body:not(.hires) #waveformBars span {
     transition: color 0.2s !important;
 }
 #nowPlayingDown:hover,
+#npBtnAlbum:hover,
 #npBtnQueue:hover,
 #npBtnPip:hover,
 #npBtnInfo:hover,
@@ -4828,6 +4830,7 @@ body.nowPlayingOpen {
 }
 
 #nowPlayingDown,
+#npBtnAlbum,
 #npBtnQueue,
 #npBtnPip,
 #npBtnInfo,
@@ -4853,6 +4856,7 @@ body.nowPlayingOpen {
 }
 
 #nowPlayingDown:hover,
+#npBtnAlbum:hover,
 #npBtnQueue:hover,
 #npBtnPip:hover,
 #npBtnInfo:hover,
@@ -4868,6 +4872,7 @@ body.nowPlayingOpen {
 }
 
 #nowPlayingDown .material-icons,
+#npBtnAlbum .material-icons,
 #npBtnQueue .material-icons,
 #npBtnPip .material-icons,
 #npBtnInfo .material-icons,
@@ -5823,6 +5828,7 @@ body.radioMode #npBtnNext {
     }
 
     #nowPlayingDown,
+    #npBtnAlbum,
     #npBtnQueue,
     #npBtnPip,
     #npBtnInfo,
@@ -5834,6 +5840,7 @@ body.radioMode #npBtnNext {
     }
 
     #nowPlayingDown .material-icons,
+    #npBtnAlbum .material-icons,
     #npBtnQueue .material-icons,
     #npBtnPip .material-icons,
     #npBtnInfo .material-icons,
@@ -8887,6 +8894,7 @@ header > #settingsBtn.active::after {
 #nowPlayingView #npBtnVU,
 #nowPlayingView #npBtnLyrics,
 #nowPlayingView #npBtnInfo,
+#nowPlayingView #npBtnAlbum,
 #nowPlayingView #npBtnQueue,
 #nowPlayingView #npBtnPip {
     width: var(--srova-np-header-control-size) !important;
@@ -8932,6 +8940,7 @@ header > #settingsBtn.active::after {
 #nowPlayingView #npBtnVU::before,
 #nowPlayingView #npBtnLyrics::before,
 #nowPlayingView #npBtnInfo::before,
+#nowPlayingView #npBtnAlbum::before,
 #nowPlayingView #npBtnQueue::before,
 #nowPlayingView #npBtnPip::before {
     content: "" !important;
@@ -8956,6 +8965,7 @@ header > #settingsBtn.active::after {
 #nowPlayingView #npBtnVU::after,
 #nowPlayingView #npBtnLyrics::after,
 #nowPlayingView #npBtnInfo::after,
+#nowPlayingView #npBtnAlbum::after,
 #nowPlayingView #npBtnQueue::after,
 #nowPlayingView #npBtnPip::after {
     position: absolute !important;
@@ -9023,6 +9033,7 @@ header > #settingsBtn.active::after {
 #nowPlayingView #npBtnVU .material-icons,
 #nowPlayingView #npBtnLyrics .material-icons,
 #nowPlayingView #npBtnInfo .material-icons,
+#nowPlayingView #npBtnAlbum .material-icons,
 #nowPlayingView #npBtnQueue .material-icons,
 #nowPlayingView #npBtnPip .material-icons {
     opacity: 0 !important;
@@ -9037,6 +9048,7 @@ header > #settingsBtn.active::after {
 #nowPlayingView #npBtnVU:hover,
 #nowPlayingView #npBtnLyrics:hover,
 #nowPlayingView #npBtnInfo:hover,
+#nowPlayingView #npBtnAlbum:hover,
 #nowPlayingView #npBtnQueue:hover,
 #nowPlayingView #npBtnPip:hover {
     border-color: rgba(245, 210, 122, 0.24) !important;
@@ -9059,6 +9071,7 @@ header > #settingsBtn.active::after {
 #nowPlayingView #npBtnVU:hover::before,
 #nowPlayingView #npBtnLyrics:hover::before,
 #nowPlayingView #npBtnInfo:hover::before,
+#nowPlayingView #npBtnAlbum:hover::before,
 #nowPlayingView #npBtnQueue:hover::before,
 #nowPlayingView #npBtnPip:hover::before {
     background:
@@ -9076,6 +9089,7 @@ header > #settingsBtn.active::after {
 #nowPlayingView #npBtnVU:hover::after,
 #nowPlayingView #npBtnLyrics:hover::after,
 #nowPlayingView #npBtnInfo:hover::after,
+#nowPlayingView #npBtnAlbum:hover::after,
 #nowPlayingView #npBtnQueue:hover::after,
 #nowPlayingView #npBtnPip:hover::after {
     -webkit-text-stroke-color: #F8DA86 !important;
@@ -9089,11 +9103,13 @@ header > #settingsBtn.active::after {
 #nowPlayingView #npBtnVU:active,
 #nowPlayingView #npBtnLyrics:active,
 #nowPlayingView #npBtnInfo:active,
+#nowPlayingView #npBtnAlbum:active,
 #nowPlayingView #npBtnQueue:active,
 #nowPlayingView #npBtnPip:active,
 #nowPlayingView #npBtnVU.active,
 #nowPlayingView #npBtnLyrics.active,
 #nowPlayingView #npBtnInfo.active,
+#nowPlayingView #npBtnAlbum.active,
 #nowPlayingView #npBtnQueue.active,
 #nowPlayingView #npBtnPip.active {
     border-color: rgba(245, 210, 122, 0.34) !important;
@@ -9115,11 +9131,13 @@ header > #settingsBtn.active::after {
 #nowPlayingView #npBtnVU:active::before,
 #nowPlayingView #npBtnLyrics:active::before,
 #nowPlayingView #npBtnInfo:active::before,
+#nowPlayingView #npBtnAlbum:active::before,
 #nowPlayingView #npBtnQueue:active::before,
 #nowPlayingView #npBtnPip:active::before,
 #nowPlayingView #npBtnVU.active::before,
 #nowPlayingView #npBtnLyrics.active::before,
 #nowPlayingView #npBtnInfo.active::before,
+#nowPlayingView #npBtnAlbum.active::before,
 #nowPlayingView #npBtnQueue.active::before,
 #nowPlayingView #npBtnPip.active::before {
     background:
@@ -9136,11 +9154,13 @@ header > #settingsBtn.active::after {
 #nowPlayingView #npBtnVU:active::after,
 #nowPlayingView #npBtnLyrics:active::after,
 #nowPlayingView #npBtnInfo:active::after,
+#nowPlayingView #npBtnAlbum:active::after,
 #nowPlayingView #npBtnQueue:active::after,
 #nowPlayingView #npBtnPip:active::after,
 #nowPlayingView #npBtnVU.active::after,
 #nowPlayingView #npBtnLyrics.active::after,
 #nowPlayingView #npBtnInfo.active::after,
+#nowPlayingView #npBtnAlbum.active::after,
 #nowPlayingView #npBtnQueue.active::after,
 #nowPlayingView #npBtnPip.active::after {
     -webkit-text-stroke-color: #F8DA86 !important;
@@ -9163,6 +9183,7 @@ header > #settingsBtn.active::after {
     #nowPlayingView #npBtnVU,
     #nowPlayingView #npBtnLyrics,
     #nowPlayingView #npBtnInfo,
+    #nowPlayingView #npBtnAlbum,
     #nowPlayingView #npBtnQueue,
     #nowPlayingView #npBtnPip {
         width: var(--srova-np-header-control-size) !important;
@@ -16614,6 +16635,7 @@ input[type="reset"]:disabled:focus-visible,
     }
 
     #nowPlayingView #nowPlayingDown,
+    #nowPlayingView #npBtnAlbum,
     #nowPlayingView #npBtnQueue,
     #nowPlayingView #npBtnPip,
     #nowPlayingView #npBtnInfo,
@@ -16625,6 +16647,7 @@ input[type="reset"]:disabled:focus-visible,
     }
 
     #nowPlayingView #nowPlayingDown .material-icons,
+    #nowPlayingView #npBtnAlbum .material-icons,
     #nowPlayingView #npBtnQueue .material-icons,
     #nowPlayingView #npBtnPip .material-icons,
     #nowPlayingView #npBtnInfo .material-icons,
@@ -22020,5 +22043,11 @@ img.icon {
 
 .srovaRestartModal
 .srovaRestartActions.srovaRestartSuccessActionsHidden {
+    display: none !important;
+}
+
+/* Point 8 — unresolved/ambiguous album means no control at all.
+   This must outrank the high-specificity Now Playing button layout rules. */
+#nowPlayingView #npBtnAlbum.hidden {
     display: none !important;
 }

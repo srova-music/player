@@ -15,7 +15,7 @@ def release(version="v1.3.0", assets=None):
     return {
         "tag_name": version,
         "name": "SROVA " + version,
-        "html_url": "https://github.com/srova-music/srova/releases/tag/" + version,
+        "html_url": "https://github.com/srova-music/player/releases/tag/" + version,
         "assets": assets or [],
     }
 

@@ -14,7 +14,7 @@
 <link rel="manifest" href="/ui_web/manifest.webmanifest" crossorigin="use-credentials">
 <meta name="theme-color" content="#050505">
 
-<link rel="stylesheet" href="/ui_web/srova.css?v=20260812_v1_2_queue_drag2">
+<link rel="stylesheet" href="/ui_web/srova.css?v=20260819_v1_3_release1">
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Josefin+Sans:wght@100;200;300;400&family=Outfit:wght@300;400&display=swap" rel="stylesheet">
 </head>
@@ -190,6 +190,16 @@
       <div id="npHeaderRight">
         <button id="npBtnVU" onclick="openVuPanel()" title="VU Meter">
           <span class="material-icons">graphic_eq</span>
+        </button>
+        <button id="npBtnAlbum" class="hidden" onclick="openNowPlayingResolvedAlbum()" title="Go to Album" aria-label="Go to Album">
+          <svg width="18" height="18" viewBox="0 0 24 24"
+               fill="none" stroke="currentColor" stroke-width="1.6"
+               stroke-linecap="round" stroke-linejoin="round"
+               aria-hidden="true">
+            <rect x="4.5" y="4.5" width="15" height="15" rx="1.5"></rect>
+            <circle cx="12" cy="12" r="4"></circle>
+            <circle cx="12" cy="12" r="1"></circle>
+          </svg>
         </button>
         <button id="npBtnLyrics" onclick="openLyricsPanel()" title="Lyrics">
           <span class="material-icons">lyrics</span>
@@ -430,7 +440,7 @@
   </div>
 </div>
 
-<script src="/ui_web/ui.js?v=20260812_v1_2_queue_drag2"></script>
+<script src="/ui_web/ui.js?v=20260819_v1_3_release1"></script>
 <script>
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", function() {

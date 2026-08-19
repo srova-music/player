@@ -1,5 +1,22 @@
 # SROVA Changelog
 
+## 1.3 (`1.3-1`) — 2026-08-19
+
+### Added
+
+- Now Playing can open the matching TIDAL album when SROVA has a confident album identity.
+
+### Improved
+
+- Play Queue reordering preserves the working scroll position instead of jumping back to the top.
+- Radio transitions keep Up Next and the player bar synchronized with active playback, while Radio artwork is retained across source navigation to avoid unnecessary redraws.
+- Infinite Play generation is coordinated more reliably and uses stronger diversity/history handling to reduce repetition and avoid avoidable generation pauses.
+- Browser asset cache handling and low-risk production housekeeping were hardened without changing the release runtime contract.
+
+### Fixed
+
+- Manual mmap seeking for Local Music and TIDAL uses hardened position-state handling for more reliable forward and backward seeks.
+
 ## 1.2 (`1.2-1`) — 2026-08-13
 
 ### Added
