@@ -7,17 +7,17 @@ Internet Radio from a browser on another device.
 SROVA is designed around high-quality playback, a responsive browser interface
 and clear Bit-Perfect signal-path reporting.
 
-## Version 1.3 release
+## Version 1.4 release
 
 This public source snapshot corresponds to:
 
-- SROVA Version 1.3
-- Debian package version `1.3-1`
+- SROVA Version 1.4
+- Debian package version `1.4-1`
 - web and control port `8081`
 - qualified Debian package architectures: AMD64 and ARM64
 
-This Version 1.3 public source update was derived from the locked private
-release source at commit b548c31e0ca7b480e662526c147533c9f654e5d5.
+This Version 1.4 public source update was derived from the locked private
+release source at commit af935a16615ea50d37cc2f2225d8d07bcb70406e.
 
 Private Git history is not included. The public repository contains the curated
 release source, build materials and tests. Private-only development files,
@@ -39,14 +39,14 @@ generated artifacts, binaries, logs and databases are excluded.
 
 ## Supported release targets
 
-The Version 1.3 release-qualified package format is Debian `.deb`.
+The Version 1.4 release-qualified package format is Debian `.deb`.
 
 - AMD64: tested on Debian and Debian-family PC or NUC systems
 - ARM64: built natively on ARM64 Debian systems and tested on Raspberry Pi
 
 Other inherited packaging and desktop-oriented source may remain in the tree
 for compatibility or future work, but RPM, Arch and Flatpak packages are not
-qualified Version 1.3 release targets.
+qualified Version 1.4 release targets.
 
 ## Accessing SROVA
 
@@ -88,9 +88,9 @@ From the repository root:
 
     ./package.sh deb "$(cat version.txt)"
 
-For Version 1.3 this produces:
+For Version 1.4 this produces:
 
-    dist/srova_1.3-1_amd64.deb
+    dist/srova_1.4-1_amd64.deb
 
 ## Building an ARM64 Debian package
 
@@ -102,9 +102,9 @@ The wrapper verifies that the host architecture is ARM64, reads `version.txt`,
 and delegates to the same authoritative `package.sh` Debian build path used for
 AMD64.
 
-For Version 1.3 this produces:
+For Version 1.4 this produces:
 
-    dist/srova_1.3-1_arm64.deb
+    dist/srova_1.4-1_arm64.deb
 
 See `packaging/arm64/README.md` for the ARM64 build contract.
 
@@ -112,11 +112,11 @@ See `packaging/arm64/README.md` for the ARM64 build contract.
 
 Install the package matching the machine architecture:
 
-    sudo apt install ./dist/srova_1.3-1_amd64.deb
+    sudo apt install ./dist/srova_1.4-1_amd64.deb
 
 or:
 
-    sudo apt install ./dist/srova_1.3-1_arm64.deb
+    sudo apt install ./dist/srova_1.4-1_arm64.deb
 
 The resulting package must be validated on a separate clean target system
 before publication.
@@ -139,9 +139,10 @@ through the application interfaces.
 This repository contains the SROVA player source and its AMD64 and ARM64 Debian
 build materials.
 
-The SROVA Remote Android application, APK source, Google Cast receiver source
-and passive Cast display source are separate projects and are not included in
-this repository.
+The SROVA Remote Android application, APK source and SROVA Cast
+receiver/provisioning source are separate projects and are not included in
+this repository. Player-side SROVA Cast display assets used by the Linux
+player are included here.
 
 ## Licence and attribution
 

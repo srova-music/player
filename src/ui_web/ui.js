@@ -21,6 +21,58 @@ var settingsView  = document.getElementById("settingsView");
 var myAlbumsView  = document.getElementById("myAlbumsView");
 var mySongsView   = document.getElementById("mySongsView");
 var localMusicView = document.getElementById("localMusicView");
+var headerHomeBtn = document.getElementById("headerHomeBtn");
+
+// Point 9: showView() and currentSourceSection are the shared frontend's
+// authoritative navigation state. Source walls deliberately reuse homeView,
+// so the broad container alone cannot identify the true Home landing view.
+var currentSrovaView = "home";
+var headerHomeNavigationBound = false;
+
+function isTrueHomeLandingViewActive() {
+    var nowPlayingOpen = nowPlayingView &&
+        !nowPlayingView.classList.contains("hidden");
+    return currentSrovaView === "home" &&
+        currentSourceSection === "" &&
+        !nowPlayingOpen;
+}
+
+function syncHeaderHomeNavigationState() {
+    if (!headerHomeBtn) { return; }
+    var onHome = isTrueHomeLandingViewActive();
+    headerHomeBtn.disabled = onHome;
+
+    if (onHome) {
+        headerHomeBtn.setAttribute("tabindex", "-1");
+        headerHomeBtn.setAttribute("aria-current", "page");
+        headerHomeBtn.setAttribute("aria-label", "SROVA");
+        headerHomeBtn.removeAttribute("title");
+        return;
+    }
+
+    headerHomeBtn.removeAttribute("tabindex");
+    headerHomeBtn.removeAttribute("aria-current");
+    headerHomeBtn.setAttribute("aria-label", "SROVA Home");
+    headerHomeBtn.setAttribute("title", "Home");
+}
+
+function activateHeaderHomeNavigation(event) {
+    if (event) { event.preventDefault(); }
+    if (isTrueHomeLandingViewActive()) { return false; }
+    goHome();
+    return false;
+}
+
+function initHeaderHomeNavigation() {
+    if (!headerHomeBtn || headerHomeNavigationBound) {
+        syncHeaderHomeNavigationState();
+        return;
+    }
+    headerHomeNavigationBound = true;
+    headerHomeBtn.addEventListener("click", activateHeaderHomeNavigation);
+    window.addEventListener("pageshow", syncHeaderHomeNavigationState);
+    syncHeaderHomeNavigationState();
+}
 
 var homeSections    = document.getElementById("homeSections");
 var playlistsContent = document.getElementById("playlistsContent");
@@ -71,6 +123,15 @@ var playerBarActivePlaybackSource = "";
 var playerHasActiveMedia = false;
 var homeHeroNowPlayingStateKey = "";
 var homeHeroNowPlayingToken = 0;
+var homeHeroArtworkElement = null;
+var homeHeroArtworkInitialized = false;
+var homeHeroDisplayedArtworkKey = "";
+var homeHeroDisplayedArtworkSource = "";
+var homeHeroPendingArtworkKey = "";
+var homeHeroPendingArtworkSource = "";
+var homeHeroArtworkPreload = null;
+var homeHeroFadeOutTimer = null;
+var homeHeroFadeInTimer = null;
 var playerInfinitePlayOriginalParent = null;
 var playerInfinitePlayOriginalNextSibling = null;
 // Test22 Point 3: Local CUE virtual tracks cannot use manual seek-to-zero safely.
@@ -410,6 +471,14 @@ var _radioSourcePageCache = null;
 var _radioSourceStationSignature = "";
 var _radioSourceRefreshInFlight = false;
 var _radioSourceCacheGeneration = 0;
+var RADIO_SOURCE_PREPARE_FAIL_OPEN_MS = 1200;
+var _radioSourcePreparationOperation = 0;
+var _radioSourcePreparationGeneration = -1;
+var _radioSourcePreparationPromise = null;
+var _radioSourcePreparationFresh = false;
+var _radioSourcePreparationTimedOut = false;
+var _radioSourceShowRequest = 0;
+var _radioSourcePendingAttachRequest = 0;
 var SROVA_STANDBY_ART = "/ui_web/assets/srova-square-logo.png";
 if (_addRadioModal) {
     _addRadioModal.addEventListener("click", function(e) {
@@ -663,6 +732,7 @@ var favArtistIds = {};
 
 // Playback source tracking -- set at every queue/replace entry point
 var playbackSource = { type: "", id: "", title: "" };
+var currentRadioPlayingFromName = "";
 
 // Artist page state
 var _artistPageRestoreFn = null;   // called by goBack() when previousView === "artistpage"
@@ -677,6 +747,21 @@ function _setPlaybackSource(type, id, title) {
         syncPlayerBarRadioProgressState();
         updatePlayerInfinitePlayControl();
     }
+}
+
+function renderRadioPlayingFromPresentation() {
+    var fromLabelEl = document.getElementById("nowPlayingFromLabel");
+    if (fromLabelEl) { fromLabelEl.textContent = "PLAYING FROM"; }
+    if (!nowPlayingFrom) { return; }
+    nowPlayingFrom.textContent = currentRadioPlayingFromName;
+    nowPlayingFrom.style.cursor = "";
+    nowPlayingFrom.onclick = null;
+}
+
+function syncRadioPlayingFromStation(station) {
+    station = station || {};
+    currentRadioPlayingFromName = String(station.name || "").trim();
+    renderRadioPlayingFromPresentation();
 }
 
 function syncPlayerBarRadioProgressState() {
@@ -701,6 +786,7 @@ function syncRadioSourceSectionState() {
 
 function setCurrentSourceSection(source) {
     currentSourceSection = source || "";
+    syncHeaderHomeNavigationState();
     syncPlayerBarRadioProgressState();
     syncRadioSourceSectionState();
 }
@@ -1093,6 +1179,12 @@ function queueActionSummary(action, tracksList) {
     return "Added " + count + " " + label + " to " + target;
 }
 
+function radioQueueActionSummary(action, stationName) {
+    var name = String(stationName || "").trim() || "Radio station";
+    var target = action === "next" ? "play next" : "the queue";
+    return "Added " + name + " to " + target;
+}
+
 function showQueueActionToast(message, isError) {
     var toast = document.getElementById("queueActionToast");
     if (!toast) {
@@ -1224,6 +1316,7 @@ function openNowPlaying() {
     // "Playing from" label -- derive from playbackSource
     var srcType  = playbackSource.type  || "";
     var srcTitle = playbackSource.title || (currentContext ? (currentContext.title || "") : "") || (meta.contextTitle || "");
+    var radioPlayingFromActive = playerBarActivePlaybackSource === "radio";
     var fromLabel = "PLAYING FROM";
     if      (srcType === "album")    { fromLabel = "PLAYING FROM ALBUM"; }
     else if (srcType === "playlist") { fromLabel = "PLAYING FROM PLAYLIST"; }
@@ -1235,6 +1328,10 @@ function openNowPlaying() {
     else if (srcType === "hires")    { fromLabel = "FROM HI-RES"; }
     else if (srcType === "home")     { fromLabel = "PLAYING FROM"; }
     else if (srcType === "radio")    { fromLabel = "LIVE RADIO"; }
+    if (radioPlayingFromActive) {
+        fromLabel = "PLAYING FROM";
+        srcTitle = currentRadioPlayingFromName;
+    }
 
     var fromLabelEl = document.getElementById("nowPlayingFromLabel");
     if (fromLabelEl) { fromLabelEl.textContent = fromLabel; }
@@ -1243,6 +1340,7 @@ function openNowPlaying() {
     nowPlayingTrack.textContent  = title;
     nowPlayingArtist.textContent = artist;
     nowPlayingFrom.textContent   = srcTitle;
+    if (radioPlayingFromActive) { renderRadioPlayingFromPresentation(); }
     nowPlayingTotal.textContent  = total;
     if (lastTechText) {
         nowPlayingQuality.textContent = lastTechText;
@@ -1256,6 +1354,7 @@ function openNowPlaying() {
     updateNpHeart();
     nowPlayingView.classList.remove("hidden");
     document.body.classList.add("nowPlayingOpen");
+    syncHeaderHomeNavigationState();
 }
 
 function closeNowPlaying() {
@@ -1726,6 +1825,7 @@ function setHomeGatewayAppPanel(active) {
 // --- View switching ---
 
 function showView(name) {
+    currentSrovaView = name;
     if (name !== "home") {
         setHomeGatewayAppPanel(false);
         _cancelHomeSlotPolls();
@@ -1789,6 +1889,7 @@ function showView(name) {
     }
     // Dismiss any open popover when switching views
     closeActivePopover();
+    syncHeaderHomeNavigationState();
     syncPlayerBarRadioProgressState();
     syncRadioSourceSectionState();
 }
@@ -1943,9 +2044,11 @@ function setGlobalSearchVisible(visible) {
 function showHome() { loadHome(); }
 
 function goHome() {
+    if (isTrueHomeLandingViewActive()) { return false; }
     searchInput.value = "";
     searchClear.classList.add("hidden");
     loadHome();
+    return false;
 }
 
 
@@ -3294,18 +3397,40 @@ function openNetworkShareDiscoveryModal(options) {
     modal.className = "networkShareModal";
     modal.setAttribute("role", "dialog");
     modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-labelledby", "networkShareDiscoveryTitle");
 
     var card = document.createElement("div");
     card.className = "networkShareCard";
 
     var title = document.createElement("div");
+    title.id = "networkShareDiscoveryTitle";
     title.className = "networkShareTitle";
     title.textContent = "Discover Network Shares";
     card.appendChild(title);
 
     var status = document.createElement("div");
     status.className = "settingsStatus networkShareStatus";
-    status.textContent = "Scanning NFS and SMB hosts on your LAN. This is bounded and may take up to 8 seconds.";
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    status.setAttribute("aria-atomic", "true");
+    status.setAttribute("aria-busy", "false");
+
+    var statusPrimary = document.createElement("div");
+    statusPrimary.className = "networkShareStatusPrimary";
+    status.appendChild(statusPrimary);
+
+    var statusDetail = document.createElement("div");
+    statusDetail.className = "networkShareStatusDetail";
+    status.appendChild(statusDetail);
+
+    var statusActivity = document.createElement("div");
+    statusActivity.className = "networkShareStatusActivity";
+    statusActivity.setAttribute("aria-hidden", "true");
+
+    var statusActivityFill = document.createElement("div");
+    statusActivityFill.className = "networkShareStatusActivityFill";
+    statusActivity.appendChild(statusActivityFill);
+    status.appendChild(statusActivity);
     card.appendChild(status);
 
     var serverList = document.createElement("div");
@@ -3350,8 +3475,14 @@ function openNetworkShareDiscoveryModal(options) {
     var connectInFlight = false;
     var connectButton = null;
     var disconnectInFlight = {};
+    var discoveryRequestSerial = 0;
+    var dismissed = false;
 
     function closeModal() {
+        if (dismissed) { return; }
+        dismissed = true;
+        discoveryRequestSerial += 1;
+        setDiscoveryActive(false);
         if (passwordInput) { passwordInput.value = ""; }
         currentCredentials = {};
         document.removeEventListener("keydown", onKeyDown);
@@ -3362,9 +3493,34 @@ function openNetworkShareDiscoveryModal(options) {
         if (e.key === "Escape") { closeModal(); }
     }
 
-    function setStatus(text, isError) {
-        status.textContent = text;
+    function setStatus(text, isError, detail) {
+        statusPrimary.textContent = text;
+        statusDetail.textContent = detail || "";
         status.classList.toggle("networkShareStatusError", !!isError);
+    }
+
+    function setDiscoveryActive(active) {
+        var isActive = !!active && !dismissed;
+        status.classList.toggle("networkShareStatusActive", isActive);
+        status.setAttribute("aria-busy", isActive ? "true" : "false");
+        if (isActive) {
+            setStatus(
+                "Scanning for NAS and network shares…",
+                false,
+                "Checking NFS and SMB services on your local network. This may take a few seconds."
+            );
+        }
+    }
+
+    function discoveryRequestIsCurrent(requestId) {
+        return !dismissed && requestId === discoveryRequestSerial;
+    }
+
+    function renderDiscoveryFailure(message) {
+        setDiscoveryActive(false);
+        setStatus(message || "Network discovery failed.", true);
+        serverList.innerHTML = "";
+        addText(serverList, "networkShareEmpty", "Network-share discovery did not complete.");
     }
 
     function clearSharePanel() {
@@ -3643,19 +3799,27 @@ function openNetworkShareDiscoveryModal(options) {
     }
 
     function discover(refresh) {
+        var requestId = ++discoveryRequestSerial;
         serverList.innerHTML = "";
         clearSharePanel();
-        addText(serverList, "networkShareEmpty", "Scanning NFS port 2049 and SMB port 445. This scan is capped and time-bounded.");
-        setStatus("Scanning network shares...", false);
+        setDiscoveryActive(true);
         fetchJson("/api/local/library/network/discover" + (refresh ? "?refresh=1" : "")).then(function(data) {
+            if (!discoveryRequestIsCurrent(requestId)) { return; }
+            setDiscoveryActive(false);
             if (!data || !data.ok) {
-                setStatus((data && data.error) || "Network discovery failed.", true);
+                renderDiscoveryFailure((data && data.error) || "Network discovery failed.");
                 return;
             }
-            setStatus("Discovery complete. " + (data.servers || []).length + " server(s) found.", false);
+            var servers = Array.isArray(data.servers) ? data.servers : [];
+            if (servers.length) {
+                setStatus("Scan complete — " + servers.length + " network server(s) found.", false);
+            } else {
+                setStatus("Scan complete — no NFS or SMB servers found.", false);
+            }
             renderServers(data);
         }).catch(function() {
-            setStatus("Network discovery failed.", true);
+            if (!discoveryRequestIsCurrent(requestId)) { return; }
+            renderDiscoveryFailure("Network discovery failed.");
         });
     }
 
@@ -6376,6 +6540,13 @@ function updateLoginBtn(loggedIn, options) {
     options = options || {};
     var changed = (isLoggedIn !== loggedIn);
     isLoggedIn = loggedIn;
+    if (changed) {
+        tidalLibraryUiGeneration += 1;
+        window._mySongsData = [];
+        window._myAlbumsData = [];
+        allPlaylists = [];
+        playlistsLoaded = false;
+    }
     if (!loggedIn) {
         hideNowPlayingAlbumAction();
         globalSearchTidalRequestSerial += 1;
@@ -6721,7 +6892,23 @@ function homeHeroNowPlayingParts(title, artist, fallbackTitle) {
 }
 
 function deriveHomeHeroNowPlayingModel(s) {
-    var active = !!(s && s.playing && s.current_track_valid !== false && s.playback_state !== "idle");
+    var radioCurrent = !!(
+        s &&
+        (
+            s.radio_mode ||
+            String(s.source || "").toLowerCase() === "radio" ||
+            String(s.context_type || "").toLowerCase() === "radio"
+        )
+    );
+    var validCurrentMedia = !!(
+        s &&
+        s.current_track_valid === true &&
+        s.playback_state !== "idle"
+    );
+    // A paused Local/TIDAL track remains the current media, including while
+    // mmap temporarily pauses for Pause/Seek/Resume. Radio keeps its existing
+    // playing-only Home presentation and delayed standby behaviour.
+    var active = !!(validCurrentMedia && (!radioCurrent || s.playing));
     if (!active) {
         return {
             active: false,
@@ -6766,11 +6953,65 @@ function setHomeHeroActiveSource(source) {
     }
 }
 
+function homeHeroArtworkIdentity(value) {
+    var raw = String(value || SROVA_STANDBY_ART);
+    if (raw.indexOf("data:") === 0) { return raw; }
+    try {
+        return new URL(raw, document.baseURI).href;
+    } catch (e) {
+        return raw;
+    }
+}
+
+function isHomeHeroFiniteArtworkSource(source) {
+    return source === "local" || source === "tidal";
+}
+
+function applyHomeHeroPresentation(gateway, nowPlaying, model) {
+    var targetText = model.text || "";
+    var targetSource = model.source || "";
+    nowPlaying.textContent = targetText;
+    nowPlaying.classList.toggle("isActive", !!(model.active && targetText));
+    gateway.classList.toggle("srovaHomeHeroNowPlaying", !!model.active);
+    setHomeHeroActiveSource(targetSource);
+}
+
+function cancelHomeHeroArtworkRequest(gateway) {
+    homeHeroNowPlayingToken += 1;
+    if (homeHeroArtworkPreload) {
+        homeHeroArtworkPreload.onload = null;
+        homeHeroArtworkPreload.onerror = null;
+        homeHeroArtworkPreload = null;
+    }
+    if (homeHeroFadeOutTimer !== null) {
+        window.clearTimeout(homeHeroFadeOutTimer);
+        homeHeroFadeOutTimer = null;
+    }
+    if (homeHeroFadeInTimer !== null) {
+        window.clearTimeout(homeHeroFadeInTimer);
+        homeHeroFadeInTimer = null;
+    }
+    homeHeroPendingArtworkKey = "";
+    homeHeroPendingArtworkSource = "";
+    if (gateway) { gateway.classList.remove("srovaHomeHeroSwapping"); }
+}
+
 function applyHomeHeroNowPlayingModel(model) {
     var gateway = document.getElementById("srovaGateway");
     var logo = document.getElementById("srovaGatewayLogo");
     var nowPlaying = document.getElementById("srovaHomeNowPlaying");
     if (!gateway || !logo || !nowPlaying) { return; }
+
+    if (homeHeroArtworkElement !== logo) {
+        cancelHomeHeroArtworkRequest(gateway);
+        homeHeroArtworkElement = logo;
+        homeHeroNowPlayingStateKey = "";
+        homeHeroArtworkInitialized = false;
+        homeHeroDisplayedArtworkKey = homeHeroArtworkIdentity(
+            logo.getAttribute("src") || logo.src || SROVA_STANDBY_ART
+        );
+        homeHeroDisplayedArtworkSource = "";
+    }
 
     var key = [
         model.active ? "1" : "0",
@@ -6781,23 +7022,66 @@ function applyHomeHeroNowPlayingModel(model) {
     if (key === homeHeroNowPlayingStateKey) { return; }
     homeHeroNowPlayingStateKey = key;
 
-    var token = ++homeHeroNowPlayingToken;
     var targetImage = model.imageUrl || SROVA_STANDBY_ART;
-    var targetText = model.text || "";
     var targetSource = model.source || "";
+    var targetArtworkKey = homeHeroArtworkIdentity(targetImage);
+    var finiteTarget = isHomeHeroFiniteArtworkSource(targetSource);
+    var sameDisplayedArtwork = !!(
+        homeHeroArtworkInitialized &&
+        targetSource === homeHeroDisplayedArtworkSource &&
+        targetArtworkKey === homeHeroDisplayedArtworkKey
+    );
+    var samePendingArtwork = !!(
+        homeHeroPendingArtworkKey &&
+        targetSource === homeHeroPendingArtworkSource &&
+        targetArtworkKey === homeHeroPendingArtworkKey
+    );
+    var sameFiniteSource = !!(
+        finiteTarget &&
+        (
+            targetSource === homeHeroDisplayedArtworkSource ||
+            targetSource === homeHeroPendingArtworkSource
+        )
+    );
+
+    // Finite-track metadata must not wait for image loading. When Local/TIDAL
+    // artwork is already displayed or loading for the same source, leave the
+    // artwork element, classes, preload and timers completely untouched.
+    if (sameFiniteSource) {
+        applyHomeHeroPresentation(gateway, nowPlaying, model);
+    }
+    if (finiteTarget && (sameDisplayedArtwork || samePendingArtwork)) {
+        if (sameDisplayedArtwork && !samePendingArtwork && homeHeroPendingArtworkKey) {
+            cancelHomeHeroArtworkRequest(gateway);
+        }
+        return;
+    }
+
+    cancelHomeHeroArtworkRequest(gateway);
+    var token = homeHeroNowPlayingToken;
+    var updatePresentationOnCommit = !sameFiniteSource;
+    homeHeroPendingArtworkKey = targetArtworkKey;
+    homeHeroPendingArtworkSource = targetSource;
 
     function commitHero(imageUrl) {
-        if (token !== homeHeroNowPlayingToken) { return; }
+        if (token !== homeHeroNowPlayingToken || homeHeroArtworkElement !== logo) { return; }
         gateway.classList.add("srovaHomeHeroSwapping");
-        window.setTimeout(function() {
-            if (token !== homeHeroNowPlayingToken) { return; }
-            logo.src = imageUrl || SROVA_STANDBY_ART;
-            nowPlaying.textContent = targetText;
-            nowPlaying.classList.toggle("isActive", !!(model.active && targetText));
-            gateway.classList.toggle("srovaHomeHeroNowPlaying", !!model.active);
-            setHomeHeroActiveSource(targetSource);
-            window.setTimeout(function() {
-                if (token === homeHeroNowPlayingToken) {
+        homeHeroFadeOutTimer = window.setTimeout(function() {
+            homeHeroFadeOutTimer = null;
+            if (token !== homeHeroNowPlayingToken || homeHeroArtworkElement !== logo) { return; }
+            var committedImage = imageUrl || SROVA_STANDBY_ART;
+            logo.src = committedImage;
+            homeHeroArtworkInitialized = true;
+            homeHeroDisplayedArtworkKey = homeHeroArtworkIdentity(committedImage);
+            homeHeroDisplayedArtworkSource = targetSource;
+            homeHeroPendingArtworkKey = "";
+            homeHeroPendingArtworkSource = "";
+            if (updatePresentationOnCommit) {
+                applyHomeHeroPresentation(gateway, nowPlaying, model);
+            }
+            homeHeroFadeInTimer = window.setTimeout(function() {
+                homeHeroFadeInTimer = null;
+                if (token === homeHeroNowPlayingToken && homeHeroArtworkElement === logo) {
                     gateway.classList.remove("srovaHomeHeroSwapping");
                 }
             }, 320);
@@ -6810,8 +7094,15 @@ function applyHomeHeroNowPlayingModel(model) {
     }
 
     var preload = new Image();
-    preload.onload = function() { commitHero(targetImage); };
-    preload.onerror = function() { commitHero(SROVA_STANDBY_ART); };
+    homeHeroArtworkPreload = preload;
+    preload.onload = function() {
+        if (homeHeroArtworkPreload === preload) { homeHeroArtworkPreload = null; }
+        commitHero(targetImage);
+    };
+    preload.onerror = function() {
+        if (homeHeroArtworkPreload === preload) { homeHeroArtworkPreload = null; }
+        commitHero(SROVA_STANDBY_ART);
+    };
     preload.src = targetImage;
 }
 
@@ -7162,6 +7453,9 @@ function pollStatus() {
                 updateBitPerfectReadout(s, hiRes);
             }
             document.body.classList.toggle("radioMode", !!(s.radio_mode && !(radioIdleStandbyApplied && !statusPlaying)));
+            if (s.radio_mode) {
+                syncRadioPlayingFromStation(s.radio_station || {});
+            }
             if (s.radio_mode && s.radio_station) {
                 if (radioIdleStandbyApplied && !statusPlaying) {
                     playerBar.classList.remove("hidden");
@@ -7798,6 +8092,7 @@ function playRadioStation(item) {
                 playerBar.classList.remove("hidden");
             }
             setPlayerBarActivePlaybackSource("radio");
+            syncRadioPlayingFromStation((data && data.station) || {});
             document.body.classList.add("radioMode");
             syncPlayerTrayTrackInfo({
                 source: "radio",
@@ -7883,7 +8178,9 @@ function showRadioStationMenu(anchorEl, item, e) {
             showQueueActionToast("Clear the Radio station from the Play Queue before adding to it.", true);
             return;
         }
-        submitQueueTracks([buildRadioStationPayload(item)], "next");
+        submitQueueTracks([buildRadioStationPayload(item)], "next", {
+            radioStationName: String(item.name || "").trim()
+        });
     });
 
     addMenuButton("add_to_queue", "Add to Queue", function() {
@@ -7891,7 +8188,9 @@ function showRadioStationMenu(anchorEl, item, e) {
             showQueueActionToast("Clear the Radio station from the Play Queue before adding to it.", true);
             return;
         }
-        submitQueueTracks([buildRadioStationPayload(item)], "queue");
+        submitQueueTracks([buildRadioStationPayload(item)], "queue", {
+            radioStationName: String(item.name || "").trim()
+        });
     });
 
     positionQueuePopover(anchorEl, popover);
@@ -8155,6 +8454,7 @@ function enhanceRadioShelfOrdering(block, items) {
                 originalCards = currentCards();
                 _radioSourceStationSignature = radioStationSignature(reordered);
                 _radioSourceCacheGeneration += 1;
+                supersedeRadioSourcePreparation();
                 _radioReorderMode = false;
                 if (toggle) { toggle.disabled = false; }
                 updateModeUi();
@@ -8426,13 +8726,25 @@ function radioStationSignature(stations) {
     }).join("\u001e");
 }
 
+function supersedeRadioSourcePreparation() {
+    _radioSourcePreparationOperation += 1;
+    _radioSourcePreparationGeneration = -1;
+    _radioSourcePreparationPromise = null;
+    _radioSourcePreparationFresh = false;
+    _radioSourcePreparationTimedOut = false;
+}
+
 function invalidateRadioSourceCache() {
     _radioSourcePageCache = null;
     _radioSourceStationSignature = "";
     _radioSourceCacheGeneration += 1;
+    supersedeRadioSourcePreparation();
 }
 
 function refreshRadioSourceCache() {
+    if (_radioSourcePreparationPromise) {
+        return _radioSourcePreparationPromise;
+    }
     if (_radioSourceRefreshInFlight) { return; }
 
     _radioSourceRefreshInFlight = true;
@@ -8472,6 +8784,301 @@ function refreshRadioSourceCache() {
         });
 }
 
+function waitForRadioSourceImageLoad(img) {
+    return new Promise(function(resolve) {
+        if (!img || img.complete) {
+            resolve();
+            return;
+        }
+
+        if (!img.addEventListener || !img.removeEventListener) {
+            resolve();
+            return;
+        }
+
+        var settled = false;
+        function finish() {
+            if (settled) { return; }
+            settled = true;
+            img.removeEventListener("load", finish);
+            img.removeEventListener("error", finish);
+            resolve();
+        }
+
+        img.addEventListener("load", finish);
+        img.addEventListener("error", finish);
+
+        if (img.complete) { finish(); }
+    });
+}
+
+function prepareRadioSourceImage(img) {
+    if (!img) { return Promise.resolve(); }
+
+    if (typeof img.decode !== "function") {
+        return waitForRadioSourceImageLoad(img);
+    }
+
+    try {
+        return Promise.resolve(img.decode()).catch(function() {
+            return waitForRadioSourceImageLoad(img);
+        });
+    } catch (e) {
+        return waitForRadioSourceImageLoad(img);
+    }
+}
+
+function prepareRadioSourceImages(shell) {
+    if (!shell || !shell.querySelectorAll) { return Promise.resolve(); }
+    var images = Array.prototype.slice.call(
+        shell.querySelectorAll('.album[data-type="radio"] img')
+    );
+    return Promise.all(images.map(function(img) {
+        return prepareRadioSourceImage(img).catch(function() {});
+    })).then(function() {});
+}
+
+function radioSourcePreparationResult(operation, timedOut) {
+    if (
+        operation !== _radioSourcePreparationOperation ||
+        !_radioSourcePageCache
+    ) {
+        return null;
+    }
+    return {
+        shell: _radioSourcePageCache,
+        generation: _radioSourceCacheGeneration,
+        operation: operation,
+        timedOut: timedOut === true
+    };
+}
+
+function radioSourcePreparationResultIsCurrent(result) {
+    return !!(
+        result &&
+        result.operation === _radioSourcePreparationOperation &&
+        result.generation === _radioSourceCacheGeneration &&
+        result.shell === _radioSourcePageCache
+    );
+}
+
+function consumeRadioSourcePreparation(operation) {
+    if (operation !== _radioSourcePreparationOperation) { return; }
+    _radioSourcePreparationPromise = null;
+    _radioSourcePreparationFresh = false;
+    _radioSourcePreparationTimedOut = false;
+    _radioSourcePendingAttachRequest = 0;
+}
+
+function attachPreparedRadioSource(result, requestId, appendShell) {
+    if (
+        requestId !== _radioSourceShowRequest ||
+        requestId !== _radioSourcePendingAttachRequest ||
+        currentSourceSection !== "radio" ||
+        !homeView ||
+        homeView.style.display === "none" ||
+        !radioSourcePreparationResultIsCurrent(result)
+    ) {
+        return false;
+    }
+
+    if (result.shell.parentNode !== homeSections) {
+        homeSections.innerHTML = "";
+        if (typeof appendShell === "function") {
+            appendShell(result.shell);
+        } else {
+            homeSections.appendChild(result.shell);
+        }
+    }
+    _syncHomePlayingTiles(result.shell);
+
+    if (!result.timedOut) {
+        consumeRadioSourcePreparation(result.operation);
+    }
+    return true;
+}
+
+function startRadioSourcePreparation() {
+    if (!_radioSourcePageCache) { return Promise.resolve(null); }
+
+    if (
+        _radioSourcePreparationPromise &&
+        _radioSourcePreparationGeneration === _radioSourceCacheGeneration
+    ) {
+        return _radioSourcePreparationPromise;
+    }
+
+    supersedeRadioSourcePreparation();
+    var operation = _radioSourcePreparationOperation;
+    var fetchGeneration = _radioSourceCacheGeneration;
+    _radioSourcePreparationGeneration = fetchGeneration;
+
+    var work = fetch("/api/radio/stations")
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (
+                operation !== _radioSourcePreparationOperation ||
+                fetchGeneration !== _radioSourceCacheGeneration
+            ) {
+                return null;
+            }
+
+            var stations = (data && Array.isArray(data.stations)) ?
+                data.stations :
+                [];
+            var signature = radioStationSignature(stations);
+
+            if (signature !== _radioSourceStationSignature) {
+                var replacement = buildRadioSourceShellFromStations(stations);
+                if (
+                    operation !== _radioSourcePreparationOperation ||
+                    fetchGeneration !== _radioSourceCacheGeneration
+                ) {
+                    return null;
+                }
+                _radioSourcePageCache = replacement;
+                _radioSourceStationSignature = signature;
+                _radioSourceCacheGeneration += 1;
+                _radioSourcePreparationGeneration = _radioSourceCacheGeneration;
+            }
+
+            var preparedGeneration = _radioSourceCacheGeneration;
+            var preparedShell = _radioSourcePageCache;
+            return prepareRadioSourceImages(preparedShell).then(function() {
+                if (
+                    operation !== _radioSourcePreparationOperation ||
+                    preparedGeneration !== _radioSourceCacheGeneration ||
+                    preparedShell !== _radioSourcePageCache
+                ) {
+                    return null;
+                }
+                return radioSourcePreparationResult(operation, false);
+            });
+        })
+        .catch(function() {
+            return radioSourcePreparationResult(operation, false);
+        });
+
+    _radioSourcePreparationPromise = new Promise(function(resolve) {
+        var settled = false;
+        var deadline = window.setTimeout(function() {
+            if (settled) { return; }
+            settled = true;
+            if (operation === _radioSourcePreparationOperation) {
+                _radioSourcePreparationTimedOut = true;
+            }
+            resolve(radioSourcePreparationResult(operation, true));
+        }, RADIO_SOURCE_PREPARE_FAIL_OPEN_MS);
+
+        work.then(function(result) {
+            if (!settled) {
+                settled = true;
+                window.clearTimeout(deadline);
+                if (radioSourcePreparationResultIsCurrent(result)) {
+                    _radioSourcePreparationFresh = true;
+                }
+                resolve(result);
+                return;
+            }
+
+            if (radioSourcePreparationResultIsCurrent(result)) {
+                _radioSourcePreparationFresh = true;
+            }
+            if (
+                _radioSourcePreparationTimedOut &&
+                radioSourcePreparationResultIsCurrent(result) &&
+                _radioSourcePendingAttachRequest
+            ) {
+                attachPreparedRadioSource(
+                    result,
+                    _radioSourcePendingAttachRequest
+                );
+            }
+        }, function() {
+            if (!settled) {
+                settled = true;
+                window.clearTimeout(deadline);
+                resolve(radioSourcePreparationResult(operation, false));
+            }
+        });
+    });
+
+    return _radioSourcePreparationPromise;
+}
+
+function prepareRadioSourceAfterVisibilityResume() {
+    if (!_radioSourcePageCache) { return null; }
+
+    var preparation = startRadioSourcePreparation();
+    if (
+        currentSourceSection === "radio" &&
+        homeView &&
+        homeView.style.display !== "none"
+    ) {
+        var requestId = ++_radioSourceShowRequest;
+        _radioSourcePendingAttachRequest = requestId;
+        preparation.then(function(result) {
+            attachPreparedRadioSource(result, requestId);
+        });
+    }
+    return preparation;
+}
+
+function retireCompletedRadioSourcePreparationAfterHide() {
+    if (_radioSourcePreparationFresh) {
+        supersedeRadioSourcePreparation();
+    }
+}
+
+function radioStationItems(stations) {
+    stations = Array.isArray(stations) ? stations : [];
+    return stations.map(function(s) {
+        return {
+            id:        s.id,
+            name:      s.name  || "",
+            sub_title: "Radio",
+            image_url: s.icon  || "",
+            type:      "radio",
+            url:       s.url   || ""
+        };
+    });
+}
+
+function buildRadioShelfFromStations(stations) {
+    var items = radioStationItems(stations);
+    if (!items.length) { return null; }
+    var block = buildScrollSection("My Radio", items, function(item, e, anchor) {
+        if (_radioReorderMode) {
+            if (e) { e.stopPropagation(); }
+            return;
+        }
+        showRadioStationMenu(anchor || (e ? e.currentTarget : null), item, e);
+    }, { kind: "live", defaultQuality: "radio" });
+    enhanceRadioShelfOrdering(block, items);
+    return block;
+}
+
+function buildRadioSourceShellFromStations(stations) {
+    var shell = buildSourcePageShell(
+        "srovaRadioSourcePage",
+        "SOURCE 01",
+        "Radio",
+        "Live Streams",
+        "radio"
+    );
+    var body = shell.querySelector(".srovaSourcePageBody");
+    var block = buildRadioShelfFromStations(stations);
+    if (block) {
+        body.appendChild(block);
+    } else {
+        var empty = document.createElement("div");
+        empty.className = "srovaSourceEmpty";
+        empty.textContent = "No radio stations configured.";
+        body.appendChild(empty);
+    }
+    return shell;
+}
+
 
 function buildRadioShelf(onReady) {
     fetch("/api/radio/stations")
@@ -8479,29 +9086,7 @@ function buildRadioShelf(onReady) {
         .then(function(data) {
             var stations = (data && data.stations) ? data.stations : [];
             _radioSourceStationSignature = radioStationSignature(stations);
-            if (!stations.length) {
-                onReady(null);
-                return;
-            }
-            var items = stations.map(function(s) {
-                return {
-                    id:        s.id,
-                    name:      s.name  || "",
-                    sub_title: "Radio",
-                    image_url: s.icon  || "",
-                    type:      "radio",
-                    url:       s.url   || ""
-                };
-            });
-            var block = buildScrollSection("My Radio", items, function(item, e, anchor) {
-                if (_radioReorderMode) {
-                    if (e) { e.stopPropagation(); }
-                    return;
-                }
-                showRadioStationMenu(anchor || (e ? e.currentTarget : null), item, e);
-            }, { kind: "live", defaultQuality: "radio" });
-            enhanceRadioShelfOrdering(block, items);
-            onReady(block);
+            onReady(buildRadioShelfFromStations(stations));
         })
         .catch(function() { onReady(null); });
 }
@@ -8729,11 +9314,19 @@ function showRadioSource(preserveReorderMode, setupVerified) {
      * already rendered. Do not recreate or reassign artwork src values.
      */
     if (_radioSourcePageCache) {
-        if (_radioSourcePageCache.parentNode !== homeSections) {
-            homeSections.innerHTML = "";
-            homeSections.appendChild(_radioSourcePageCache);
+        if (_radioSourcePageCache.parentNode === homeSections) {
+            _syncHomePlayingTiles(_radioSourcePageCache);
+            return;
         }
-        _syncHomePlayingTiles(_radioSourcePageCache);
+
+        var requestId = ++_radioSourceShowRequest;
+        _radioSourcePendingAttachRequest = requestId;
+        var preparation = startRadioSourcePreparation();
+        preparation.then(function(result) {
+            attachPreparedRadioSource(result, requestId, function() {
+                homeSections.appendChild(_radioSourcePageCache);
+            });
+        });
         refreshRadioSourceCache();
         return;
     }
@@ -8754,6 +9347,7 @@ function showRadioSource(preserveReorderMode, setupVerified) {
             slot.textContent = "No radio stations configured.";
         }
         _radioSourcePageCache = shell;
+        supersedeRadioSourcePreparation();
     });
 }
 
@@ -8892,6 +9486,7 @@ function showTidalSource(opts) {
     homeSections.appendChild(shell);
     attachTidalSourceSearch(body, restoreSourceSearch);
 
+    var libraryGeneration = tidalLibraryUiGeneration;
     var tidalDone = false;
     var hiresDone = false;
     var tidalData = [];
@@ -8949,13 +9544,21 @@ function showTidalSource(opts) {
 
         // Phase 2: poll the slow sections independently every 1.5s.
         _pollHomeSlot("/tidal/mysongs",  songSlot,  "My Songs",
-            function(d) { window._mySongsData  = d; },
+            function(d) {
+                if (libraryGeneration === tidalLibraryUiGeneration) {
+                    window._mySongsData = d;
+                }
+            },
             function(item, e, anchorEl) { handleTidalWallItemClick(item, "home", e, anchorEl); },
             function() { showMySongs(); },
             { kind: "library" }
         );
         _pollHomeSlot("/tidal/myalbums", albumSlot, "My Albums",
-            function(d) { window._myAlbumsData = d; },
+            function(d) {
+                if (libraryGeneration === tidalLibraryUiGeneration) {
+                    window._myAlbumsData = d;
+                }
+            },
             function(item, e, anchorEl) { handleTidalWallItemClick(item, "home", e, anchorEl); },
             function() { showMyAlbums(); },
             { kind: "library" }
@@ -10466,9 +11069,11 @@ function showMyAlbums() {
         return;
     }
     grid.innerHTML = '<div class="libraryLoading">Loading...</div>';
+    var libraryGeneration = tidalLibraryUiGeneration;
     fetchWithTimeout("/tidal/myalbums", {}, 5000)
         .then(function(r) { return r.json(); })
         .then(function(d) {
+            if (libraryGeneration !== tidalLibraryUiGeneration) { return; }
             window._myAlbumsData = Array.isArray(d) ? d : [];
             renderLibraryGrid(grid, window._myAlbumsData, function(item) { handleItemClick(item, "myalbums"); });
         })
@@ -10494,9 +11099,11 @@ function showMySongs() {
         return;
     }
     grid.innerHTML = '<div class="libraryLoading">Loading...</div>';
+    var libraryGeneration = tidalLibraryUiGeneration;
     fetchWithTimeout("/tidal/mysongs", {}, 5000)
         .then(function(r) { return r.json(); })
         .then(function(d) {
+            if (libraryGeneration !== tidalLibraryUiGeneration) { return; }
             window._mySongsData = Array.isArray(d) ? d : [];
             renderSongsList(grid, window._mySongsData);
         })
@@ -11295,18 +11902,27 @@ function showRemoveFromTidalPlaylistModal(track, rowEl) {
     document.body.appendChild(modal);
 }
 
+var tidalLibraryUiGeneration = 0;
 var allPlaylists = [];
+var MY_PLAYLISTS_RETRY_MS = 1500;
+var MY_PLAYLISTS_MAX_RETRIES = 120;
 
-function loadMyPlaylists(retryCount) {
+function loadMyPlaylists(retryCount, libraryGeneration) {
     retryCount = retryCount || 0;
+    if (libraryGeneration === undefined) {
+        libraryGeneration = tidalLibraryUiGeneration;
+    }
     playlistsContent.innerHTML = '<div class="playlistsLoading">Loading playlists...</div>';
     fetch("/tidal/myplaylists")
         .then(function(res) { return res.json(); })
         .then(function(playlists) {
+            if (libraryGeneration !== tidalLibraryUiGeneration) { return; }
             if (!playlists || playlists.length === 0) {
-                if (retryCount < 12) {
-                    playlistsContent.innerHTML = '<div class="playlistsLoading">Fetching from Tidal (' + (retryCount + 1) + '/12)...</div>';
-                    setTimeout(function() { loadMyPlaylists(retryCount + 1); }, 15000);
+                if (retryCount < MY_PLAYLISTS_MAX_RETRIES) {
+                    playlistsContent.innerHTML = '<div class="playlistsLoading">Fetching from Tidal (' + (retryCount + 1) + '/' + MY_PLAYLISTS_MAX_RETRIES + ')...</div>';
+                    setTimeout(function() {
+                        loadMyPlaylists(retryCount + 1, libraryGeneration);
+                    }, MY_PLAYLISTS_RETRY_MS);
                 } else {
                     playlistsContent.innerHTML = '<div class="playlistsLoading">No playlists found.</div>';
                 }
@@ -12630,8 +13246,14 @@ function queueTracksAllRadio(tracksList) {
     });
 }
 
-function submitQueueTracks(tracksList, action) {
+function submitQueueTracks(tracksList, action, successContext) {
     resetTidalInfinitePlayGuard();
+    successContext = successContext || {};
+    var radioStationName = String(successContext.radioStationName || "").trim();
+    var hasRadioSuccessContext = Object.prototype.hasOwnProperty.call(
+        successContext,
+        "radioStationName"
+    );
     var hasLocalTracks = queueTracksContainLocal(tracksList);
     var hasRadioTracks = queueTracksContainRadio(tracksList);
     if (hasRadioTracks && isRadioCurrentlyActive()) {
@@ -12661,6 +13283,13 @@ function submitQueueTracks(tracksList, action) {
                 return;
             }
             throw new Error(backendMessage);
+        }
+        if (hasRadioTracks && hasRadioSuccessContext) {
+            showQueueActionToast(
+                radioQueueActionSummary(action, radioStationName),
+                false
+            );
+            return;
         }
         showQueueActionToast(queueActionSummary(action, tracksList), false);
     })
@@ -15045,6 +15674,7 @@ function _playArtistTopTrack(t, idx, allTracks, artistName, artistCover) {
 
 
 window.addEventListener("DOMContentLoaded", function() {
+    initHeaderHomeNavigation();
     updatePlayPauseIcon();
     startOnlineSourcePolling();
     loadHome();
@@ -15159,10 +15789,13 @@ function initPlayerInfinitePlayControl() {
 
 document.addEventListener("visibilitychange", function() {
     if (document.visibilityState === "visible") {
+        prepareRadioSourceAfterVisibilityResume();
         restoreSession();
         if (settingsView && settingsView.style.display !== "none") {
             refreshTidalSettingsStatus(_settingsRenderToken);
         }
+    } else if (document.visibilityState === "hidden") {
+        retireCompletedRadioSourcePreparationAfterHide();
     }
 });
 
@@ -15180,6 +15813,8 @@ function restoreSession() {
                 resetLocalPlaybackProgress();
                 playing = !!s.playing;
                 setPlayerHasActiveMedia(true);
+                setPlayerBarActivePlaybackSource("radio");
+                syncRadioPlayingFromStation(s.radio_station || {});
                 playerBar.classList.remove("hidden");
                 updatePlayPauseIcon();
                 return;

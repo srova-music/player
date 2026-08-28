@@ -22,13 +22,14 @@ The inclusion of the upstream project name in attribution, retained source
 identifiers or compatibility paths does not imply endorsement by the upstream
 project.
 
-This public snapshot corresponds to SROVA Version 1.3, Debian package
-1.3-1. It was derived from the locked private release source at commit
-b548c31e0ca7b480e662526c147533c9f654e5d5 without importing private Git history.
+This public snapshot corresponds to SROVA Version 1.4, Debian package
+1.4-1. It was derived from the locked private release source at commit
+af935a16615ea50d37cc2f2225d8d07bcb70406e without importing private Git history.
 
-The SROVA Remote Android application, APK source, Google Cast receiver source
-and passive Cast display source are separate projects and are not included in
-this repository.
+The SROVA Remote Android application, APK source and SROVA Cast
+receiver/provisioning source are separate projects and are not included in
+this repository. Player-side SROVA Cast display assets used by the Linux
+player are included here.
 
 The complete applicable GNU General Public License text is provided in
 `LICENSE`.

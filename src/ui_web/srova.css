@@ -377,9 +377,13 @@ header > #srovaInstanceLabel {
     padding-left: 13px !important;
     opacity: 0.9 !important;
 }
-#headerHomeBtn:hover {
+#headerHomeBtn:not(:disabled):hover {
     background: none !important;
     color: var(--srova-gold-light) !important;
+}
+#headerHomeBtn:disabled {
+    cursor: default !important;
+    pointer-events: none !important;
 }
 #headerHomeBtn .material-icons { display: none !important; }
 #headerHomeBtn::after {
@@ -3427,11 +3431,92 @@ body:not(.hires) #waveformBars span {
 }
 
 .networkShareStatus {
+    position: relative !important;
     margin-bottom: 12px !important;
+    padding: 13px 14px 12px !important;
+    overflow: hidden !important;
+    border: 1px solid rgba(201, 168, 76, 0.18) !important;
+    background: linear-gradient(180deg, rgba(201, 168, 76, 0.045), rgba(255, 255, 255, 0.012)) !important;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.025) !important;
+    box-sizing: border-box !important;
+}
+
+.networkShareStatusPrimary {
+    color: var(--srova-cream) !important;
+    font-family: var(--srova-body) !important;
+    font-size: 16px !important;
+    font-weight: 400 !important;
+    line-height: 1.35 !important;
+}
+
+.networkShareStatusActive .networkShareStatusPrimary {
+    color: var(--srova-gold-light) !important;
+}
+
+.networkShareStatusDetail {
+    margin-top: 4px !important;
+    color: var(--srova-muted) !important;
+    font-family: var(--srova-body) !important;
+    font-size: 13px !important;
+    font-weight: 300 !important;
+    line-height: 1.4 !important;
+}
+
+.networkShareStatusDetail:empty {
+    display: none !important;
+}
+
+.networkShareStatusActivity {
+    position: relative !important;
+    display: none !important;
+    height: 4px !important;
+    margin-top: 11px !important;
+    overflow: hidden !important;
+    border: 1px solid rgba(201, 168, 76, 0.16) !important;
+    background: rgba(0, 0, 0, 0.64) !important;
+    box-shadow: inset 0 0 8px rgba(0, 0, 0, 0.82) !important;
+    pointer-events: none !important;
+}
+
+.networkShareStatusActive .networkShareStatusActivity {
+    display: block !important;
+}
+
+.networkShareStatusActivityFill {
+    position: absolute !important;
+    top: 0 !important;
+    bottom: 0 !important;
+    left: -34% !important;
+    width: 34% !important;
+    background: linear-gradient(90deg, transparent 0%, rgba(201, 168, 76, 0.34) 24%, #F0D27A 56%, rgba(201, 168, 76, 0.48) 78%, transparent 100%) !important;
+    box-shadow: 0 0 12px rgba(201, 168, 76, 0.38) !important;
+}
+
+.networkShareStatusActive .networkShareStatusActivityFill {
+    animation: networkShareStatusSweep 1.6s ease-in-out infinite !important;
+}
+
+@keyframes networkShareStatusSweep {
+    0% { transform: translateX(0); }
+    100% { transform: translateX(394%); }
 }
 
 .networkShareStatusError {
+    border-color: rgba(224, 80, 80, 0.36) !important;
+    background: rgba(192, 64, 64, 0.06) !important;
+}
+
+.networkShareStatusError .networkShareStatusPrimary {
     color: #e05050 !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .networkShareStatusActive .networkShareStatusActivityFill {
+        left: 0 !important;
+        width: 34% !important;
+        transform: none !important;
+        animation: none !important;
+    }
 }
 
 .networkShareServerList,
@@ -13928,7 +14013,7 @@ header > #headerHomeBtn {
         drop-shadow(0 0 9px rgba(201, 168, 76, 0.035)) !important;
 }
 
-#headerHomeBtn:hover .srovaHeaderWordmark {
+#headerHomeBtn:not(:disabled):hover .srovaHeaderWordmark {
     opacity: 0.98 !important;
     filter:
         brightness(1.02)
@@ -14012,6 +14097,16 @@ header > #headerHomeBtn {
 #settingsView .dupBtnRow .settingsBtn,
 .localFolderBrowserActions .settingsBtn {
     min-height: 39px !important;
+    padding-top: 12px !important;
+    padding-bottom: 8px !important;
+    box-sizing: border-box !important;
+}
+
+/* The Network Music modal is portalled under body, and its footer also
+   inherits the folder-browser rule above. Keep every modal text control on
+   the same optical baseline and accepted touch height. */
+.networkShareCard .settingsBtn {
+    min-height: 44px !important;
     padding-top: 12px !important;
     padding-bottom: 8px !important;
     box-sizing: border-box !important;

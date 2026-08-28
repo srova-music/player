@@ -1,5 +1,25 @@
 # SROVA Changelog
 
+## 1.4 (`1.4-1`) — 2026-08-28
+
+### Added
+
+- SROVA Cast now includes the accepted SROVA Clock presentation in the player-side Cast display, with the final header spacing and playback-state presentation behaviour.
+
+### Improved
+
+- TIDAL My Songs, My Albums and My Playlists loading coalesces concurrent cache misses, rejects stale account or mutation results, and uses a faster completion check.
+- NAS and Network Music discovery presents immediate scan activity, clearer status text and centred modal controls.
+- The Home wordmark is inert on the true Home landing view while retaining Home navigation from other views.
+
+### Fixed
+
+- Fresh installations now select the recommended ALSA mmap driver by default while preserving existing saved output choices.
+- Radio Now Playing reports the authoritative saved station name consistently across station changes and browser restoration.
+- Radio Add to Queue and Play Next confirmations identify the saved station by name while retaining a safe generic fallback.
+- Home artwork remains stable through pause, resume, seeking and same-artwork track transitions while preserving transitions for genuine artwork changes.
+- Saved Radio artwork is prepared while hidden after Android wake and revealed atomically, preventing a visible first-visit redraw.
+
 ## 1.3 (`1.3-1`) — 2026-08-19
 
 ### Added

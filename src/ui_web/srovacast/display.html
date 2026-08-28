@@ -326,7 +326,7 @@ html, body {
   height: 150px;
 
   background:
-    url("srova-wordmark.png") 48px center / 250px auto no-repeat,
+    url("srova-wordmark.png") 30px center / 250px auto no-repeat,
     linear-gradient(180deg, rgba(10, 6, 3, 0.58) 0%, rgba(3, 3, 3, 0.84) 100%),
     radial-gradient(circle at 50% 0%, rgba(201, 168, 76, 0.085), transparent 60%),
     url("../assets/srova-leather-dark-brown.jpg") center 42% / cover no-repeat;
@@ -397,8 +397,8 @@ html, body {
   position: absolute;
   z-index: 1;
 
-  left: 62px;
-  right: 62px;
+  left: 30px;
+  right: 30px;
   bottom: 40px;
 
   margin: 0;
@@ -763,6 +763,65 @@ html, body {
 
 </style>
 
+
+<style>
+/* SROVACAST_POINT10B_SOFT_PRESENTATION_V1 */
+.screen {
+  transition: opacity 60ms ease;
+}
+
+.screen.srovacast-presentation-fading {
+  opacity: 0;
+}
+</style>
+
+
+<style>
+/* SROVACAST_POINT10B_HEADER_CLOCK_V1
+   Cast-display-only local clock. Presentation-independent and read-only. */
+@font-face {
+  font-family: "SROVA Clock";
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url("fonts/SROVAClock-Regular.woff2") format("woff2");
+}
+
+.srovacast-header-clock {
+  position: absolute;
+  z-index: 1;
+
+  top: 0;
+  right: 30px;
+  height: 100px;
+
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+
+  margin: 0;
+  padding: 0;
+
+  font-family: "SROVA Clock", sans-serif;
+  font-style: normal;
+  font-weight: 400;
+  font-size: 40px;
+  line-height: 1;
+  letter-spacing: 0;
+
+  color: rgba(225, 211, 176, 0.68);
+
+  text-shadow:
+    0 1px 0 rgba(255, 238, 196, 0.04),
+    0 -1px 0 rgba(0, 0, 0, 0.82),
+    0 0 10px rgba(201, 168, 76, 0.035);
+
+  white-space: nowrap;
+  user-select: none;
+  pointer-events: none;
+}
+</style>
+
 </head>
 
 <body>
@@ -774,6 +833,10 @@ html, body {
     </section>
 
     <section class="details">
+      <div id="srovacastHeaderClock"
+           class="srovacast-header-clock"
+           aria-label="Local time">00:00</div>
+
       <div class="heading">NOW PLAYING</div>
 
       <div class="title">The Long Road Home</div>
@@ -816,6 +879,7 @@ html, body {
   const timeNodes = document.querySelectorAll(".times span");
   const artwork = document.querySelector(".artwork img");
   const artworkLabel = document.querySelector(".artwork-label");
+  const headerClock = document.getElementById("srovacastHeaderClock");
   const footer = document.querySelector(".footer");
 
   /* SROVACAST_STARTUP_REVEAL_V1 */
@@ -852,6 +916,364 @@ html, body {
   let artworkRequestId = 0;
   let activeArtworkUrl = "";
   let haveStatus = false;
+
+  /* SROVACAST_POINT10B_PLAYBACK_BRIDGE_V1 */
+  const PLAYBACK_MESSAGE_TYPE =
+    "SROVACAST_PLAYBACK_STATE_V1";
+  const PLAYBACK_MESSAGE_VERSION = 1;
+
+  const PRESENTATION_AUTHORITY_MESSAGE_TYPE =
+    "SROVACAST_PRESENTATION_AUTHORITY_V1";
+  const PRESENTATION_AUTHORITY_MESSAGE_VERSION = 1;
+
+  const PRESENTATION_FADE_MS = 120;
+  const PRESENTATION_HALF_FADE_MS =
+    PRESENTATION_FADE_MS / 2;
+  const INACTIVE_PRESENTATION_HOLD_MS = 30000;
+
+  let lastPlaybackState = "unknown";
+  let presentationFadeTimer = null;
+
+  /*
+   * Embedded Cast display starts non-authoritative until the receiver
+   * explicitly binds the current configured presentation lifecycle.
+   */
+  let presentationAuthorized =
+    window.parent === window;
+
+  let latestPlaybackState = "unknown";
+  let inactivePresentationDeadline = null;
+  let inactivePresentationTimer = null;
+  let inactivePresentationExpired = false;
+  let retainedNowPlayingState = null;
+
+  function paintHeaderClock() {
+    if (!headerClock) {
+      return;
+    }
+
+    const now = new Date();
+    const hours =
+      String(now.getHours()).padStart(2, "0");
+    const minutes =
+      String(now.getMinutes()).padStart(2, "0");
+
+    headerClock.textContent =
+      `${hours}:${minutes}`;
+  }
+
+  function scheduleHeaderClockTick() {
+    paintHeaderClock();
+
+    /*
+     * Align subsequent paints to real minute boundaries.
+     * This is a local browser timer only: no status/API/network polling.
+     */
+    const delay =
+      60000 -
+      (Date.now() % 60000) +
+      25;
+
+    window.setTimeout(
+      scheduleHeaderClockTick,
+      delay
+    );
+  }
+
+  scheduleHeaderClockTick();
+
+  function postPlaybackState(state) {
+    if (
+      !["active", "inactive", "unknown"].includes(state) ||
+      window.parent === window
+    ) {
+      return;
+    }
+
+    window.parent.postMessage(
+      {
+        type: PLAYBACK_MESSAGE_TYPE,
+        version: PLAYBACK_MESSAGE_VERSION,
+        state
+      },
+      "*"
+    );
+  }
+
+  function playbackStateFromStatus(status) {
+    return (
+      status &&
+      status.playing === true
+    )
+      ? "active"
+      : "inactive";
+  }
+
+  function presentationStatusFromStatus(
+    status
+  ) {
+    if (presentationAuthorized) {
+      return status;
+    }
+
+    return Object.assign(
+      {},
+      status || {},
+      {
+        playing: false
+      }
+    );
+  }
+  function clearInactivePresentationHold(
+    resetExpired
+  ) {
+    if (inactivePresentationTimer !== null) {
+      window.clearTimeout(
+        inactivePresentationTimer
+      );
+      inactivePresentationTimer = null;
+    }
+
+    inactivePresentationDeadline = null;
+
+    if (resetExpired === true) {
+      inactivePresentationExpired = false;
+    }
+  }
+
+  function retainedPresentationStatusFromStatus(
+    status
+  ) {
+    if (!retainedNowPlayingState) {
+      return null;
+    }
+
+    const current =
+      normalizeStatus(status || {});
+
+    const retained =
+      Object.assign(
+        {},
+        retainedNowPlayingState
+      );
+
+    if (current.currentTrackValid) {
+      retained.radio =
+        current.radio;
+      retained.radioStation =
+        current.radioStation;
+      retained.title =
+        current.title;
+      retained.artist =
+        current.artist;
+      retained.album =
+        current.album;
+      retained.artwork =
+        current.artwork;
+      retained.quality =
+        current.quality;
+      retained.hires =
+        current.hires;
+      retained.dacName =
+        current.dacName;
+      retained.bitPerfect =
+        current.bitPerfect;
+    }
+
+    /*
+     * Position is always current player truth, including a reset to 00:00.
+     * Duration may be retained only when the inactive status no longer
+     * reports one, so the progress bar can still display that authoritative
+     * zero position against the known track duration.
+     */
+    retained.position =
+      current.position;
+
+    if (current.duration > 0) {
+      retained.duration =
+        current.duration;
+    }
+
+    retained.currentTrackValid = true;
+    retained.playing = false;
+
+    return retained;
+  }
+
+  function presentAuthorizedInactive(
+    status
+  ) {
+    if (
+      !presentationAuthorized ||
+      !retainedNowPlayingState
+    ) {
+      clearInactivePresentationHold();
+      renderWithPlaybackTransition(
+        presentationStatusFromStatus(
+          status
+        ),
+        "inactive",
+        false
+      );
+      return;
+    }
+
+    if (inactivePresentationExpired) {
+      renderWithPlaybackTransition(
+        presentationStatusFromStatus({}),
+        "inactive",
+        false
+      );
+      return;
+    }
+
+    if (inactivePresentationDeadline === null) {
+      inactivePresentationDeadline =
+        Date.now() +
+        INACTIVE_PRESENTATION_HOLD_MS;
+
+      inactivePresentationTimer =
+        window.setTimeout(() => {
+          inactivePresentationTimer = null;
+
+          if (
+            presentationAuthorized &&
+            latestPlaybackState === "inactive" &&
+            inactivePresentationDeadline !== null &&
+            Date.now() >=
+              inactivePresentationDeadline
+          ) {
+            inactivePresentationExpired = true;
+            renderWithPlaybackTransition(
+              presentationStatusFromStatus({}),
+              "inactive",
+              false
+            );
+          }
+        }, INACTIVE_PRESENTATION_HOLD_MS);
+    }
+
+    if (
+      Date.now() >=
+        inactivePresentationDeadline
+    ) {
+      renderWithPlaybackTransition(
+        presentationStatusFromStatus({}),
+        "inactive",
+        false
+      );
+      return;
+    }
+
+    renderWithPlaybackTransition(
+      status,
+      "active",
+      true
+    );
+  }
+
+
+  function handlePresentationAuthorityMessage(
+    event
+  ) {
+    if (window.parent === window) {
+      return;
+    }
+
+    if (event.source !== window.parent) {
+      return;
+    }
+
+    if (
+      !event.data ||
+      typeof event.data !== "object" ||
+      event.data.type !==
+        PRESENTATION_AUTHORITY_MESSAGE_TYPE ||
+      event.data.version !==
+        PRESENTATION_AUTHORITY_MESSAGE_VERSION ||
+      typeof event.data.authorized !== "boolean"
+    ) {
+      return;
+    }
+
+    presentationAuthorized =
+      event.data.authorized;
+
+    lastPlaybackState = "unknown";
+    clearInactivePresentationHold(true);
+
+    if (!presentationAuthorized) {
+      retainedNowPlayingState = null;
+      /*
+       * Release presentation authority immediately. The existing Ready
+       * renderer must not depend on a successful subsequent status fetch.
+       */
+      renderWithPlaybackTransition(
+        presentationStatusFromStatus({}),
+        "inactive"
+      );
+      return;
+    }
+
+    /*
+     * Reauthorization requires one fresh playback observation. Reuse the
+     * existing refresh path; this creates no additional polling loop.
+     */
+    void refresh();
+  }
+
+  window.addEventListener(
+    "message",
+    handlePresentationAuthorityMessage
+  );
+
+  function renderWithPlaybackTransition(
+    status,
+    nextPlaybackState,
+    retainNowPlaying
+  ) {
+    const presentationChanged =
+      lastPlaybackState !== "unknown" &&
+      nextPlaybackState !== lastPlaybackState;
+
+    lastPlaybackState =
+      nextPlaybackState;
+
+    if (!presentationChanged) {
+      render(
+        status,
+        retainNowPlaying === true
+      );
+      return;
+    }
+
+    if (presentationFadeTimer !== null) {
+      window.clearTimeout(
+        presentationFadeTimer
+      );
+      presentationFadeTimer = null;
+    }
+
+    screen.classList.add(
+      "srovacast-presentation-fading"
+    );
+
+    presentationFadeTimer =
+      window.setTimeout(() => {
+        presentationFadeTimer = null;
+        render(
+          status,
+          retainNowPlaying === true
+        );
+
+        window.requestAnimationFrame(() => {
+          screen.classList.remove(
+            "srovacast-presentation-fading"
+          );
+        });
+      }, PRESENTATION_HALF_FADE_MS);
+  }
+
 
   let progressPlaying = false;
   let progressDuration = 0;
@@ -1227,12 +1649,37 @@ html, body {
     window.requestAnimationFrame(progressLoop);
   }
 
-  function render(status) {
-    const state = normalizeStatus(status);
+  function render(
+    status,
+    retainNowPlaying
+  ) {
+    const currentState =
+      normalizeStatus(status);
+
+    let state =
+      currentState;
+
+    const retaining =
+      retainNowPlaying === true &&
+      retainedNowPlayingState !== null;
+
+    if (retaining) {
+      state =
+        retainedPresentationStatusFromStatus(
+          status
+        );
+    }
 
     haveStatus = true;
 
-    if (!state.currentTrackValid) {
+    if (
+      !state ||
+      !state.currentTrackValid ||
+      (
+        !state.playing &&
+        !retaining
+      )
+    ) {
       heading.textContent = "READY";
       title.textContent = "SROVA";
       artist.textContent = "Waiting for playback";
@@ -1252,8 +1699,18 @@ html, body {
       return;
     }
 
-    heading.textContent =
-      state.playing ? "NOW PLAYING" : "PAUSED";
+    if (
+      currentState.currentTrackValid &&
+      currentState.playing
+    ) {
+      retainedNowPlayingState =
+        Object.assign(
+          {},
+          currentState
+        );
+    }
+
+    heading.textContent = "NOW PLAYING";
 
     title.textContent = state.title;
     artist.textContent = state.artist;
@@ -1354,8 +1811,56 @@ html, body {
         );
       }
 
-      render(await response.json());
+      const status =
+        await response.json();
+
+      const nextPlaybackState =
+        playbackStateFromStatus(status);
+
+      latestPlaybackState =
+        nextPlaybackState;
+
+      /*
+       * Playback truth remains reported independently from presentation
+       * authority.
+       */
+      postPlaybackState(
+        nextPlaybackState
+      );
+
+      if (!presentationAuthorized) {
+        clearInactivePresentationHold();
+
+        renderWithPlaybackTransition(
+          presentationStatusFromStatus(
+            status
+          ),
+          "inactive",
+          false
+        );
+        return;
+      }
+
+      if (nextPlaybackState === "active") {
+        clearInactivePresentationHold(true);
+
+        renderWithPlaybackTransition(
+          status,
+          "active",
+          false
+        );
+        return;
+      }
+
+      presentAuthorizedInactive(
+        status
+      );
     } catch (_) {
+      postPlaybackState("unknown");
+      latestPlaybackState = "unknown";
+      clearInactivePresentationHold();
+      lastPlaybackState = "unknown";
+
       if (!haveStatus) {
         heading.textContent = "CONNECTING";
       }

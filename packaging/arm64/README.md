@@ -14,9 +14,9 @@ The wrapper:
 - delegates directly to `package.sh deb`;
 - does not maintain a separate package payload or service definition.
 
-For Version 1.3, `version.txt` contains `1.3-1`, producing:
+For Version 1.4, `version.txt` contains `1.4-1`, producing:
 
-    dist/srova_1.3-1_arm64.deb
+    dist/srova_1.4-1_arm64.deb
 
 The AMD64 and ARM64 packages share the same release contract:
 

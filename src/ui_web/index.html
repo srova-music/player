@@ -14,7 +14,7 @@
 <link rel="manifest" href="/ui_web/manifest.webmanifest" crossorigin="use-credentials">
 <meta name="theme-color" content="#050505">
 
-<link rel="stylesheet" href="/ui_web/srova.css?v=20260819_v1_3_release1">
+<link rel="stylesheet" href="/ui_web/srova.css?v=20260828_v1_4_release1">
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Josefin+Sans:wght@100;200;300;400&family=Outfit:wght@300;400&display=swap" rel="stylesheet">
 </head>
@@ -24,7 +24,7 @@
 <!-- HEADER -->
 <header>
 
-  <button id="headerHomeBtn" onclick="goHome()" title="Home" aria-label="SROVA Home">
+  <button id="headerHomeBtn" type="button" disabled tabindex="-1" aria-current="page" aria-label="SROVA">
     <img src="/ui_web/assets/srova-wordmark.svg?v=20260512a" alt="SROVA" class="srovaHeaderWordmark" draggable="false">
   </button>
 
@@ -440,7 +440,7 @@
   </div>
 </div>
 
-<script src="/ui_web/ui.js?v=20260819_v1_3_release1"></script>
+<script src="/ui_web/ui.js?v=20260828_v1_4_release1"></script>
 <script>
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", function() {

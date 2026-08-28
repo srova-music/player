@@ -55,7 +55,7 @@ _NETWORK_MANAGED_ID_RE = re.compile(r"^(?:nfs|smb)-[0-9a-f]{12}$")
 # ALSA output configuration -- overridden by --alsa-driver / --alsa-device CLI args.
 # Pi 4 (Fosi ZD3):  ALSA     / hw:0,0
 # Pi 5 (FiiO QX13): alsa_mmap / hw:0,0
-ALSA_DRIVER = "ALSA"
+ALSA_DRIVER = "alsa_mmap"
 ALSA_DEVICE = "hw:0,0"
 ALSA_DAC_NAME = ""
 
@@ -349,6 +349,15 @@ _OAUTH_LOCK   = threading.Lock()
 _CACHE      = {}
 _CACHE_LOCK = threading.Lock()
 
+_TIDAL_LIBRARY_CACHE_RESOURCES = ("mysongs", "myalbums", "myplaylists")
+_TIDAL_LIBRARY_CACHE_GENERATIONS = {
+    resource: 0 for resource in _TIDAL_LIBRARY_CACHE_RESOURCES
+}
+_TIDAL_LIBRARY_CACHE_INFLIGHT = set()
+_TIDAL_LIBRARY_CACHE_ACCOUNT_UNSET = object()
+_TIDAL_LIBRARY_CACHE_ACCOUNT = _TIDAL_LIBRARY_CACHE_ACCOUNT_UNSET
+_TIDAL_LIBRARY_CACHE_NO_PUBLISH = object()
+
 TTL_HOME      = 120
 TTL_TRACKS    = 300
 TTL_SEARCH    = 60
@@ -372,15 +381,20 @@ def _home_section_excluded(title):
     return False
 
 
+def _cache_get_locked(key, now=None):
+    entry = _CACHE.get(key)
+    if entry is None:
+        return None
+    current_time = time.time() if now is None else float(now)
+    if current_time - entry["ts"] > entry["ttl"]:
+        del _CACHE[key]
+        return None
+    return entry["data"]
+
+
 def cache_get(key):
     with _CACHE_LOCK:
-        entry = _CACHE.get(key)
-        if entry is None:
-            return None
-        if time.time() - entry["ts"] > entry["ttl"]:
-            del _CACHE[key]
-            return None
-        return entry["data"]
+        return _cache_get_locked(key)
 
 
 def cache_set(key, data, ttl):
@@ -389,6 +403,7 @@ def cache_set(key, data, ttl):
 
 
 def cache_invalidate(prefix=None):
+    global _TIDAL_LIBRARY_CACHE_ACCOUNT
     with _CACHE_LOCK:
         if prefix is None:
             _CACHE.clear()
@@ -396,6 +411,120 @@ def cache_invalidate(prefix=None):
             keys = [k for k in _CACHE if k.startswith(prefix)]
             for k in keys:
                 del _CACHE[k]
+        for resource in _TIDAL_LIBRARY_CACHE_RESOURCES:
+            if prefix is None or resource.startswith(prefix):
+                _TIDAL_LIBRARY_CACHE_GENERATIONS[resource] += 1
+        if prefix is None:
+            _TIDAL_LIBRARY_CACHE_ACCOUNT = _TIDAL_LIBRARY_CACHE_ACCOUNT_UNSET
+
+
+def _tidal_library_cache_account_identity(backend):
+    user = getattr(backend, "user", None)
+    if user is None:
+        session = getattr(backend, "session", None)
+        user = getattr(session, "user", None)
+    user_id = getattr(user, "id", None)
+    if user_id is not None and str(user_id).strip():
+        return "user:" + str(user_id).strip()
+    session = getattr(backend, "session", None)
+    if getattr(session, "access_token", None):
+        return "authenticated-session"
+    return "logged-out"
+
+
+def _sync_tidal_library_cache_account(backend):
+    """Supersede library work when the recovered/logged-in account changes."""
+    global _TIDAL_LIBRARY_CACHE_ACCOUNT
+    account_identity = _tidal_library_cache_account_identity(backend)
+    with _CACHE_LOCK:
+        if _TIDAL_LIBRARY_CACHE_ACCOUNT is _TIDAL_LIBRARY_CACHE_ACCOUNT_UNSET:
+            _TIDAL_LIBRARY_CACHE_ACCOUNT = account_identity
+            return False
+        if _TIDAL_LIBRARY_CACHE_ACCOUNT == account_identity:
+            return False
+        _TIDAL_LIBRARY_CACHE_ACCOUNT = account_identity
+        for resource in _TIDAL_LIBRARY_CACHE_RESOURCES:
+            _CACHE.pop(resource, None)
+            _TIDAL_LIBRARY_CACHE_GENERATIONS[resource] += 1
+        return True
+
+
+def _start_tidal_library_cache_worker(
+    resource,
+    fetch_result,
+    *,
+    ttl=TTL_PLAYLISTS,
+    publish_empty=False,
+    account_backend=None,
+):
+    """Start one cache-fill worker for a resource/generation.
+
+    Network work runs without the cache lock. Publication and in-flight cleanup
+    share one short critical section so invalidation cannot admit stale results or
+    leave a successful cache fill open to a duplicate-worker race.
+    """
+    if resource not in _TIDAL_LIBRARY_CACHE_GENERATIONS:
+        raise ValueError("unsupported TIDAL library cache resource")
+
+    with _CACHE_LOCK:
+        if _cache_get_locked(resource) is not None:
+            return False
+        account_identity = (
+            _tidal_library_cache_account_identity(account_backend)
+            if account_backend is not None
+            else None
+        )
+        generation = _TIDAL_LIBRARY_CACHE_GENERATIONS[resource]
+        work_key = (resource, generation)
+        if work_key in _TIDAL_LIBRARY_CACHE_INFLIGHT:
+            return False
+        _TIDAL_LIBRARY_CACHE_INFLIGHT.add(work_key)
+
+    def _run():
+        result = _TIDAL_LIBRARY_CACHE_NO_PUBLISH
+        try:
+            result = fetch_result()
+        except Exception as exc:
+            logger.warning("%s cache worker failed: %s", resource, exc)
+        finally:
+            with _CACHE_LOCK:
+                generation_is_current = (
+                    _TIDAL_LIBRARY_CACHE_GENERATIONS[resource] == generation
+                )
+                account_is_current = (
+                    account_backend is None
+                    or (
+                        _TIDAL_LIBRARY_CACHE_ACCOUNT == account_identity
+                        and _tidal_library_cache_account_identity(account_backend)
+                        == account_identity
+                    )
+                )
+                should_publish = (
+                    result is not _TIDAL_LIBRARY_CACHE_NO_PUBLISH
+                    and (publish_empty or bool(result))
+                    and generation_is_current
+                    and account_is_current
+                )
+                if should_publish:
+                    _CACHE[resource] = {
+                        "data": result,
+                        "ts": time.time(),
+                        "ttl": ttl,
+                    }
+                _TIDAL_LIBRARY_CACHE_INFLIGHT.discard(work_key)
+
+    worker = threading.Thread(
+        target=_run,
+        name="tidal-library-" + resource,
+        daemon=True,
+    )
+    try:
+        worker.start()
+    except Exception:
+        with _CACHE_LOCK:
+            _TIDAL_LIBRARY_CACHE_INFLIGHT.discard(work_key)
+        raise
+    return True
 
 
 def cache_stats():
@@ -9576,6 +9705,8 @@ class ControlHandler(BaseHTTPRequestHandler):
 
         # -- My Playlists --------------------------------------------------
         if self.path == "/tidal/myplaylists":
+            backend = APP_INSTANCE.backend
+            _sync_tidal_library_cache_account(backend)
             cached = cache_get("myplaylists")
             if cached is not None:
                 logger.info("Cache HIT: myplaylists")
@@ -9586,8 +9717,6 @@ class ControlHandler(BaseHTTPRequestHandler):
             # in a background daemon thread.  The UI will retry after a delay
             # and pick up the cache once the slow Tidal API call completes.
             self._send_json([])
-
-            backend = APP_INSTANCE.backend
 
             def _bg_fetch():
                 result = []
@@ -9601,7 +9730,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                     access_token = getattr(backend.session, "access_token", None)
                     if not access_token:
                         logger.warning("bg playlists: no access token available")
-                        return
+                        return _TIDAL_LIBRARY_CACHE_NO_PUBLISH
 
                     base = "https://api.tidal.com/v2/"
                     try:
@@ -9644,7 +9773,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                             data = resp.json()
                         except Exception as re:
                             logger.warning("bg playlists: API request failed: %s", re)
-                            break
+                            return _TIDAL_LIBRARY_CACHE_NO_PUBLISH
 
                         items = data.get("items") or []
                         if not items:
@@ -9701,7 +9830,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                         # If all items this page were duplicates, pagination isn't advancing
                         if new_this_page == 0:
                             logger.warning("bg playlists: all items on this page were duplicates -- stopping")
-                            break
+                            return _TIDAL_LIBRARY_CACHE_NO_PUBLISH
 
                         cursor = next_cursor if next_cursor else None
 
@@ -9712,15 +9841,17 @@ class ControlHandler(BaseHTTPRequestHandler):
                             break
 
                     logger.info("bg playlists: fetched %d playlists", len(result))
-                    if result:
-                        cache_set("myplaylists", result, TTL_PLAYLISTS)
-                    else:
-                        logger.warning("bg playlists: API returned 0 playlists")
+                    return result
                 except Exception as e:
                     logger.warning("bg playlists fetch failed: %s", e)
+                    return _TIDAL_LIBRARY_CACHE_NO_PUBLISH
 
-            t = threading.Thread(target=_bg_fetch, daemon=True)
-            t.start()
+            _start_tidal_library_cache_worker(
+                "myplaylists",
+                _bg_fetch,
+                publish_empty=True,
+                account_backend=backend,
+            )
             return
 
         # -- Playlists: find duplicates ------------------------------------
@@ -9728,6 +9859,7 @@ class ControlHandler(BaseHTTPRequestHandler):
         # total duration within 30s of each other.
         # Only fetches full track lists for the candidate groups (strategy B).
         if self.path == "/tidal/playlists/find_duplicates":
+            _sync_tidal_library_cache_account(APP_INSTANCE.backend)
             playlists = cache_get("myplaylists")
             if not playlists:
                 self._send_json({"error": "playlists_not_loaded",
@@ -9839,12 +9971,13 @@ class ControlHandler(BaseHTTPRequestHandler):
 
         # -- My Albums (liked albums, most recent first) -------------------
         if self.path == "/tidal/myalbums":
+            backend = APP_INSTANCE.backend
+            _sync_tidal_library_cache_account(backend)
             cached = cache_get("myalbums")
             if cached is not None:
                 self._send_json(cached)
                 return
             self._send_json([])
-            backend = APP_INSTANCE.backend
             def _bg_albums():
                 try:
                     albums = backend.get_recent_albums(limit=2000)
@@ -9875,22 +10008,27 @@ class ControlHandler(BaseHTTPRequestHandler):
                             "quality":   _quality_badge(a),
                             "type":      "Album"
                         })
-                    if result:
-                        cache_set("myalbums", result, TTL_PLAYLISTS)
                     logger.info("myalbums: fetched %d albums", len(result))
+                    return result
                 except Exception as e:
                     logger.warning("myalbums fetch failed: %s", e)
-            threading.Thread(target=_bg_albums, daemon=True).start()
+                    return _TIDAL_LIBRARY_CACHE_NO_PUBLISH
+            _start_tidal_library_cache_worker(
+                "myalbums",
+                _bg_albums,
+                account_backend=backend,
+            )
             return
 
         # -- My Songs (liked tracks, most recent first) --------------------
         if self.path == "/tidal/mysongs":
+            backend = APP_INSTANCE.backend
+            _sync_tidal_library_cache_account(backend)
             cached = cache_get("mysongs")
             if cached is not None:
                 self._send_json(cached)
                 return
             self._send_json([])
-            backend = APP_INSTANCE.backend
             def _bg_songs():
                 try:
                     tracks = backend.get_favorite_tracks(limit=500)
@@ -9931,12 +10069,16 @@ class ControlHandler(BaseHTTPRequestHandler):
                             "quality":   _quality_badge(t),
                             "type":      "Track"
                         })
-                    if result:
-                        cache_set("mysongs", result, TTL_PLAYLISTS)
                     logger.info("mysongs: fetched %d tracks", len(result))
+                    return result
                 except Exception as e:
                     logger.warning("mysongs fetch failed: %s", e)
-            threading.Thread(target=_bg_songs, daemon=True).start()
+                    return _TIDAL_LIBRARY_CACHE_NO_PUBLISH
+            _start_tidal_library_cache_worker(
+                "mysongs",
+                _bg_songs,
+                account_backend=backend,
+            )
             return
 
         # -- Home page -----------------------------------------------------
@@ -11520,6 +11662,7 @@ class ControlHandler(BaseHTTPRequestHandler):
             try:
                 user = APP_INSTANCE.backend.session.user
                 pl   = user.create_playlist(name, "Created by SROVA")
+                cache_invalidate("myplaylists")
                 ids  = [int(tid) for tid in PLAY_QUEUE if tid]
                 if ids:
                     pl.add(ids)
@@ -11749,6 +11892,7 @@ class ControlHandler(BaseHTTPRequestHandler):
             try:
                 user = APP_INSTANCE.backend.session.user
                 pl   = user.create_playlist(name, "Created by SROVA")
+                cache_invalidate("myplaylists")
                 ids  = [int(tid) for tid in track_ids if tid]
                 if ids:
                     pl.add(ids)
@@ -11921,6 +12065,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 pl_name = payload.get("playlist_name", "").strip() or ("Auto-Mix: " + artist)
                 user    = backend.session.user
                 pl      = user.create_playlist(pl_name, "Created by SROVA Auto-Mix")
+                cache_invalidate("myplaylists")
                 ids     = [int(tid) for tid in track_ids if tid]
                 if ids:
                     pl.add(ids)
