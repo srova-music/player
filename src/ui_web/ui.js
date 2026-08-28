@@ -7328,7 +7328,7 @@ function pollStatus() {
             if (!statusValid) {
                 resetTidalInfinitePlayGuard();
                 clearRadioIdleStandbyTimer();
-                if (typeof s.logged_in === "boolean") { updateLoginBtn(s.logged_in); }
+                if (typeof s.logged_in === "boolean") { updateLoginBtn(s.logged_in, {skipSettingsRefresh: true}); }
                 updateDacStateFromStatus(s);
                 repeatMode = s.repeat || repeatMode;
                 shuffleOn = typeof s.shuffle === "boolean" ? s.shuffle : shuffleOn;
@@ -7437,7 +7437,7 @@ function pollStatus() {
             } else if (s.current_track_id) {
                 syncActiveTrackViews(false);
             }
-            if (typeof s.logged_in === "boolean") { updateLoginBtn(s.logged_in); }
+            if (typeof s.logged_in === "boolean") { updateLoginBtn(s.logged_in, {skipSettingsRefresh: true}); }
             updateDacStateFromStatus(s);
             var hiRes = (s.bit_depth && s.bit_depth >= 24) || (s.sample_rate && s.sample_rate > 48000);
             if (radioIdleStandbyApplied && isPausedRadioStatus(s)) {
