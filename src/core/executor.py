@@ -18,8 +18,8 @@ def _calculate_optimal_workers() -> int:
     than CPU cores. However, we cap at a reasonable maximum to prevent resource exhaustion.
     """
     cpu_count = os.cpu_count() or 4
-
-
+    # I/O密集型任务: CPU核心数 * 2，但不超过16
+    # 最小4线程保证基本并发，最大16防止资源耗尽
     optimal = cpu_count * 2
     return max(4, min(optimal, 16))
 

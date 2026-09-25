@@ -74,6 +74,7 @@ class _RustAudioCore:
         ]
         installed_candidates = [
             Path("/app/share/hiresti/src_rust/rust_audio_core/target/release/librust_audio_core.so"),
+            Path("/usr/share/hiresti/src_rust/rust_audio_core/target/release/librust_audio_core.so"),
         ]
         existing_local = [p for p in local_candidates if p.exists()]
         so_path = None
@@ -1739,6 +1740,8 @@ class RustAudioPlayerAdapter:
         self._last_output_switch_sig = None
         self._last_output_switch_ts = 0.0
         self._output_switch_restore = None
+        self._native_audio_guard_lock = threading.RLock()
+        self._native_audio_guard = None
         self._alsa_container_adapter_active = False
         self._alsa_container_adapter_format = ""
         self._alsa_container_adapter_diag_sig = ""
@@ -1771,6 +1774,65 @@ class RustAudioPlayerAdapter:
             "Audio engine path: RustAdapter (rust_core=%s, rust_transport=on, rust_single=on)",
             "on" if self._rust.available else "off",
         )
+
+    def set_native_audio_guard(self, callback):
+        """Install an optional provider-agnostic native-audio permission hook."""
+        if callback is not None and not callable(callback):
+            raise TypeError("native audio guard must be callable or None")
+        lock = getattr(self, "_native_audio_guard_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._native_audio_guard_lock = lock
+        with lock:
+            self._native_audio_guard = callback
+
+    def _native_audio_operation_allowed(self, operation, **details):
+        lock = getattr(self, "_native_audio_guard_lock", None)
+        if lock is None:
+            callback = getattr(self, "_native_audio_guard", None)
+        else:
+            with lock:
+                callback = getattr(self, "_native_audio_guard", None)
+        if callback is None:
+            return True
+        try:
+            return bool(callback(operation, **details))
+        except Exception:
+            logger.warning(
+                "RustAdapter native audio guard failed closed: operation=%s",
+                operation,
+            )
+            return False
+
+    def _native_output_claim_allowed(self, driver, device_id, source):
+        driver_key = _driver_key(driver)
+        is_release = (
+            driver_key == "alsa_auto"
+            and str(device_id or "").strip().lower() == "default"
+            and not bool(getattr(self, "exclusive_lock_mode", False))
+        )
+        if is_release:
+            return True
+        return self._native_audio_operation_allowed(
+            "output_claim",
+            source=source,
+            driver=driver_key,
+            exclusive=bool(getattr(self, "exclusive_lock_mode", False)),
+        )
+
+    def _restore_output_switch_state(self):
+        restore = getattr(self, "_output_switch_restore", None)
+        if restore is None:
+            return False
+        self.requested_driver = restore.get("requested_driver")
+        self.requested_device_id = restore.get("requested_device_id")
+        self.current_driver = restore.get("current_driver")
+        self.current_device_id = restore.get("current_device_id")
+        self._apply_driver_spectrum_policy(self.current_driver)
+        self.output_state = restore.get("output_state", "idle")
+        self.output_error = restore.get("output_error")
+        self._output_switch_restore = None
+        return True
 
     def _clear_pending_seek_state(self):
         if self._seek_flush_source:
@@ -2197,6 +2259,16 @@ class RustAudioPlayerAdapter:
                         cur_driver, cur_device = self._effective_output_selection()
                         cur_driver = str(cur_driver or "")
                         if cur_driver == "PipeWire":
+                            if not self._native_output_claim_allowed(
+                                cur_driver,
+                                cur_device,
+                                "pipewire-rate-rebind",
+                            ):
+                                logger.warning(
+                                    "RustAdapter native output claim blocked: "
+                                    "source=pipewire-rate-rebind"
+                                )
+                                return False
                             target_buffer = int(getattr(self, "alsa_buffer_time", 100000) or 100000)
                             target_latency = int(getattr(self, "alsa_latency_time", 10000) or 10000)
                             exclusive = bool(getattr(self, "exclusive_lock_mode", False))
@@ -3436,6 +3508,15 @@ class RustAudioPlayerAdapter:
                                     (uri[:80] + "...") if len(uri) > 80 else uri,
                                 )
                                 try:
+                                    if not self._native_audio_operation_allowed(
+                                        "playback_start",
+                                        source="spectrum-recovery",
+                                    ):
+                                        logger.warning(
+                                            "RustAdapter native playback blocked: "
+                                            "source=spectrum-recovery"
+                                        )
+                                        return True
                                     pos_s = float(getattr(self, "_cached_pos_s", 0.0) or 0.0)
                                     dur_s = float(getattr(self, "_cached_dur_s", 0.0) or 0.0)
                                     self._reset_rust_visual_sync_state()
@@ -3590,6 +3671,12 @@ class RustAudioPlayerAdapter:
             self._cached_dur_s = 0.0
             self._cached_is_playing = False
     def play(self):
+        if not self._native_audio_operation_allowed(
+            "playback_start",
+            source="play",
+        ):
+            logger.warning("RustAdapter native playback blocked: source=play")
+            return
         self._reset_rust_visual_sync_state()
         if bool(getattr(self, "_pipewire_rate_blocked", False)):
             try:
@@ -3606,6 +3693,12 @@ class RustAudioPlayerAdapter:
             except Exception:
                 logger.debug("RustAdapter.play: PipeWire retry path failed", exc_info=True)
                 return
+        if not self._native_audio_operation_allowed(
+            "playback_start",
+            source="play-rust-call",
+        ):
+            logger.warning("RustAdapter native playback blocked: source=play-rust-call")
+            return
         rc = self._rust.play()
         logger.info(
             "RustAdapter.play: rust play rc=%s driver=%s device=%s",
@@ -3732,6 +3825,26 @@ class RustAudioPlayerAdapter:
     def set_output(self, driver, device_id=None):
         req_driver = driver
         req_device = device_id
+        if not self._native_output_claim_allowed(
+            req_driver,
+            req_device,
+            "set-output",
+        ):
+            should_restore = True
+            lock = getattr(self, "_output_switch_lock", None)
+            if lock is not None:
+                with lock:
+                    should_restore = not bool(
+                        getattr(self, "_output_switch_inflight", False)
+                    )
+                    if should_restore:
+                        self._output_switch_pending = None
+            if should_restore:
+                self._restore_output_switch_state()
+            logger.warning(
+                "RustAdapter native output claim blocked: source=set-output"
+            )
+            return False
         now = time.monotonic()
         req_sig = (str(req_driver or ""), str(req_device or ""))
         with self._output_switch_lock:
@@ -3752,8 +3865,12 @@ class RustAudioPlayerAdapter:
             switched = self._apply_output_switch_once(current_driver, current_device)
             ok = bool(ok and switched)
             with self._output_switch_lock:
-                self._last_output_switch_sig = (str(current_driver or ""), str(current_device or ""))
-                self._last_output_switch_ts = time.monotonic()
+                if switched:
+                    self._last_output_switch_sig = (
+                        str(current_driver or ""),
+                        str(current_device or ""),
+                    )
+                    self._last_output_switch_ts = time.monotonic()
                 pending = self._output_switch_pending
                 self._output_switch_pending = None
                 if pending is None or (
@@ -3774,6 +3891,16 @@ class RustAudioPlayerAdapter:
                     getattr(self, "current_device_id", None)
                     or getattr(self, "requested_device_id", None)
                 )
+        if not self._native_output_claim_allowed(
+            driver,
+            resolved_device_id,
+            "apply-output-switch",
+        ):
+            logger.warning(
+                "RustAdapter native output claim blocked: "
+                "source=apply-output-switch"
+            )
+            return False
         restore = getattr(self, "_output_switch_restore", None)
         if restore is None:
             restore = {
@@ -3880,17 +4007,7 @@ class RustAudioPlayerAdapter:
             f"Output switch failed (rc={rc}) for {driver}/{resolved_device_id or 'default'}"
             + (f": {detail}" if detail else "")
         )
-        restore = getattr(self, "_output_switch_restore", None)
-        if restore is not None:
-            self.requested_driver = restore.get("requested_driver")
-            self.requested_device_id = restore.get("requested_device_id")
-            self.current_driver = restore.get("current_driver")
-            self.current_device_id = restore.get("current_device_id")
-            self._apply_driver_spectrum_policy(self.current_driver)
-            self.output_state = restore.get("output_state", "idle")
-            self.output_error = restore.get("output_error")
-            self._output_switch_restore = None
-        else:
+        if not self._restore_output_switch_state():
             self.output_state = "error"
             self.output_error = msg
         logger.error(

@@ -249,15 +249,26 @@ def test_initial_markup_and_css_expose_an_inert_unchanged_wordmark_without_hover
     assert "#headerHomeBtn:hover .srovaHeaderWordmark" not in CSS
 
 
-def test_point9_asset_tokens_advance_once_and_service_worker_identity_stays_put():
-    assert INDEX.count('/ui_web/ui.js?v=20260828_v1_4_release1') == 1
+def test_q8f_js_asset_token_advances_once_and_service_worker_identity_stays_put():
+    q8f_js_token = "20260911_v2_0_q8f_qobuz_rename1"
+
+    assert INDEX.count(
+        f'/ui_web/ui.js?v={q8f_js_token}'
+    ) == 1
     assert INDEX.count("/ui_web/ui.js?v=") == 1
+    assert POINT9_JS_TOKEN not in INDEX
     assert POINT8_JS_TOKEN not in INDEX
-    assert INDEX.count('/ui_web/srova.css?v=20260828_v1_4_release1') == 1
+
+    assert INDEX.count(
+        f'/ui_web/srova.css?v={POINT9_CSS_TOKEN}'
+    ) == 1
     assert INDEX.count("/ui_web/srova.css?v=") == 1
     assert POINT6_CSS_TOKEN not in INDEX
+
     assert 'const CACHE_NAME = "srova-shell-v3";' in SW
-    assert INDEX.count('navigator.serviceWorker.register("/ui_web/sw.js")') == 1
+    assert INDEX.count(
+        'navigator.serviceWorker.register("/ui_web/sw.js")'
+    ) == 1
 
 
 def test_desktop_and_android_webview_share_the_single_header_implementation():

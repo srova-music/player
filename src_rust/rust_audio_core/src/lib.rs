@@ -3945,7 +3945,7 @@ fn pulseaudio_alsa_card_index_from_card_name(card: &str) -> Option<String> {
 fn pa_connect() -> Result<(PaMainloop, PaContext), String> {
     let mut mainloop =
         PaMainloop::new().ok_or_else(|| "pulseaudio mainloop init failed".to_string())?;
-    let mut context = PaContext::new(&mainloop, "SROVA")
+    let mut context = PaContext::new(&mainloop, "hiresTI")
         .ok_or_else(|| "pulseaudio context init failed".to_string())?;
     context
         .connect(None, PaContextFlagSet::NOFLAGS, None)

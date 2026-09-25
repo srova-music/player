@@ -13,14 +13,14 @@ from version_info import read_version_payload
 
 
 def test_final_debian_package_version_has_clean_display_version():
-    assert build_version_payload("1.4-1") == {
-        "package_version": "1.4-1",
-        "display_version": "1.4",
+    assert build_version_payload("1.1-1") == {
+        "package_version": "1.1-1",
+        "display_version": "1.1",
     }
 
 
 def test_release_candidate_version_remains_readable():
-    assert display_version_for("1.4~rc1-1") == "1.4 RC1"
+    assert display_version_for("1.2~rc1-1") == "1.2 RC1"
 
 
 def test_version_reader_uses_first_readable_nonempty_candidate(tmp_path):
@@ -29,11 +29,11 @@ def test_version_reader_uses_first_readable_nonempty_candidate(tmp_path):
     valid = tmp_path / "version.txt"
 
     empty.write_text("\n", encoding="utf-8")
-    valid.write_text("1.4-1\n", encoding="utf-8")
+    valid.write_text("1.1-1\n", encoding="utf-8")
 
     assert read_version_payload((missing, empty, valid)) == {
-        "package_version": "1.4-1",
-        "display_version": "1.4",
+        "package_version": "1.1-1",
+        "display_version": "1.1",
     }
 
 
@@ -54,8 +54,7 @@ def test_ui_cache_key_tracks_about_version_change():
     index_path = REPO_ROOT / "src" / "ui_web" / "index.html"
     index = index_path.read_text(encoding="utf-8")
 
-    assert '/ui_web/ui.js?v=20260828_v1_4_release1' in index
-    assert '/ui_web/srova.css?v=20260828_v1_4_release1' in index
+    assert '/ui_web/ui.js?v=' in index
 
 def test_package_preflight_requires_version_helper():
     package_path = REPO_ROOT / "package.sh"

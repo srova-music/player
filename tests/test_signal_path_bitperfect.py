@@ -109,21 +109,19 @@ def test_pipewire_verdict_help_mentions_system_mixer_and_volume():
     win = _make_window("PipeWire", exclusive=False)
 
     text = win._build_bitperfect_verdict_help_text()
-    lower_text = text.lower()
 
-    assert "pipewire shared output" in lower_text
-    assert "system mixer" in lower_text
-    assert "volume changes" in lower_text
+    assert "shared PipeWire output still goes through the system mixer" in text
+    assert "System volume changes" in text
+    assert "opens the selected hw:* device directly" in text
 
 
 def test_alsa_verdict_help_mentions_direct_hw_without_exclusive_requirement():
     win = _make_window("ALSA", exclusive=True)
 
     text = win._build_bitperfect_verdict_help_text()
-    lower_text = text.lower()
 
-    assert "alsa opens the hw:* device directly" in lower_text
-    assert "without requiring the exclusive toggle" in lower_text
+    assert "opens the selected hw:* device directly" in text
+    assert "without requiring the Exclusive toggle" in text
 
 
 def test_pipewire_latency_debug_log_dedupes_stable_state(caplog):

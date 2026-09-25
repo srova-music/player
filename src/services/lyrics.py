@@ -50,7 +50,7 @@ class LyricsManager:
         
         if not text: return
 
-
+        # 匹配 [00:12.34] 格式
         pattern = re.compile(r'\[(\d{2}):(\d{2}\.\d{2,3})\](.*)')
         
         lines = text.split('\n')

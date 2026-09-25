@@ -19,7 +19,7 @@ button.circular {
     min-height: 28px;
 }
 
-
+/* 侧边栏基础样式 */
 .sidebar-header { font-size: 13px; font-weight: 800; opacity: 0.5; margin: 16px 12px 8px 12px; text-transform: uppercase; letter-spacing: 1px; }
 .sidebar-row { padding: 8px 12px; border-radius: 6px; margin: 0 4px; }
 .sidebar-row:hover { background-color: alpha(currentColor, 0.08); }
@@ -32,7 +32,7 @@ button.circular {
     box-shadow: none;
 }
 
-
+/* 核心播放栏样式 */
 .card-bar { 
     background-color: @headerbar_bg_color;
     border-top: 1px solid alpha(currentColor, 0.12); 
@@ -51,7 +51,7 @@ button.circular {
     background-color: @headerbar_bg_color;
 }
 
-
+/* 波形面板黑框 */
 .viz-panel {
     background: rgba(10, 10, 10, 0.98);
     background-color: rgba(10, 10, 10, 0.98);
@@ -751,9 +751,11 @@ button.circular {
     text-shadow: 0 0 10px rgba(255, 255, 255, 0.45);
 }
 
+/* ===================================
+   Mini Switcher 独立胶囊版 (修复版)
+   =================================== */
 
-
-
+/* 1. 容器清理 */
     .mini-switcher,
     .mini-switcher > box {
         background: none;
@@ -763,15 +765,15 @@ button.circular {
         padding: 0;
     }
 
-    
+    /* 2. 按钮本体 */
     .mini-switcher button {
         border: 1px solid alpha(currentColor, 0.2);
         box-shadow: none;
-        text-shadow: none; 
+        text-shadow: none; /* 去掉文字阴影 */
         background-image: none;
         background-color: rgba(34, 38, 48, 0.98);
 
-        
+        /* 尺寸与字体 */
         min-height: 28px;
         min-width: 0;
         padding: 3px 14px;
@@ -795,28 +797,28 @@ button.circular {
         margin-right: 0;
     }
 
-    
+    /* 3. 防止窗口失去焦点时变灰 (Inspector 里显示你是 backdrop 状态) */
     .mini-switcher button:backdrop {
         background-image: none;
         background-color: rgba(34, 38, 48, 0.98);
         color: alpha(currentColor, 0.75);
     }
 
-    
+    /* 4. 选中状态 (Spectrum 被选中时) */
     .mini-switcher button:checked {
-        background-color: alpha(@accent_bg_color, 0.90); 
+        background-color: alpha(@accent_bg_color, 0.90); /* 只有这里有淡淡的背景 */
         background-image: none;
         color: alpha(@accent_fg_color, 0.98);
         box-shadow: none;
     }
 
-    
+    /* 选中状态但在后台时 */
     .mini-switcher button:checked:backdrop {
         background-color: alpha(@accent_bg_color, 0.86);
         color: alpha(@accent_fg_color, 0.95);
     }
 
-    
+    /* 5. 鼠标悬停 */
     .mini-switcher button:hover {
         background-color: rgba(50, 56, 70, 0.98);
         background-image: none;
@@ -850,14 +852,22 @@ button.circular {
     }
 
     .viz-panel {
-    
+    /* rgba(红, 绿, 蓝, 透明度)
+       最后一个数字控制透明度：范围是 0.0 到 1.0
+
+       0.95 = 几乎不透明 (很深)
+       0.8  = 默认值 (深色玻璃感)
+       0.5  = 半透明
+       0.2  = 非常透
+       0.0  = 完全透明 (看不见背景，只有波形)
+    */
     /* Theme-specific background is controlled by .viz-panel-dark / .viz-panel-light */
     background-image: none;
     border-top: 1px solid alpha(currentColor, 0.18);
     border-bottom: 1px solid rgba(0, 0, 0, 0.3);
 
-    
-    
+    /* 3. 玻璃内发光/阴影：增加立体感，不让它看起来像一张纸 */
+    /* inset 0 0 20px 意味着在内部有一圈淡淡的黑晕 */
     box-shadow: inset 0 0 20px rgba(0, 0, 0, 0.2);
 
     padding: 0px;
@@ -871,7 +881,7 @@ button.circular {
         border-radius: 0;
     }
 
-    
+    /* Box 也要透明 */
     .lyrics-scroller > box,
     .lyrics-scroller viewport {
         background: transparent;

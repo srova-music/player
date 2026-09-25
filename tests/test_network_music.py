@@ -543,75 +543,40 @@ class NetworkMusicTests(unittest.TestCase):
         )
 
     def test_debian_lifecycle_and_payload_checks_are_safe(self):
-        relative = "package.sh"
-        source = (self.repo_root / relative).read_text(
-            encoding="utf-8"
-        )
+        for relative in ("package.sh", "packaging/arm64/build_rc1_deb.sh"):
+            source = (self.repo_root / relative).read_text(encoding="utf-8")
+            prerm = source.index('if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]')
+            stop = source.index("systemctl stop srova.service", prerm)
+            unmount = source.index("unmount-all", prerm)
+            self.assertLess(stop, unmount, relative)
+            self.assertIn(
+                "srova-network-mount-helper unmount-all </dev/null",
+                source,
+                relative,
+            )
+            self.assertIn("rmdir \"$managed_dir\"", source)
+            self.assertNotIn("rm -rf /mnt/srova-network", source)
+            self.assertIn("srova-network-mount-helper", source)
+            self.assertIn("srova-network-mounts.service", source)
+            self.assertIn("srova-network-mount", source)
+            self.assertIn("visudo -cf", source)
+            for mode in ("755", "644", "440"):
+                self.assertIn(mode, source)
 
-        prerm = source.index(
-            'if [ "$1" = "remove" ] || '
-            '[ "$1" = "deconfigure" ]'
-        )
-        stop = source.index(
-            "systemctl stop srova.service",
-            prerm,
-        )
-        unmount = source.index("unmount-all", prerm)
-
-        self.assertLess(stop, unmount, relative)
-        self.assertIn(
-            "srova-network-mount-helper "
-            "unmount-all </dev/null",
-            source,
-            relative,
-        )
-        self.assertIn('rmdir "$managed_dir"', source)
-        self.assertNotIn(
-            "rm -rf /mnt/srova-network",
-            source,
-        )
-        self.assertIn(
-            "srova-network-mount-helper",
-            source,
-        )
-        self.assertIn(
-            "srova-network-mounts.service",
-            source,
-        )
-        self.assertIn("srova-network-mount", source)
-        self.assertIn("visudo -cf", source)
-
-        for mode in ("755", "644", "440"):
-            self.assertIn(mode, source)
-
-        self.assertEqual(
-            source.count(
-                'dpkg-deb --root-owner-group '
-                '--build "$BUILD_ROOT"'
-            ),
-            2,
-        )
-        self.assertNotIn(
-            'dpkg-deb --build "$BUILD_ROOT"',
-            source,
-        )
-        self.assertIn(
-            "validate_deb_network_archive",
-            source,
-        )
-
-        for expected in (
-            "root/root",
-            "-rwxr-xr-x",
-            "-rw-r--r--",
-            "-r--r-----",
-        ):
-            self.assertIn(expected, source)
+        amd64_source = (self.repo_root / "package.sh").read_text(encoding="utf-8")
+        self.assertEqual(amd64_source.count('dpkg-deb --root-owner-group --build "$BUILD_ROOT"'), 2)
+        self.assertNotIn('dpkg-deb --build "$BUILD_ROOT"', amd64_source)
+        self.assertIn("validate_deb_network_archive", amd64_source)
+        for expected in ("root/root", "-rwxr-xr-x", "-rw-r--r--", "-r--r-----"):
+            self.assertIn(expected, amd64_source)
 
     def test_debian_payload_rejects_oversized_application_svg_artwork(self):
         package_source = (self.repo_root / "package.sh").read_text(encoding="utf-8")
         bootstrap_source = (
             self.repo_root / "src/app/app_bootstrap.py"
+        ).read_text(encoding="utf-8")
+        generator_source = (
+            self.repo_root / "generate_logo.py"
         ).read_text(encoding="utf-8")
 
         forbidden_svg = (
@@ -651,60 +616,37 @@ class NetworkMusicTests(unittest.TestCase):
             bootstrap_source,
         )
 
-
-    def test_arm64_debian_wrapper_delegates_to_package_builder(self):
-        wrapper_path = (
-            self.repo_root
-            / "packaging/arm64/build_deb.sh"
+        self.assertIn(
+            'os.path.expanduser("~/SROVA_ARTWORK_EXPORTS")',
+            generator_source,
         )
-        old_path = (
+
+    def test_arm64_v2_source_default_is_git_head_and_version_locked(self):
+        source = (
             self.repo_root
             / "packaging/arm64/build_rc1_deb.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            'SOURCE_REF="${SROVA_ARM64_SOURCE_REF:-HEAD}"',
+            source,
         )
-        readme_path = (
-            self.repo_root
-            / "packaging/arm64/README.md"
+        self.assertIn('SOURCE_COMMIT=""', source)
+        self.assertIn('VERSION="2.0-1"', source)
+        self.assertIn("verify_source_ref() {", source)
+        self.assertIn(
+            'git -C "$REPO_ROOT" archive --format=tar "$SOURCE_COMMIT"',
+            source,
         )
-
-        self.assertTrue(wrapper_path.is_file())
-        self.assertFalse(old_path.exists())
-
-        source = wrapper_path.read_text(encoding="utf-8")
-        readme = readme_path.read_text(encoding="utf-8")
-
-        for expected in (
-            "set -euo pipefail",
-            'ARCH="$(dpkg --print-architecture)"',
-            'if [ "$ARCH" != "arm64" ]; then',
-            "version.txt",
-            'exec bash "$PACKAGE_SCRIPT" deb "$VERSION"',
-        ):
-            self.assertIn(expected, source)
-
-        for obsolete in (
-            "v1.0-rc1",
-            "1.0~rc1-1",
-            "NON-RC1 SOURCE OVERRIDE",
-            "SROVA_PORT=8080",
-            "/opt/srova/app",
-        ):
-            self.assertNotIn(obsolete, source)
-
-        self.assertEqual(
-            (
-                self.repo_root / "version.txt"
-            ).read_text(encoding="utf-8").strip(),
-            "1.4-1",
+        self.assertIn(
+            'install -m 0644 "$EXPORT_ROOT/version.txt" "$APP/version.txt"',
+            source,
         )
-
-        for expected in (
-            "package.sh",
-            "build_deb.sh",
-            "1.4-1",
-            "/opt/srova",
-            "8081",
-        ):
-            self.assertIn(expected, readme)
+        self.assertIn('APP="${TREE}/opt/srova"', source)
+        self.assertIn('WorkingDirectory=/opt/srova', source)
+        self.assertNotIn("/opt/srova/app", source)
+        self.assertNotIn('EXPECTED_TAG="v1.0-rc1"', source)
+        self.assertNotIn("NON-RC1 SOURCE OVERRIDE", source)
 
 
 
@@ -1302,7 +1244,7 @@ class NetworkMusicSettingsRefreshTests(unittest.TestCase):
         )
 
 
-    def test_ui_javascript_uses_single_valid_cache_token(self):
+    def test_ui_cache_bust_is_current(self):
         index = (
             Path(__file__).resolve().parents[1]
             / "src"
@@ -1310,23 +1252,16 @@ class NetworkMusicSettingsRefreshTests(unittest.TestCase):
             / "index.html"
         ).read_text(encoding="utf-8")
 
-        prefix = "/ui_web/ui.js?v="
-        self.assertEqual(index.count(prefix), 1)
-
-        token = index.split(prefix, 1)[1].split('"', 1)[0]
-        self.assertTrue(token)
-        self.assertTrue(
-            all(
-                char.isalnum() or char in "_.-"
-                for char in token
-            )
-        )
-        self.assertNotIn(
-            '<script src="/ui_web/ui.js"></script>',
+        self.assertRegex(
             index,
+            r'/ui_web/ui\.js\?v=[A-Za-z0-9_.-]+',
+        )
+        self.assertRegex(
+            index,
+            r'/ui_web/srova\.css\?v=[A-Za-z0-9_.-]+',
         )
 
-    def test_network_discovery_note_states_network_and_share_requirements(self):
+    def test_network_discovery_note_states_subnet_and_share_requirements(self):
         source = (
             Path(__file__).resolve().parents[1]
             / "src"
@@ -1362,7 +1297,7 @@ class NetworkMusicSettingsRefreshTests(unittest.TestCase):
             section,
         )
 
-    def test_network_discovery_note_uses_existing_dependency_note_classes(self):
+    def test_network_discovery_note_uses_existing_responsive_settings_classes(self):
         source = (
             Path(__file__).resolve().parents[1]
             / "src"
@@ -1376,8 +1311,8 @@ class NetworkMusicSettingsRefreshTests(unittest.TestCase):
             source,
         )
 
-        # The note deliberately inherits the existing dependency-note
-        # styling rather than introducing a separate fixed-width layout.
+        # The note deliberately inherits the existing responsive Settings
+        # typography rather than introducing a fixed-width layout.
         css = (
             Path(__file__).resolve().parents[1]
             / "src"
@@ -1385,7 +1320,7 @@ class NetworkMusicSettingsRefreshTests(unittest.TestCase):
             / "srova.css"
         ).read_text(encoding="utf-8")
 
-        self.assertIn(".settingsDependencyNote", css)
+        self.assertIn(".settingsSectionDesc", css)
 
     def test_settings_rows_use_canonical_mutation_results_and_ignore_stale_status(self):
         source = (

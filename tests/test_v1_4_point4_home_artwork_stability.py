@@ -250,13 +250,13 @@ def run_scenario(body):
     subprocess.run(["node", "-e", script], check=True, text=True, capture_output=True)
 
 
-@pytest.mark.parametrize("source", ["local", "tidal"])
+@pytest.mark.parametrize("source", ["local", "tidal", "qobuz"])
 def test_pause_extended_pause_resume_and_mmap_seek_keep_artwork_stable(source):
     run_scenario(
         f"""
 const playingStatus = status({source!r});
 applyStatus(playingStatus);
-assert.deepStrictEqual(settleLatestImageLoad(), [300, 320]);
+assert.deepStrictEqual(settleLatestImageLoad(), []);
 const assignments = logo.srcAssignments;
 const preloadCount = images.length;
 events.length = 0;
@@ -269,6 +269,7 @@ const pausedStatus = status({source!r}, {{
 }});
 applyStatus(pausedStatus);
 for (let poll = 0; poll < 5; poll += 1) {{ applyStatus(pausedStatus); }}
+
 // Model both directions of mmap Pause/Seek/Resume without introducing any
 // seek-specific Home state: only position and the temporary pause change.
 applyStatus(status({source!r}, {{
@@ -300,7 +301,7 @@ def test_idle_and_cleared_current_item_still_transition_to_hero():
     run_scenario(
         r"""
 applyStatus(status("local"));
-settleLatestImageLoad();
+assert.deepStrictEqual(settleLatestImageLoad(), []);
 events.length = 0;
 
 applyStatus({
@@ -311,13 +312,24 @@ applyStatus({
     current_track_id: null,
     cover: null
 });
+
 assert.strictEqual(images.length, 2);
 images[1].fireLoad();
-assert.strictEqual(gateway.classList.contains("srovaHomeHeroSwapping"), true);
-assert.deepStrictEqual(runAllTimers(), [300, 320]);
-assert.strictEqual(logo.getAttribute("src"), SROVA_STANDBY_ART);
+
+assert.deepStrictEqual(runAllTimers(), []);
+assert.strictEqual(
+    gateway.classList.contains("srovaHomeHeroSwapping"),
+    false
+);
+assert.strictEqual(
+    logo.getAttribute("src"),
+    SROVA_STANDBY_ART
+);
 assert.strictEqual(nowPlaying.textContent, "");
-assert.strictEqual(gateway.classList.contains("srovaHomeHeroNowPlaying"), false);
+assert.strictEqual(
+    gateway.classList.contains("srovaHomeHeroNowPlaying"),
+    false
+);
 """
     )
 
@@ -360,8 +372,10 @@ assert.strictEqual(countEvent("timer"), 0);
 def test_pending_equivalent_artwork_is_not_preloaded_twice_and_metadata_does_not_wait():
     run_scenario(
         r"""
-applyStatus(status("tidal", {cover: "https://resources.tidal.com/images/a/320x320.jpg"}));
-settleLatestImageLoad();
+applyStatus(status("tidal", {
+    cover: "https://resources.tidal.com/images/a/320x320.jpg"
+}));
+assert.deepStrictEqual(settleLatestImageLoad(), []);
 events.length = 0;
 
 applyStatus(status("tidal", {
@@ -379,12 +393,19 @@ applyStatus(status("tidal", {
 }));
 assert.strictEqual(images.length, 2);
 assert.strictEqual(nowPlaying.textContent, "Track Three - Artist");
-assert.strictEqual(countEvent("class-add", "srovaHomeHeroSwapping"), 0);
+assert.strictEqual(
+    countEvent("class-add", "srovaHomeHeroSwapping"),
+    0
+);
 assert.strictEqual(countEvent("timer"), 0);
 
 images[1].fireLoad();
-assert.deepStrictEqual(runAllTimers(), [300, 320]);
-assert.strictEqual(logo.getAttribute("src"), "https://resources.tidal.com/images/b/320x320.jpg");
+
+assert.deepStrictEqual(runAllTimers(), []);
+assert.strictEqual(
+    logo.getAttribute("src"),
+    "https://resources.tidal.com/images/b/320x320.jpg"
+);
 assert.strictEqual(nowPlaying.textContent, "Track Three - Artist");
 """
     )
@@ -419,86 +440,185 @@ assert.strictEqual(homeHeroArtworkIdentity("http://[invalid"), "http://[invalid"
     )
 
 
-def test_different_artwork_keeps_existing_fade_timings_and_latest_failure_falls_back():
+def test_different_artwork_preloads_then_commits_directly_and_latest_failure_falls_back():
     run_scenario(
         r"""
 applyStatus(status("local", {cover: "/art/a.jpg"}));
-settleLatestImageLoad();
+assert.deepStrictEqual(settleLatestImageLoad(), []);
 events.length = 0;
 
-applyStatus(status("local", {title: "Different", cover: "/art/b.jpg?sig=two"}));
+applyStatus(status("local", {
+    title: "Different",
+    cover: "/art/b.jpg?sig=two"
+}));
 assert.strictEqual(images.length, 2);
 assert.strictEqual(countEvent("timer"), 0);
-images[1].fireLoad();
-assert.strictEqual(gateway.classList.contains("srovaHomeHeroSwapping"), true);
-assert.deepStrictEqual(runAllTimers(), [300, 320]);
-assert.strictEqual(logo.getAttribute("src"), "/art/b.jpg?sig=two");
 
-applyStatus(status("local", {title: "Broken", cover: "/art/missing.jpg"}));
+images[1].fireLoad();
+
+assert.strictEqual(
+    gateway.classList.contains("srovaHomeHeroSwapping"),
+    false
+);
+assert.deepStrictEqual(runAllTimers(), []);
+assert.strictEqual(
+    logo.getAttribute("src"),
+    "/art/b.jpg?sig=two"
+);
+
+applyStatus(status("local", {
+    title: "Broken",
+    cover: "/art/missing.jpg"
+}));
 assert.strictEqual(images.length, 3);
+
 images[2].fireError();
-assert.deepStrictEqual(runAllTimers(), [300, 320]);
-assert.strictEqual(logo.getAttribute("src"), SROVA_STANDBY_ART);
-assert.strictEqual(nowPlaying.textContent, "Broken - Artist");
+
+assert.deepStrictEqual(runAllTimers(), []);
+assert.strictEqual(
+    gateway.classList.contains("srovaHomeHeroSwapping"),
+    false
+);
+assert.strictEqual(
+    logo.getAttribute("src"),
+    SROVA_STANDBY_ART
+);
+assert.strictEqual(
+    nowPlaying.textContent,
+    "Broken - Artist"
+);
 """
     )
 
 
-def test_stale_load_error_and_timer_callbacks_cannot_override_latest_artwork_or_hide_it():
+def test_stale_load_error_callbacks_cannot_override_latest_artwork_or_hide_it():
     run_scenario(
         r"""
 applyStatus(status("tidal", {cover: "/art/a.jpg"}));
-settleLatestImageLoad();
+assert.deepStrictEqual(settleLatestImageLoad(), []);
 events.length = 0;
 
-applyStatus(status("tidal", {title: "B", cover: "/art/b.jpg"}));
+applyStatus(status("tidal", {
+    title: "B",
+    cover: "/art/b.jpg"
+}));
+
 const staleLoad = images[1].onload;
 const staleError = images[1].onerror;
-applyStatus(status("tidal", {title: "C", cover: "/art/c.jpg"}));
+
+applyStatus(status("tidal", {
+    title: "C",
+    cover: "/art/c.jpg"
+}));
+
 staleLoad();
 staleError();
+
 assert.strictEqual(countEvent("timer"), 0);
-assert.strictEqual(logo.getAttribute("src"), "/art/a.jpg");
+assert.strictEqual(
+    logo.getAttribute("src"),
+    "/art/a.jpg"
+);
 
 images[2].fireLoad();
-const staleFadeTimer = timers.find(function(timer) { return !timer.cancelled && timer.delay === 300; });
-assert.ok(staleFadeTimer);
-applyStatus(status("tidal", {title: "Back to A", cover: "/art/a.jpg"}));
-assert.strictEqual(gateway.classList.contains("srovaHomeHeroSwapping"), false);
-staleFadeTimer.callback();
-runAllTimers();
-assert.strictEqual(logo.getAttribute("src"), "/art/a.jpg");
-assert.strictEqual(gateway.classList.contains("srovaHomeHeroSwapping"), false);
-assert.strictEqual(nowPlaying.textContent, "Back to A - Artist");
+
+assert.strictEqual(
+    logo.getAttribute("src"),
+    "/art/c.jpg"
+);
+assert.strictEqual(countEvent("timer"), 0);
+assert.strictEqual(
+    gateway.classList.contains("srovaHomeHeroSwapping"),
+    false
+);
+
+applyStatus(status("tidal", {
+    title: "Back to A",
+    cover: "/art/a.jpg"
+}));
+
+assert.strictEqual(images.length, 4);
+assert.strictEqual(
+    logo.getAttribute("src"),
+    "/art/c.jpg"
+);
+assert.strictEqual(
+    nowPlaying.textContent,
+    "Back to A - Artist"
+);
+assert.strictEqual(countEvent("timer"), 0);
+
+images[3].fireLoad();
+
+assert.strictEqual(
+    logo.getAttribute("src"),
+    "/art/a.jpg"
+);
+assert.strictEqual(
+    gateway.classList.contains("srovaHomeHeroSwapping"),
+    false
+);
+assert.strictEqual(
+    nowPlaying.textContent,
+    "Back to A - Artist"
+);
 """
     )
 
 
-def test_initial_hero_media_transitions_and_new_home_dom_keep_established_presentation():
+def test_initial_hero_and_new_home_dom_do_not_reassign_identical_standby_artwork():
     run_scenario(
         r"""
-applyStatus({playing: false, current_track_valid: false, playback_state: "idle"});
-assert.strictEqual(images.length, 0);
-assert.strictEqual(gateway.classList.contains("srovaHomeHeroSwapping"), true);
-assert.deepStrictEqual(runAllTimers(), [300, 320]);
-assert.strictEqual(logo.srcAssignments, 1);
+applyStatus({
+    playing: false,
+    current_track_valid: false,
+    playback_state: "idle"
+});
 
-applyStatus(status("local", {cover: "/art/media.jpg"}));
+assert.strictEqual(images.length, 0);
+assert.strictEqual(
+    gateway.classList.contains("srovaHomeHeroSwapping"),
+    false
+);
+assert.deepStrictEqual(runAllTimers(), []);
+assert.strictEqual(logo.srcAssignments, 0);
+
+applyStatus(status("local", {
+    cover: "/art/media.jpg"
+}));
+
 assert.strictEqual(images.length, 1);
 images[0].fireLoad();
-assert.deepStrictEqual(runAllTimers(), [300, 320]);
-assert.strictEqual(logo.getAttribute("src"), "/art/media.jpg");
+
+assert.deepStrictEqual(runAllTimers(), []);
+assert.strictEqual(
+    logo.getAttribute("src"),
+    "/art/media.jpg"
+);
+assert.strictEqual(
+    gateway.classList.contains("srovaHomeHeroSwapping"),
+    false
+);
 
 replaceHome(SROVA_STANDBY_ART);
-applyStatus({playing: false, current_track_valid: false, playback_state: "idle"});
-assert.strictEqual(gateway.classList.contains("srovaHomeHeroSwapping"), true);
-assert.deepStrictEqual(runAllTimers(), [300, 320]);
-assert.strictEqual(logo.srcAssignments, 1);
+
+applyStatus({
+    playing: false,
+    current_track_valid: false,
+    playback_state: "idle"
+});
+
+assert.strictEqual(
+    gateway.classList.contains("srovaHomeHeroSwapping"),
+    false
+);
+assert.deepStrictEqual(runAllTimers(), []);
+assert.strictEqual(logo.srcAssignments, 0);
 """
     )
 
 
-def test_radio_selection_and_same_artwork_transition_behavior_remain_unchanged():
+def test_radio_selection_and_same_artwork_metadata_update_preserve_artwork_identity():
     run_scenario(
         r"""
 const pausedRadio = deriveHomeHeroNowPlayingModel({
@@ -507,18 +627,29 @@ const pausedRadio = deriveHomeHeroNowPlayingModel({
     playback_state: "paused",
     source: "radio",
     radio_mode: true,
-    radio_station: {name: "Station", icon: "/radio/station.png"}
+    radio_station: {
+        name: "Station",
+        icon: "/radio/station.png"
+    }
 });
+
 assert.strictEqual(pausedRadio.active, false);
-assert.strictEqual(pausedRadio.imageUrl, SROVA_STANDBY_ART);
-assert.strictEqual(deriveHomeHeroNowPlayingModel({
-    playing: false,
-    current_track_valid: true,
-    playback_state: "paused",
-    source: "radio",
-    radio_mode: false,
-    radio_station: null
-}).active, false);
+assert.strictEqual(
+    pausedRadio.imageUrl,
+    SROVA_STANDBY_ART
+);
+
+assert.strictEqual(
+    deriveHomeHeroNowPlayingModel({
+        playing: false,
+        current_track_valid: true,
+        playback_state: "paused",
+        source: "radio",
+        radio_mode: false,
+        radio_station: null
+    }).active,
+    false
+);
 
 const radioOne = {
     playing: true,
@@ -526,32 +657,174 @@ const radioOne = {
     playback_state: "playing",
     source: "radio",
     radio_mode: true,
-    radio_station: {name: "Station", icon: "/radio/station.png"},
-    radio_metadata: {title: "Song One", artist: "Artist"},
+    radio_station: {
+        name: "Station",
+        icon: "/radio/station.png"
+    },
+    radio_metadata: {
+        title: "Song One",
+        artist: "Artist"
+    },
     radio_cover_art_url: "/radio/song.png"
 };
+
 applyStatus(radioOne);
-settleLatestImageLoad();
+assert.deepStrictEqual(settleLatestImageLoad(), []);
+
 const assignments = logo.srcAssignments;
 events.length = 0;
 
 applyStatus(Object.assign({}, radioOne, {
-    radio_metadata: {title: "Song Two", artist: "Artist"}
+    radio_metadata: {
+        title: "Song Two",
+        artist: "Artist"
+    }
 }));
+
 assert.strictEqual(images.length, 1);
-assert.strictEqual(gateway.classList.contains("srovaHomeHeroSwapping"), true);
-assert.deepStrictEqual(runAllTimers(), [300, 320]);
-assert.strictEqual(logo.srcAssignments, assignments + 1);
-assert.strictEqual(nowPlaying.textContent, "Song Two - Artist");
+assert.strictEqual(
+    gateway.classList.contains("srovaHomeHeroSwapping"),
+    false
+);
+assert.deepStrictEqual(runAllTimers(), []);
+assert.strictEqual(
+    logo.srcAssignments,
+    assignments
+);
+assert.strictEqual(
+    logo.getAttribute("src"),
+    "/radio/song.png"
+);
+assert.strictEqual(
+    nowPlaying.textContent,
+    "Song Two - Artist"
+);
 """
+    )
+
+
+def test_p7_apply_path_has_no_opacity_zero_artwork_swap():
+    apply_model = function_source(
+        "applyHomeHeroNowPlayingModel"
+    )
+
+    assert (
+        'classList.add("srovaHomeHeroSwapping")'
+        not in apply_model
+    )
+    assert (
+        "homeHeroFadeOutTimer = window.setTimeout"
+        not in apply_model
+    )
+    assert (
+        "homeHeroFadeInTimer = window.setTimeout"
+        not in apply_model
+    )
+
+    # Existing preload and stale-request ownership must remain.
+    assert "var preload = new Image();" in apply_model
+    assert (
+        "token !== homeHeroNowPlayingToken"
+        in apply_model
+    )
+    assert (
+        "homeHeroArtworkElement !== logo"
+        in apply_model
+    )
+
+
+def test_p7_initial_home_waits_for_session_truth_and_reuses_stable_hero_state():
+    initial = function_source(
+        "loadInitialHomeAfterStreamingProviderResolution"
+    )
+    home = function_source("loadHome")
+    update = function_source(
+        "updateHomeHeroNowPlaying"
+    )
+    restore = function_source("restoreSession")
+
+    assert "Promise.all([" in initial
+    assert (
+        "Promise.resolve(sessionReady).catch(function() {})"
+        in initial
+    )
+    assert (
+        initial.index("Promise.all([")
+        < initial.index("loadHome();")
+    )
+
+    assert (
+        "deriveHomeHeroNowPlayingModel("
+        "lastKnownHomeHeroStatus"
+        ")"
+        in home
+    )
+    assert (
+        "initialHeroLogo.src = initialHeroImage;"
+        in home
+    )
+    assert (
+        "updateHomeHeroNowPlaying("
+        "lastKnownHomeHeroStatus"
+        ");"
+        in home
+    )
+
+    assert (
+        "if (s && s.qobuz_replacement_pending) "
+        "{ return; }"
+        in update
+    )
+    assert "lastKnownHomeHeroStatus = s;" in update
+
+    assert 'return fetch("/session")' in restore
+    assert (
+        restore.index("updateHomeHeroNowPlaying(s);")
+        < restore.index("if (isRadioLiveStatus(s)")
+    )
+
+    bootstrap_start = UI.index(
+        'window.addEventListener("DOMContentLoaded"'
+    )
+    bootstrap_end = UI.index(
+        "function initPlayerTechTray",
+        bootstrap_start,
+    )
+    bootstrap = UI[
+        bootstrap_start:bootstrap_end
+    ]
+
+    assert (
+        "var initialSessionRestore = restoreSession();"
+        in bootstrap
+    )
+    assert (
+        "loadInitialHomeAfterStreamingProviderResolution("
+        "initialSessionRestore"
+        ");"
+        in bootstrap
     )
 
 
 def test_point4_cache_token_has_advanced_and_seek_guard_contract_remains_present():
     marker = "/ui_web/ui.js?v="
-    assert INDEX.count(marker) == 1
+    assert marker in INDEX
     token = INDEX.split(marker, 1)[1].split('"', 1)[0].strip()
-    assert token == "20260828_v1_4_release1"
+    assert token != "20260823_v1_4_point4_home_artwork_stability1"
+
+    if "_v1_4_point" in token:
+        point = int(
+            token.split(
+                "_v1_4_point",
+                1,
+            )[1].split(
+                "_",
+                1,
+            )[0]
+        )
+        assert point >= 5
+    else:
+        assert token == "20260911_v2_0_q8f_qobuz_rename1"
 
     assert "var SEEK_SESSION_GUARD_MS = 1500;" in UI
     assert 'fetch("/tidal/seek/" + target)' in UI

@@ -280,11 +280,11 @@ def do_activate(self):
     self._set_login_view_pending()
     _startup_mark("login-view-pending")
 
-
+    # === 恢复设置逻辑 ===
     is_bp = self.settings.get("bit_perfect", False)
     is_ex = self.settings.get("exclusive_lock", False)
 
-
+    # 1. 应用 Bit-Perfect 和 独占状态
     if is_bp:
         if self.bp_label is not None:
             self.bp_label.set_visible(True)
@@ -292,7 +292,7 @@ def do_activate(self):
     self.player.toggle_bit_perfect(is_bp, exclusive_lock=is_ex)
     _startup_mark("bit-perfect")
 
-
+    # 2. 应用 Latency
     saved_rt_profile = self.settings.get(
         "alsa_mmap_realtime_priority",
         self.ALSA_MMAP_REALTIME_PRIORITY_DEFAULT,
@@ -304,14 +304,14 @@ def do_activate(self):
     )
     _startup_mark("alsa-mmap-priority")
 
-
+    # 3. 应用 Latency
     saved_profile = self.settings.get("latency_profile", "Standard (100ms)")
     if saved_profile in self.LATENCY_MAP:
         buf_ms, lat_ms = self.LATENCY_MAP[saved_profile]
         self.player.set_alsa_latency(buf_ms, lat_ms)
     _startup_mark("alsa-latency")
 
-
+    # 3b. 应用 USB 时钟模式
     from actions.audio_settings_actions import USB_CLOCK_DEFAULT, _USB_CLOCK_MODE_MAP
     saved_usb_clock = self.settings.get("usb_clock_mode", USB_CLOCK_DEFAULT)
     if saved_usb_clock not in _USB_CLOCK_MODE_MAP:
@@ -320,7 +320,7 @@ def do_activate(self):
         self.player.set_usb_clock_mode(_USB_CLOCK_MODE_MAP[saved_usb_clock])
     _startup_mark("usb-clock-mode")
 
-
+    # 4. 恢复驱动选择
     drivers = self.player.get_drivers()
     saved_drv = self.settings.get("driver", "Auto (Default)")
     if saved_drv == "ALSA":
@@ -332,7 +332,7 @@ def do_activate(self):
     if is_ex:
         drivers = [drv for drv in drivers if drv in ("ALSA（auto）", "ALSA（mmap）")]
 
-
+    # 如果保存的是 ALSA 或其他驱动，先尝试选中
     if saved_drv in drivers:
         try:
             idx = drivers.index(saved_drv)

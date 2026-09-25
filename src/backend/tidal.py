@@ -1632,16 +1632,43 @@ class TidalBackend:
     def delete_cloud_playlist(self, playlist_or_id):
         pl = self._resolve_user_playlist(playlist_or_id)
         if pl is None:
-            return {"ok": False, "playlist_id": None}
+            return {"ok": False, "playlist_id": None, "error": "playlist not found"}
+
+        playlist_id = getattr(pl, "id", None)
+
+        if not self._is_owned_user_playlist(pl):
+            logger.warning(
+                "Refusing delete for non-owned TIDAL playlist: id=%s",
+                playlist_id,
+            )
+            return {
+                "ok": False,
+                "playlist_id": playlist_id,
+                "error": "This TIDAL playlist is not editable by the current user",
+            }
+
         if not hasattr(pl, "delete"):
-            logger.warning("Cloud playlist does not support delete(): id=%s", getattr(pl, "id", None))
-            return {"ok": False, "playlist_id": getattr(pl, "id", None)}
+            logger.warning("Cloud playlist does not support delete(): id=%s", playlist_id)
+            return {
+                "ok": False,
+                "playlist_id": playlist_id,
+                "error": "playlist does not support delete",
+            }
+
         try:
             ok = bool(pl.delete())
-            return {"ok": ok, "playlist_id": getattr(pl, "id", None)}
+            return {
+                "ok": ok,
+                "playlist_id": playlist_id,
+                "error": "" if ok else "TIDAL playlist delete failed",
+            }
         except Exception as e:
-            logger.warning("Failed deleting cloud playlist %s: %s", getattr(pl, "id", None), e)
-            return {"ok": False, "playlist_id": getattr(pl, "id", None)}
+            logger.warning("Failed deleting cloud playlist %s: %s", playlist_id, e)
+            return {
+                "ok": False,
+                "playlist_id": playlist_id,
+                "error": "TIDAL playlist delete failed",
+            }
 
     def sync_local_playlist_to_cloud(self, local_playlist, cloud_playlist_id=None, dedupe=True):
         name = str((local_playlist or {}).get("name", "") or "").strip() or "New Playlist"
@@ -1717,6 +1744,105 @@ class TidalBackend:
                 e,
             )
             return []
+
+    def get_artist_radio_tracks(
+        self,
+        artist_id,
+        limit=100,
+    ):
+        """Return provider-native TIDAL Artist Radio tracks."""
+        page_size = max(
+            1,
+            min(
+                100,
+                int(limit or 100),
+            ),
+        )
+
+        def _fetch():
+            artist = self.session.artist(
+                artist_id
+            )
+            fetcher = getattr(
+                artist,
+                "get_radio",
+                None,
+            )
+            if not callable(fetcher):
+                return []
+
+            return list(
+                fetcher(
+                    limit=page_size
+                )
+                or []
+            )
+
+        try:
+            return list(
+                self._call_with_session_recovery(
+                    _fetch,
+                    context="artist radio",
+                )
+                or []
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to fetch TIDAL Artist Radio for %s: %s",
+                artist_id,
+                e,
+            )
+            return []
+
+    def get_track_radio_tracks(
+        self,
+        track_id,
+        limit=100,
+    ):
+        """Return provider-native TIDAL Track Radio tracks."""
+        page_size = max(
+            1,
+            min(
+                100,
+                int(limit or 100),
+            ),
+        )
+
+        def _fetch():
+            track = self.session.track(
+                track_id
+            )
+            fetcher = getattr(
+                track,
+                "get_track_radio",
+                None,
+            )
+            if not callable(fetcher):
+                return []
+
+            return list(
+                fetcher(
+                    limit=page_size
+                )
+                or []
+            )
+
+        try:
+            return list(
+                self._call_with_session_recovery(
+                    _fetch,
+                    context="track radio",
+                )
+                or []
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to fetch TIDAL Track Radio for %s: %s",
+                track_id,
+                e,
+            )
+            return []
+
 
     def _get_artist_album_collection(self, art, method_name, limit=2000, page_size=100):
         target = max(0, int(limit or 0))
@@ -1824,7 +1950,7 @@ class TidalBackend:
         return None
 
     # ==========================================
-
+    # [核心修改] 带过滤功能的 get_home_page
     # ==========================================
     def _home_source_value(self, source, key):
         if isinstance(source, dict):
@@ -1907,9 +2033,9 @@ class TidalBackend:
 
     def get_home_page(self):
         """
-        Fetch the TIDAL home page and filter sections for the SROVA interface.
+        获取 Tidal 首页，并根据用户需求过滤栏目。
         """
-
+        # 定义您想要显示的关键词 (不区分大小写)
         ALLOWED_KEYWORDS = [
             # English
             "mix", "spotlight", "suggested", "because", "recommended",
@@ -1972,7 +2098,7 @@ class TidalBackend:
                             if str(part or "").strip()
                         ).lower()
                         
-
+                        # [过滤逻辑] 检查标题是否包含任一关键词
                         is_allowed = any(k in filter_text for k in ALLOWED_KEYWORDS)
                         
                         if is_allowed:
@@ -1991,11 +2117,11 @@ class TidalBackend:
                             if section['items']:
                                 home_sections.append(section)
                         else:
-
+                            # 可以在这里打印被过滤掉的栏目，方便调试
                             # print(f"[Backend] Filtered out: {title}")
                             pass
             else:
-
+                # 回退模式
                 logger.info("session.home() not found, using fallback.")
                 mixes = self._get_fallback_mixes()
                 if mixes: home_sections.append({'title': 'Mixes for you', 'items': mixes})
@@ -2953,7 +3079,7 @@ class TidalBackend:
 
     def _process_generic_item(self, item):
         try:
-
+            # 基础信息
             _t = getattr(item, 'title', None)
             _name = str(_t) if _t is not None and not callable(_t) else str(getattr(item, 'name', None) or 'Unknown')
             data = {
@@ -2964,14 +3090,14 @@ class TidalBackend:
                 'type': type(item).__name__ 
             }
             
-
+            # 补充子标题
             if hasattr(item, 'artist') and item.artist:
                 data['sub_title'] = item.artist.name
             elif hasattr(item, 'artists') and item.artists:
                 data['sub_title'] = ", ".join([a.name for a in item.artists[:2]])
             elif hasattr(item, 'description'):
                 data['sub_title'] = item.description
-
+            # 处理 Track 类型
             elif hasattr(item, 'album'):
                  data['sub_title'] = getattr(item.artist, 'name', '')
                 
@@ -2992,7 +3118,7 @@ class TidalBackend:
     def get_tracks(self, item):
         try:
             def _fetch():
-
+                # 1. 解包
                 resolved = item
                 if isinstance(resolved, dict) and 'obj' in resolved:
                     resolved = resolved['obj']
@@ -3000,8 +3126,8 @@ class TidalBackend:
                 item_type = type(resolved).__name__
                 item_id = getattr(resolved, 'id', None)
 
-
-
+                # 2. 优先通过当前 session 重新解析远端对象，避免使用挂在旧 session
+                # 上的 album/playlist object（挂起后更容易失效）。
                 if item_id:
                     logger.debug("Reloading %s with ID %s", item_type, item_id)
 
@@ -3039,7 +3165,7 @@ class TidalBackend:
                         alb = self.session.album(item_id)
                         return alb.tracks()
 
-
+                # 3. 回退到对象自带方法（适配部分本地/轻量对象）。
                 if hasattr(resolved, 'tracks') and callable(resolved.tracks):
                     return resolved.tracks()
                 if hasattr(resolved, 'items') and callable(resolved.items):
@@ -3113,7 +3239,7 @@ class TidalBackend:
 
     def get_artwork_url(self, obj, size=320):
         """
-        [Extended] Detect cover and avatar UUIDs across TIDAL objects, including LocalAlbum.
+        [增强版] 自动识别各种 Tidal 对象的封面/头像 UUID，支持 LocalAlbum
         """
         if isinstance(obj, dict) and 'obj' in obj: obj = obj['obj']
         if not obj: return None
@@ -3136,18 +3262,18 @@ class TidalBackend:
 
         uuid = None
 
-
-
+        # 1. 优先检查 cover_url (LocalAlbum 历史记录对象使用此属性)
+        # 以前这里直接返回，现在增加 UUID 检测
         raw_url = getattr(obj, 'cover_url', None)
         if raw_url:
             if isinstance(raw_url, str) and "http" in raw_url:
-                return raw_url
+                return raw_url # 已经是完整 URL
             elif isinstance(raw_url, str) and len(raw_url) > 20:
-                uuid = raw_url
+                uuid = raw_url # 是 UUID，留给后面处理
 
-
+        # 2. 如果没找到，尝试常规 Tidal 对象的属性 (picture/cover/images)
         if not uuid:
-
+            # 尝试调用方法
             for attr in ['picture', 'cover', 'image', 'square_image', 'square_picture', 'wide_image']:
                 val = getattr(obj, attr, None)
                 if val and callable(val):
@@ -3176,7 +3302,7 @@ class TidalBackend:
                     except Exception:
                         pass
             
-
+            # 检查 images 集合
             if hasattr(obj, 'images') and obj.images:
                 try:
                     if hasattr(obj.images, 'large'): return obj.images.large
@@ -3184,7 +3310,7 @@ class TidalBackend:
                 except Exception as e:
                     logger.debug("Failed to resolve artwork from images on %s: %s", type(obj).__name__, e)
 
-
+            # 属性探测
             check_attrs = ['picture_id', 'cover_id', 'picture', 'cover', 'image', 'avatar', 'square_image']
             for attr in check_attrs:
                 val = getattr(obj, attr, None)
@@ -3196,11 +3322,11 @@ class TidalBackend:
                     uuid = val
                     break
         
-
+        # 3. 如果还是没找到，且是单曲，尝试用专辑封面
         if not uuid and hasattr(obj, 'album') and obj.album:
             return self.get_artwork_url(obj.album, size)
 
-
+        # 4. 最终生成 URL
         if uuid:
             path = uuid.replace('-', '/')
             return f"https://resources.tidal.com/images/{path}/{size}x{size}.jpg"
@@ -3727,7 +3853,7 @@ class TidalBackend:
             self._cache_lyrics(track_id, None)
             return None
         except Exception as e:
-
+            # 404 是正常的（表示没歌词），不打印错误堆栈
             if "404" in str(e):
                 logger.debug("Lyrics result: 404 not found (no lyrics)")
                 self._cache_lyrics(track_id, None)

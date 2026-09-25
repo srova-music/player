@@ -234,6 +234,9 @@ def test_ui_has_default_filter_warning_grouping_and_fresh_cache_tokens():
     assert 'otherGroup.label = "Other system outputs";' in UI
     assert '" (Recommended)"' in UI
     assert '"Select a recommended output"' in UI
+    assert "current && current.output_selected === true" in UI
+    assert '"No output selected"' in UI
+    assert 'output_selected: output.output_selected' in UI
     assert "deviceSelect.insertBefore(chooseOption, deviceSelect.firstChild);" in UI
     assert (
         "Restart SROVA to activate the new audio-output safety controls."

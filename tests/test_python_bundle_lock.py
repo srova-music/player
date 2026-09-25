@@ -9,9 +9,11 @@ PACKAGE_SH = ROOT / "package.sh"
 
 EXPECTED = {
     "certifi": "2026.7.22",
+    "charset-normalizer": "3.4.9",
     "idna": "3.18",
     "isodate": "0.7.2",
     "mpegdash": "0.4.1",
+    "pillow": "12.3.0",
     "pyaes": "1.6.1",
     "pystray": "0.19.5",
     "python-dateutil": "2.9.0.post0",
@@ -44,7 +46,7 @@ def test_python_bundle_lock_contains_only_exact_unique_pins():
     rows = read_lock()
     parsed = {}
 
-    assert len(rows) == 15
+    assert len(rows) == 17
 
     for row in rows:
         match = re.fullmatch(
@@ -81,52 +83,3 @@ def test_package_script_uses_lock_without_dependency_resolution():
         "pip3 install tidalapi requests urllib3 pystray"
         not in text
     )
-
-def test_compiled_python_dependencies_are_system_supplied():
-    rows = read_lock()
-    text = PACKAGE_SH.read_text(encoding="utf-8")
-
-    assert not any(
-        row.startswith("pillow==")
-        for row in rows
-    )
-
-    assert not any(
-        row.startswith("charset-normalizer==")
-        for row in rows
-    )
-
-    assert text.count("python3-pil") == 2
-    assert text.count("python3-charset-normalizer") == 2
-
-    assert (
-        re.search(
-            r'^[ \t]*"PIL",[ \t]*$',
-            text,
-            re.MULTILINE,
-        )
-        is None
-    )
-
-    assert (
-        re.search(
-            r'^[ \t]*"charset_normalizer",[ \t]*$',
-            text,
-            re.MULTILINE,
-        )
-        is None
-    )
-
-    assert "-name '*.cpython-*.so'" in text
-    assert '"$INSTALL_DIR/libs/PIL"' in text
-    assert '"$INSTALL_DIR/libs/pillow.libs"' in text
-    assert '"$INSTALL_DIR/libs/charset_normalizer"' in text
-    assert "-iname 'pillow-*.dist-info'" in text
-    assert "-iname 'charset_normalizer-*.dist-info'" in text
-
-    assert (
-        "Portable Python bundle contains no build-host "
-        "CPython extensions"
-        in text
-    )
-

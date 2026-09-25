@@ -39,6 +39,7 @@ body:
         - Browser interface
         - Audio output
         - Packaging or installation
+        - Remote app
         - Other
     validations:
       required: true

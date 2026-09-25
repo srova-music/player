@@ -995,6 +995,24 @@ header > #settingsBtn.active {
     color: var(--srova-gold);
     word-break: break-all;
 }
+#qobuzLoginComplete {
+    margin-top: 18px;
+}
+
+#qobuzLoginComplete .loginInstruction {
+    margin: 0 0 10px;
+}
+
+#qobuzCallbackUrl {
+    width: 100%;
+    box-sizing: border-box;
+}
+
+#qobuzCompleteLoginBtn {
+    width: 100%;
+    margin-top: 10px;
+}
+
 .loginCancelBtn {
     background: transparent;
     color: var(--srova-cream);
@@ -1065,7 +1083,10 @@ header > #settingsBtn.active {
 .rowArrowLeft  { left: 0; }
 .rowArrowRight { right: 0; }
 
-.rowWrapper:hover .rowArrow { pointer-events: auto; opacity: 1; }
+.rowWrapper .rowArrow {
+    pointer-events: auto;
+    opacity: 1;
+}
 
 /* Decorative gold chevron positioned at the vertical midline of artwork */
 .rowWrapper::before,
@@ -2097,8 +2118,9 @@ body:not(.hires) #waveformBars span {
     transition: opacity 0.15s, color 0.15s !important;
 }
 
-.searchSection > .searchArtist:hover .searchArrow {
+.searchSection > .searchArtist .searchArrow {
     opacity: 1 !important;
+    visibility: visible !important;
     color: var(--srova-gold) !important;
 }
 
@@ -2315,6 +2337,225 @@ body:not(.hires) #waveformBars span {
 .playlistsLoading {
     color: var(--srova-muted) !important;
     font-family: var(--srova-body) !important;
+}
+
+/* ================================================================
+   V2.0 BF&P P2 — POLISHED PLAYLIST STATE PRESENTATION
+   ----------------------------------------------------------------
+   One shared visual language for initial loading, fetch failure,
+   empty provider libraries and empty playlist filters.
+   Fetch/retry semantics remain owned by ui.js provider loaders.
+   ================================================================ */
+
+.playlistsState {
+    width: 100% !important;
+    min-height: clamp(300px, 58vh, 660px) !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 16px !important;
+    box-sizing: border-box !important;
+    padding: 48px 24px 96px !important;
+    text-align: center !important;
+    color: var(--srova-gold) !important;
+}
+
+.playlistsStateMark {
+    position: relative !important;
+    width: 54px !important;
+    height: 54px !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    flex: 0 0 auto !important;
+    color: inherit !important;
+}
+
+.playlistsStateCore {
+    position: relative !important;
+    width: 93% !important;
+    height: 93% !important;
+    display: block !important;
+    overflow: hidden !important;
+    box-sizing: border-box !important;
+    border: 2px solid currentColor !important;
+    border-radius: 50% !important;
+    box-shadow:
+        0 0 0 1px rgba(0, 0, 0, 0.20) inset,
+        0 0 14px rgba(201, 168, 76, 0.08) !important;
+}
+
+.playlistsStateCore::after {
+    content: "" !important;
+    position: absolute !important;
+    left: 26% !important;
+    right: 26% !important;
+    top: 50% !important;
+    height: 1px !important;
+    transform: translateY(-50%) !important;
+    border-radius: 999px !important;
+    background: currentColor !important;
+    opacity: 0.30 !important;
+    pointer-events: none !important;
+}
+
+.playlistsStateBar {
+    display: block !important;
+    position: absolute !important;
+    top: 8% !important;
+    width: 1.7px !important;
+    height: 84% !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    border-radius: 999px !important;
+    background: currentColor !important;
+    opacity: 0.80 !important;
+    transform-origin: center center !important;
+    transform: translateX(-50%) scaleY(0.42);
+}
+
+.playlistsStateBar1 { left: 31% !important; }
+.playlistsStateBar2 { left: 40.5% !important; }
+.playlistsStateBar3 { left: 50% !important; }
+.playlistsStateBar4 { left: 59.5% !important; }
+.playlistsStateBar5 { left: 69% !important; }
+
+.playlistsStateText {
+    max-width: min(420px, 90vw) !important;
+    margin: 0 !important;
+    color: var(--srova-cream-dim) !important;
+    font-family: var(--srova-display) !important;
+    font-size: 12px !important;
+    font-weight: 400 !important;
+    letter-spacing: 0.16em !important;
+    line-height: 1.45 !important;
+    text-transform: uppercase !important;
+}
+
+.playlistsState[data-state="loading"] .playlistsStateCore {
+    animation:
+        srovaRoundLogoRingGlow
+        2s
+        ease-in-out
+        infinite
+        alternate !important;
+}
+
+.playlistsState[data-state="loading"] .playlistsStateCore::after {
+    opacity: 0 !important;
+}
+
+.playlistsState[data-state="loading"] .playlistsStateBar1 {
+    animation: srovaRoundLogoEq1 1.10s ease-in-out infinite alternate !important;
+}
+
+.playlistsState[data-state="loading"] .playlistsStateBar2 {
+    animation: srovaRoundLogoEq2 0.85s ease-in-out infinite alternate !important;
+    animation-delay: -0.30s !important;
+}
+
+.playlistsState[data-state="loading"] .playlistsStateBar3 {
+    animation: srovaRoundLogoEq3 0.95s ease-in-out infinite alternate !important;
+    animation-delay: -0.60s !important;
+}
+
+.playlistsState[data-state="loading"] .playlistsStateBar4 {
+    animation: srovaRoundLogoEq4 0.75s ease-in-out infinite alternate !important;
+    animation-delay: -0.15s !important;
+}
+
+.playlistsState[data-state="loading"] .playlistsStateBar5 {
+    animation: srovaRoundLogoEq5 1.05s ease-in-out infinite alternate !important;
+    animation-delay: -0.50s !important;
+}
+
+.playlistsState[data-state="empty"],
+.playlistsState[data-state="filter-empty"] {
+    color: var(--srova-gold-dim) !important;
+}
+
+.playlistsState[data-state="empty"] .playlistsStateCore,
+.playlistsState[data-state="filter-empty"] .playlistsStateCore {
+    filter: drop-shadow(0 0 3px rgba(201, 168, 76, 0.12)) !important;
+}
+
+.playlistsState[data-state="error"] {
+    color: var(--srova-cream-dim) !important;
+}
+
+.playlistsState[data-state="error"] .playlistsStateCore {
+    border-color: rgba(201, 168, 76, 0.60) !important;
+    filter: drop-shadow(0 0 3px rgba(201, 168, 76, 0.12)) !important;
+}
+
+.playlistsState[data-state="error"] .playlistsStateMark::after {
+    content: "!" !important;
+    position: absolute !important;
+    right: -5px !important;
+    bottom: -3px !important;
+    width: 19px !important;
+    height: 19px !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    box-sizing: border-box !important;
+    border: 1px solid rgba(240, 210, 122, 0.72) !important;
+    border-radius: 50% !important;
+    background: rgba(36, 14, 12, 0.96) !important;
+    color: var(--srova-gold-light) !important;
+    font-family: var(--srova-body) !important;
+    font-size: 12px !important;
+    font-weight: 600 !important;
+    line-height: 1 !important;
+    box-shadow: 0 0 8px rgba(192, 64, 64, 0.18) !important;
+}
+
+.playlistsState[data-state="filter-empty"] {
+    min-height: 220px !important;
+    padding-top: 42px !important;
+    padding-bottom: 42px !important;
+}
+
+.playlistsState[data-state="filter-empty"] .playlistsStateMark {
+    width: 42px !important;
+    height: 42px !important;
+}
+
+.playlistsState[data-state="filter-empty"] .playlistsStateText {
+    font-size: 11px !important;
+    color: var(--srova-muted) !important;
+}
+
+@media (max-width: 640px) {
+    .playlistsState {
+        min-height: clamp(260px, 54vh, 520px) !important;
+        gap: 14px !important;
+        padding: 38px 18px 78px !important;
+    }
+
+    .playlistsStateMark {
+        width: 50px !important;
+        height: 50px !important;
+    }
+
+    .playlistsStateText {
+        font-size: 11px !important;
+        letter-spacing: 0.14em !important;
+    }
+
+    .playlistsState[data-state="filter-empty"] {
+        min-height: 190px !important;
+        padding-top: 34px !important;
+        padding-bottom: 34px !important;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .playlistsState[data-state="loading"] .playlistsStateCore,
+    .playlistsState[data-state="loading"] .playlistsStateBar {
+        animation: none !important;
+    }
 }
 
 .playlistsSortBar {
@@ -8360,11 +8601,18 @@ body.radioMode #npBtnNext {
     color: rgba(224, 112, 112, 0.82) !important;
 }
 
-.track:hover .trackHeart,
-.track:hover .trackAddBtn,
-.track:hover .trackRemoveBtn,
-.trackHeart.faved {
+.trackHeart,
+.trackAddBtn,
+.trackRemoveBtn {
     opacity: 1 !important;
+    visibility: visible !important;
+}
+
+/* Q8G: playlist actions must remain visible on pointer and touch UIs. */
+.streamingPlaylistTrack .trackAddBtn,
+.playlistEditableTrack .trackRemoveBtn {
+    opacity: 1 !important;
+    visibility: visible !important;
 }
 
 .trackHeart:hover,
@@ -11111,19 +11359,13 @@ body.is-radio-reordering-drag {
     right: 8px !important;
 }
 
-.artistTopTracksSection > .track:hover .trackHeart,
-.artistTopTracksSection > .track:hover .trackAddBtn,
-.artistTopTracksSection .trackHeart.faved {
+.artistTopTracksSection .trackHeart,
+.artistTopTracksSection .trackAddBtn {
     opacity: 1 !important;
+    visibility: visible !important;
 }
 
-@media (hover: none), (pointer: coarse) {
-    .artistTopTracksSection .trackHeart,
-    .artistTopTracksSection .trackAddBtn,
-    .searchSection .searchArrow {
-        opacity: 1 !important;
-    }
-}
+
 
 /* ================================================================
    MOBILE / TABLET TECH TRAY WIDTH LOCK -- 300426_1327
@@ -14544,7 +14786,7 @@ header > #headerHomeBtn {
 .srovaSearchTopRow {
     min-height: 64px !important;
     display: grid !important;
-    grid-template-columns: 48px minmax(0, 1fr) auto 34px !important;
+    grid-template-columns: 48px minmax(0, 1fr) auto max-content !important;
     align-items: center !important;
     gap: 13px !important;
     padding: 8px 12px !important;
@@ -14800,6 +15042,24 @@ header > #headerHomeBtn {
     color: var(--srova-cream-dim) !important;
 }
 
+.srovaSearchTopActions,
+.srovaSearchCardActions {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: flex-end !important;
+    flex-wrap: nowrap !important;
+    gap: 4px !important;
+}
+
+.srovaSearchTopActions {
+    min-width: 30px !important;
+}
+
+.srovaSearchCardActions {
+    min-height: 30px !important;
+    margin-top: 8px !important;
+}
+
 .srovaSearchActionBtn {
     width: 30px !important;
     height: 30px !important;
@@ -14826,8 +15086,12 @@ header > #headerHomeBtn {
     cursor: default !important;
 }
 
+/* ================================================================
+   Q10I SEARCH FAVORITE FILLED GOLD PARITY -- 150926
+   ================================================================ */
+
 .srovaSearchHeart.faved {
-    color: #d75c5c !important;
+    color: var(--srova-gold) !important;
 }
 
 .srovaSearchAlbumGrid {
@@ -15258,7 +15522,7 @@ header > #headerHomeBtn {
     max-width: none !important;
     min-height: 72px !important;
     display: grid !important;
-    grid-template-columns: 62px minmax(0, 1fr) !important;
+    grid-template-columns: 62px minmax(0, 1fr) 34px !important;
     grid-template-rows: auto auto !important;
     align-items: center !important;
     gap: 2px 12px !important;
@@ -15386,6 +15650,24 @@ header > #headerHomeBtn {
 
 .srovaSearchAlbumGrid.artworkViewList .srovaSearchEyebrow {
     margin-bottom: 5px !important;
+}
+
+/* ================================================================
+   Q10I SEARCH PROVIDER PRESENTATION PARITY -- 150926
+   ----------------------------------------------------------------
+   Album Search list mode:
+   artwork | metadata | Favorite
+   Shared by TIDAL and Qobuz.
+   ================================================================ */
+
+.srovaSearchAlbumGrid.artworkViewList
+.srovaSearchCardActions {
+    grid-column: 3 !important;
+    grid-row: 1 / 3 !important;
+    align-self: center !important;
+    justify-self: end !important;
+    margin: 0 !important;
+    min-height: 30px !important;
 }
 
 #tidalSourceSearchResults .searchSection.artworkViewSupported.artworkViewList .searchArrow {
@@ -19590,7 +19872,8 @@ body.srovaPlaybackPlaying #playerBar .playerInfinitePlaySvgRecraft {
 
 /* TIDAL source header: identity left, Back upper-right,
    source selector lower-right beside STREAMING LIBRARY. */
-#homeView .srovaTidalSourcePage .srovaSourcePageHeader {
+#homeView .srovaTidalSourcePage .srovaSourcePageHeader,
+#homeView .srovaQobuzSourcePage .srovaSourcePageHeader {
     max-width: none !important;
     margin-bottom: 14px !important;
     grid-template-columns: minmax(0, 1fr) auto !important;
@@ -19603,19 +19886,22 @@ body.srovaPlaybackPlaying #playerBar .playerInfinitePlaySvgRecraft {
     row-gap: 0 !important;
 }
 
-#homeView .srovaTidalSourcePage .srovaSourcePageIdentity {
+#homeView .srovaTidalSourcePage .srovaSourcePageIdentity,
+#homeView .srovaQobuzSourcePage .srovaSourcePageIdentity {
     grid-area: identity !important;
     min-width: 0 !important;
     align-self: stretch !important;
 }
 
-#homeView .srovaTidalSourcePage .srovaSourceBack {
+#homeView .srovaTidalSourcePage .srovaSourceBack,
+#homeView .srovaQobuzSourcePage .srovaSourceBack {
     grid-area: back !important;
     justify-self: end !important;
     align-self: start !important;
 }
 
-#homeView .srovaTidalSourcePage .srovaSourceSwitcher {
+#homeView .srovaTidalSourcePage .srovaSourceSwitcher,
+#homeView .srovaQobuzSourcePage .srovaSourceSwitcher {
     grid-area: switcher !important;
     grid-column: auto !important;
     grid-row: auto !important;
@@ -19682,12 +19968,14 @@ body.srovaPlaybackPlaying #playerBar .playerInfinitePlaySvgRecraft {
 
 /* Tablet layouts. */
 @media (max-width: 900px) {
-    #homeView .srovaTidalSourcePage .srovaSourcePageHeader {
+    #homeView .srovaTidalSourcePage .srovaSourcePageHeader,
+    #homeView .srovaQobuzSourcePage .srovaSourcePageHeader {
         column-gap: 14px !important;
         margin-bottom: 12px !important;
     }
 
-    #homeView .srovaTidalSourcePage .srovaSourceSwitcher {
+    #homeView .srovaTidalSourcePage .srovaSourceSwitcher,
+    #homeView .srovaQobuzSourcePage .srovaSourceSwitcher {
         gap: 16px !important;
     }
 
@@ -19699,12 +19987,14 @@ body.srovaPlaybackPlaying #playerBar .playerInfinitePlaySvgRecraft {
 
 /* Phone layouts. */
 @media (max-width: 640px) {
-    #homeView .srovaTidalSourcePage .srovaSourcePageHeader {
+    #homeView .srovaTidalSourcePage .srovaSourcePageHeader,
+    #homeView .srovaQobuzSourcePage .srovaSourcePageHeader {
         column-gap: 10px !important;
         margin-bottom: 10px !important;
     }
 
-    #homeView .srovaTidalSourcePage .srovaSourceSwitcher {
+    #homeView .srovaTidalSourcePage .srovaSourceSwitcher,
+    #homeView .srovaQobuzSourcePage .srovaSourceSwitcher {
         max-width: min(58vw, 230px) !important;
         gap: 12px !important;
         overflow-x: auto !important;
@@ -19712,7 +20002,8 @@ body.srovaPlaybackPlaying #playerBar .playerInfinitePlaySvgRecraft {
     }
 
     #homeView .srovaTidalSourcePage
-        .srovaSourceSwitcher::-webkit-scrollbar {
+        .srovaSourceSwitcher::-webkit-scrollbar,
+    #homeView .srovaQobuzSourcePage .srovaSourceSwitcher::-webkit-scrollbar {
         display: none !important;
     }
 
@@ -19773,7 +20064,8 @@ body.srovaPlaybackPlaying #playerBar .playerInfinitePlaySvgRecraft {
 
 /* Desktop seam closure. */
 @media (min-width: 901px) {
-    #homeView .srovaTidalSourcePage .srovaSourcePageHeader {
+    #homeView .srovaTidalSourcePage .srovaSourcePageHeader,
+    #homeView .srovaQobuzSourcePage .srovaSourcePageHeader {
         margin-bottom: 0 !important;
     }
 
@@ -19788,7 +20080,8 @@ body.srovaPlaybackPlaying #playerBar .playerInfinitePlaySvgRecraft {
     (max-width: 900px) and
     (orientation: portrait) {
 
-    #homeView .srovaTidalSourcePage .srovaSourcePageHeader {
+    #homeView .srovaTidalSourcePage .srovaSourcePageHeader,
+    #homeView .srovaQobuzSourcePage .srovaSourcePageHeader {
         /*
          * Keep SOURCE 03 below the measured leather-header edge.
          */
@@ -19818,7 +20111,8 @@ body.srovaPlaybackPlaying #playerBar .playerInfinitePlaySvgRecraft {
     (max-height: 560px) and
     (max-width: 640px) {
 
-    #homeView .srovaTidalSourcePage .srovaSourcePageHeader {
+    #homeView .srovaTidalSourcePage .srovaSourcePageHeader,
+    #homeView .srovaQobuzSourcePage .srovaSourcePageHeader {
         margin-bottom: 0 !important;
     }
 
@@ -19834,7 +20128,8 @@ body.srovaPlaybackPlaying #playerBar .playerInfinitePlaySvgRecraft {
     (min-width: 641px) and
     (max-width: 900px) {
 
-    #homeView .srovaTidalSourcePage .srovaSourcePageHeader {
+    #homeView .srovaTidalSourcePage .srovaSourcePageHeader,
+    #homeView .srovaQobuzSourcePage .srovaSourcePageHeader {
         margin-bottom: 0 !important;
     }
 
@@ -19850,7 +20145,8 @@ body.srovaPlaybackPlaying #playerBar .playerInfinitePlaySvgRecraft {
     (min-width: 901px) and
     (max-width: 1180px) {
 
-    #homeView .srovaTidalSourcePage .srovaSourcePageHeader {
+    #homeView .srovaTidalSourcePage .srovaSourcePageHeader,
+    #homeView .srovaQobuzSourcePage .srovaSourcePageHeader {
         margin-bottom: 0 !important;
     }
 
@@ -22145,4 +22441,2244 @@ img.icon {
    This must outrank the high-specificity Now Playing button layout rules. */
 #nowPlayingView #npBtnAlbum.hidden {
     display: none !important;
+}
+
+/* Q7D Qobuz SOURCE 03 wall */
+#homeView .srovaStreamingProviderBar {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: flex-end !important;
+    gap: 10px !important;
+    margin: 8px 0 22px !important;
+}
+
+#homeView .srovaStreamingProviderBar .srovaSourceSwitchItem {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    text-align: center !important;
+    box-sizing: border-box !important;
+    min-width: 88px !important;
+    height: 34px !important;
+    padding: 0 14px !important;
+    line-height: 1 !important;
+}
+
+#homeView .srovaStreamingProviderBar .srovaSourceSwitchItem.active {
+    padding: 0 14px !important;
+}
+
+#homeView .srovaQobuzWallSlot {
+    min-height: 92px !important;
+}
+
+#homeView .srovaQobuzWallState {
+    min-height: 92px !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 13px !important;
+    padding: 18px 20px !important;
+    text-align: center !important;
+    color: rgba(237, 230, 211, 0.62) !important;
+}
+
+#homeView .srovaQobuzWallStateText {
+    font-family: var(--srova-display) !important;
+    font-size: 12px !important;
+    line-height: 1.45 !important;
+    letter-spacing: 0.04em !important;
+}
+
+#homeView .srovaQobuzActionRow {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    padding: 3px 0 24px !important;
+}
+
+#homeView .srovaQobuzActionButton {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    text-align: center !important;
+    box-sizing: border-box !important;
+    min-width: 112px !important;
+    height: 34px !important;
+    padding: 0 14px !important;
+    line-height: 1 !important;
+    border-color: rgba(201, 168, 76, 0.42) !important;
+    background: rgba(201, 168, 76, 0.065) !important;
+    color: var(--srova-gold-light) !important;
+}
+
+#homeView .srovaQobuzActionButton:disabled {
+    opacity: 0.48 !important;
+    cursor: default !important;
+}
+
+@media (max-width: 720px) {
+    #homeView .srovaStreamingProviderBar {
+        justify-content: flex-start !important;
+        overflow-x: auto !important;
+        scrollbar-width: none !important;
+        margin-top: 5px !important;
+        margin-bottom: 18px !important;
+    }
+
+    #homeView .srovaStreamingProviderBar::-webkit-scrollbar {
+        display: none !important;
+    }
+
+    #homeView .srovaStreamingProviderBar .srovaSourceSwitchItem,
+    #homeView .srovaQobuzActionButton {
+        height: 32px !important;
+        padding: 0 12px !important;
+    }
+}
+
+/* Q7D: provider tabs are shown only when both streaming
+   providers are authenticated. */
+#homeView .srovaStreamingProviderBar[hidden] {
+    display: none !important;
+}
+
+/* ================================================================
+   Q7E-E1 -- STREAMING ALBUM HEADER / LOCAL MUSIC PARITY
+   ----------------------------------------------------------------
+   Local Music remains the visual reference and is unchanged.
+
+   TIDAL Album:
+   Artist -> Title -> Stats
+
+   Qobuz Album:
+   Artist -> Title -> Catalogue quality -> Stats
+
+   Qobuz catalogue quality uses the established SROVA quality logic:
+   Hi-Res gold; CD-quality cyan.
+   ================================================================ */
+
+#albumView.tidalAlbumDetail #albumArtist {
+    order: 1 !important;
+    margin: 0 0 2px !important;
+    max-width: 760px !important;
+    color: rgba(237, 230, 211, 0.72) !important;
+    font-family: var(--srova-body) !important;
+    font-size: 14px !important;
+    font-weight: 300 !important;
+    line-height: 1.35 !important;
+}
+
+#albumView.tidalAlbumDetail #albumTitle {
+    order: 2 !important;
+}
+
+#albumView.tidalAlbumDetail
+    #albumTechInfo.qobuzAlbumTechInfo {
+    order: 3 !important;
+    display: inline-flex !important;
+    visibility: visible !important;
+    width: auto !important;
+    height: auto !important;
+    min-width: 0 !important;
+    min-height: 0 !important;
+    max-width: 100% !important;
+    max-height: none !important;
+    margin: 4px 0 0 !important;
+    padding: 0 !important;
+    border: 0 !important;
+    overflow: visible !important;
+    align-items: center !important;
+    justify-content: flex-start !important;
+    background: transparent !important;
+    font-family: var(--srova-body) !important;
+    font-size: 13px !important;
+    font-weight: 400 !important;
+    letter-spacing: 0.04em !important;
+    line-height: 1.35 !important;
+    text-transform: none !important;
+}
+
+#albumView.tidalAlbumDetail
+    #albumTechInfo.qobuzAlbumTechInfoHiRes {
+    color: var(--srova-gold) !important;
+    text-shadow:
+        0 0 14px rgba(201, 168, 76, 0.18) !important;
+}
+
+#albumView.tidalAlbumDetail
+    #albumTechInfo.qobuzAlbumTechInfoCd {
+    color: var(--srova-cyan) !important;
+    text-shadow:
+        0 0 14px rgba(0, 191, 255, 0.16) !important;
+}
+
+#albumView.tidalAlbumDetail
+    #albumStatsLine.streamingAlbumStatsLine {
+    order: 4 !important;
+    display: block !important;
+    visibility: visible !important;
+    margin: 0 !important;
+    color: rgba(237, 230, 211, 0.5) !important;
+    font-family: var(--srova-body) !important;
+    font-size: 13px !important;
+    font-weight: 300 !important;
+    line-height: 1.35 !important;
+    letter-spacing: 0.02em !important;
+}
+
+/* ================================================================
+   Q7E-E1 -- ALBUM SOURCE CONTEXT LABEL
+   ----------------------------------------------------------------
+   Small source-orientation eyebrow for the three album views:
+   MUSIC / TIDAL / QOBUZ.
+   ================================================================ */
+
+#albumView.localAlbumDetail
+    #albumSourceLabel.albumSourceLabel,
+#albumView.tidalAlbumDetail
+    #albumSourceLabel.albumSourceLabel {
+    order: 0 !important;
+    display: block !important;
+    visibility: visible !important;
+    width: auto !important;
+    max-width: max-content !important;
+    margin: 0 0 1px !important;
+    padding: 0 !important;
+    color: rgba(201, 168, 76, 0.72) !important;
+    font-family: var(--srova-display) !important;
+    font-size: 10px !important;
+    font-weight: 400 !important;
+    letter-spacing: 0.22em !important;
+    line-height: 1.2 !important;
+    text-transform: uppercase !important;
+}
+
+#albumSourceLabel.hidden {
+    display: none !important;
+}
+
+/* ================================================================
+   Q7E-E2B — Qobuz Artist Editorial
+   ================================================================ */
+
+#albumView.tidalArtistDetail .qobuzArtistBiographySection,
+#albumView.tidalArtistDetail .qobuzArtistSimilarSection {
+    margin-top: 34px !important;
+}
+
+#albumView.tidalArtistDetail .qobuzArtistBiographyText {
+    max-width: 1080px !important;
+    color: var(--srova-cream-dim) !important;
+    font-family: var(--srova-body) !important;
+    font-size: 14px !important;
+    font-weight: 300 !important;
+    line-height: 1.7 !important;
+    white-space: pre-line !important;
+}
+
+#albumView.tidalArtistDetail .qobuzArtistSimilarSection > .rowWrapper {
+    margin-top: 14px !important;
+}
+
+@media (max-width: 640px) {
+    #albumView.tidalArtistDetail .qobuzArtistBiographyText {
+        font-size: 13px !important;
+        line-height: 1.65 !important;
+    }
+}
+
+/* ================================================================
+   Q7F-F2 — provider-aware global playlist selector
+   ================================================================ */
+
+#playlistsContent > .playlistsProviderBar {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 8px !important;
+    width: 100% !important;
+    box-sizing: border-box !important;
+    padding: 10px 24px !important;
+    border-bottom: 1px solid var(--srova-border) !important;
+    background: var(--srova-black) !important;
+}
+
+#playlistsContent
+    > .playlistsProviderBar
+    > .srovaSourceSwitchItem {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    min-width: 104px !important;
+    min-height: 30px !important;
+    box-sizing: border-box !important;
+    padding: 6px 14px !important;
+    border: 1px solid var(--srova-border) !important;
+    border-radius: 0 !important;
+    background: transparent !important;
+    color: var(--srova-cream-dim) !important;
+    font-family: var(--srova-display) !important;
+    font-size: 10px !important;
+    font-weight: 400 !important;
+    letter-spacing: 0.14em !important;
+    line-height: 1 !important;
+    text-align: center !important;
+    cursor: pointer !important;
+}
+
+#playlistsContent
+    > .playlistsProviderBar
+    > .srovaSourceSwitchItem:hover,
+#playlistsContent
+    > .playlistsProviderBar
+    > .srovaSourceSwitchItem.active {
+    color: var(--srova-gold) !important;
+    border-color: var(--srova-border-s) !important;
+    background: var(--srova-gold-glow) !important;
+}
+
+@media (max-width: 560px) {
+    #playlistsContent > .playlistsProviderBar {
+        padding-left: 16px !important;
+        padding-right: 16px !important;
+    }
+
+    #playlistsContent
+        > .playlistsProviderBar
+        > .srovaSourceSwitchItem {
+        flex: 1 1 0 !important;
+        min-width: 0 !important;
+    }
+}
+
+/* ================================================================
+   Q7E-E3 QOBUZ WALL QUALITY COLOUR PARITY -- 080926
+   ----------------------------------------------------------------
+   Qobuz exposes normalized resolution metadata, so its source-wall
+   Album / Track captions follow the same resting quality language
+   already used by Local Music:
+     CD-quality -> cyan
+     Hi-Res     -> gold
+   Cards without authoritative quality metadata remain neutral.
+   ================================================================ */
+
+#homeView .srovaQobuzSourcePage
+    .album[data-q="cd"] .album-title {
+    color: rgba(0, 191, 255, 0.74) !important;
+}
+
+#homeView .srovaQobuzSourcePage
+    .album[data-q="cd"] .album-artist {
+    color: rgba(0, 191, 255, 0.58) !important;
+}
+
+#homeView .srovaQobuzSourcePage
+    .album[data-q="hires"] .album-title {
+    color: rgba(201, 168, 76, 0.84) !important;
+}
+
+#homeView .srovaQobuzSourcePage
+    .album[data-q="hires"] .album-artist {
+    color: rgba(201, 168, 76, 0.64) !important;
+}
+
+/* ================================================================
+   Q7G-G1 QOBUZ FULL LIBRARY QUALITY PARITY -- 080926
+   ----------------------------------------------------------------
+   Qobuz My Albums / My Tracks full walls preserve the same
+   authoritative catalogue-quality language as the SOURCE 03 wall:
+     CD-quality -> cyan
+     Hi-Res     -> gold
+   Unknown / unavailable quality remains neutral.
+   TIDAL My Albums / My Songs are intentionally unaffected.
+   ================================================================ */
+
+#myAlbumsGrid
+    .qobuzLibraryGrid
+    .libraryCard[data-q="cd"]
+    .libraryCardTitle,
+#mySongsGrid
+    .qobuzSavedTracksList
+    .librarySongRow[data-q="cd"]
+    .librarySongTitle {
+    color: rgba(0, 191, 255, 0.74) !important;
+}
+
+#myAlbumsGrid
+    .qobuzLibraryGrid
+    .libraryCard[data-q="cd"]
+    .libraryCardSub,
+#mySongsGrid
+    .qobuzSavedTracksList
+    .librarySongRow[data-q="cd"]
+    .librarySongSub {
+    color: rgba(0, 191, 255, 0.58) !important;
+}
+
+#myAlbumsGrid
+    .qobuzLibraryGrid
+    .libraryCard[data-q="hires"]
+    .libraryCardTitle,
+#mySongsGrid
+    .qobuzSavedTracksList
+    .librarySongRow[data-q="hires"]
+    .librarySongTitle {
+    color: rgba(201, 168, 76, 0.84) !important;
+}
+
+#myAlbumsGrid
+    .qobuzLibraryGrid
+    .libraryCard[data-q="hires"]
+    .libraryCardSub,
+#mySongsGrid
+    .qobuzSavedTracksList
+    .librarySongRow[data-q="hires"]
+    .librarySongSub {
+    color: rgba(201, 168, 76, 0.64) !important;
+}
+
+/* ================================================================
+   Q7G-G2 QOBUZ PROVIDER-LOCAL SEARCH FOUNDATION -- 080926
+   ----------------------------------------------------------------
+   Qobuz SOURCE 03 search mirrors the locked TIDAL search geometry
+   while remaining provider-local. Result-item integration is G3.
+   ================================================================ */
+
+#qobuzSourceSearchBox {
+    height: 42px !important;
+    border: 1px solid var(--srova-border) !important;
+    background: rgba(15, 15, 15, 0.88) !important;
+    display: flex !important;
+    align-items: center !important;
+    gap: 12px !important;
+    padding: 0 14px !important;
+    box-sizing: border-box !important;
+}
+
+#qobuzSourceSearchBox .material-icons {
+    color: var(--srova-gold) !important;
+    font-size: 19px !important;
+}
+
+#qobuzSourceSearchInput {
+    flex: 1 !important;
+    min-width: 0 !important;
+    height: 100% !important;
+    border: 0 !important;
+    outline: 0 !important;
+    background: transparent !important;
+    color: var(--srova-cream) !important;
+    font-family: var(--srova-body) !important;
+    font-size: 14px !important;
+    font-weight: 300 !important;
+    line-height: normal !important;
+}
+
+#qobuzSourceSearchInput::placeholder {
+    color: var(--srova-muted) !important;
+}
+
+#qobuzSourceSearchStatus {
+    color: var(--srova-muted) !important;
+    font-family: var(--srova-body) !important;
+    font-size: 13px !important;
+}
+
+#qobuzSourceSearchWrap,
+#qobuzSourceSearchResults {
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    box-sizing: border-box !important;
+}
+
+#homeView
+    .srovaQobuzSourcePage
+    #qobuzSourceSearchToolbar {
+    position: sticky !important;
+    top: 206px !important;
+    z-index: 80 !important;
+    width: 100% !important;
+    min-width: 0 !important;
+    margin: 0 !important;
+    padding: 0 0 12px !important;
+    background:
+        linear-gradient(
+            180deg,
+            rgba(8, 8, 8, 0.985),
+            rgba(8, 8, 8, 0.955)
+        ),
+        var(--srova-black) !important;
+    box-sizing: border-box !important;
+}
+
+#homeView
+    .srovaQobuzSourcePage
+    #qobuzSourceSearchBox {
+    display: flex !important;
+    align-items: center !important;
+    width: min(520px, 100%) !important;
+    max-width: 520px !important;
+    min-width: 0 !important;
+    margin: 0 !important;
+    box-sizing: border-box !important;
+}
+
+#homeView
+    .srovaQobuzSourcePage
+    #qobuzSourceSearchStatus {
+    width: min(520px, 100%) !important;
+    max-width: 520px !important;
+    min-width: 0 !important;
+    padding: 7px 2px 0 !important;
+    box-sizing: border-box !important;
+}
+
+#homeView
+    .srovaQobuzSourcePage
+    #qobuzSourceSearchStatus:empty {
+    display: none !important;
+}
+
+.qobuzSourceSearchSummaryGrid {
+    display: grid !important;
+    grid-template-columns:
+        repeat(4, minmax(0, 1fr)) !important;
+    gap: 12px !important;
+}
+
+.qobuzSourceSearchSummary {
+    min-width: 0 !important;
+    padding: 18px 16px !important;
+    border:
+        1px solid
+        rgba(201, 168, 76, 0.16) !important;
+    background:
+        rgba(14, 14, 14, 0.76) !important;
+    box-sizing: border-box !important;
+}
+
+.qobuzSourceSearchSummaryLabel {
+    color: var(--srova-muted) !important;
+    font-family: var(--srova-display) !important;
+    font-size: 11px !important;
+    letter-spacing: 0.12em !important;
+    text-transform: uppercase !important;
+}
+
+.qobuzSourceSearchSummaryCount {
+    margin-top: 8px !important;
+    color: var(--srova-cream) !important;
+    font-family: var(--srova-display) !important;
+    font-size: 24px !important;
+    font-weight: 200 !important;
+}
+
+.qobuzSourceSearchCategoryFoundation,
+.qobuzSourceSearchErrorText {
+    color: var(--srova-muted) !important;
+    font-family: var(--srova-body) !important;
+    font-size: 13px !important;
+    padding: 12px 0 !important;
+}
+
+.qobuzSourceSearchError {
+    display: flex !important;
+    flex-wrap: wrap !important;
+    align-items: center !important;
+    gap: 12px !important;
+    padding: 8px 0 20px !important;
+}
+
+.qobuzSourceSearchRetry {
+    min-width: 92px !important;
+    min-height: 34px !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    text-align: center !important;
+    padding: 9px 14px 7px !important;
+    border:
+        1px solid
+        rgba(201, 168, 76, 0.36) !important;
+    border-radius: 0 !important;
+    background:
+        rgba(15, 15, 15, 0.86) !important;
+    color: var(--srova-cream-dim) !important;
+    font-family: var(--srova-display) !important;
+    font-size: 11px !important;
+    line-height: 1 !important;
+    letter-spacing: 0.12em !important;
+    text-transform: uppercase !important;
+    box-sizing: border-box !important;
+    cursor: pointer !important;
+}
+
+.qobuzSourceSearchRetry:hover,
+.qobuzSourceSearchRetry:active {
+    color: var(--srova-gold) !important;
+    border-color:
+        rgba(201, 168, 76, 0.72) !important;
+    background:
+        rgba(201, 168, 76, 0.10) !important;
+}
+
+@media (max-width: 900px) {
+    #homeView
+        .srovaQobuzSourcePage
+        #qobuzSourceSearchToolbar {
+        top: 180px !important;
+        padding-bottom: 10px !important;
+    }
+
+    .qobuzSourceSearchSummaryGrid {
+        grid-template-columns:
+            repeat(2, minmax(0, 1fr)) !important;
+    }
+}
+
+@media (max-width: 640px) {
+    #homeView
+        .srovaQobuzSourcePage
+        #qobuzSourceSearchToolbar {
+        top: 162px !important;
+        padding-bottom: 8px !important;
+    }
+
+    #homeView
+        .srovaQobuzSourcePage
+        #qobuzSourceSearchBox {
+        height: 38px !important;
+        gap: 7px !important;
+        padding-left: 8px !important;
+        padding-right: 8px !important;
+    }
+
+    #homeView
+        .srovaQobuzSourcePage
+        #qobuzSourceSearchBox
+        .material-icons {
+        font-size: 17px !important;
+    }
+
+    #homeView
+        .srovaQobuzSourcePage
+        #qobuzSourceSearchInput {
+        font-size: 12px !important;
+    }
+}
+
+@media (min-width: 901px) {
+    #homeView
+        .srovaQobuzSourcePage
+        #qobuzSourceSearchToolbar {
+        top: 198px !important;
+    }
+
+    #homeView
+        .srovaQobuzSourcePage
+        #qobuzSourceSearchBox,
+    #homeView
+        .srovaQobuzSourcePage
+        #qobuzSourceSearchStatus {
+        margin-left: 18px !important;
+    }
+}
+
+@media
+    (min-width: 701px) and
+    (max-width: 900px) and
+    (orientation: portrait) {
+
+    #homeView
+        .srovaQobuzSourcePage
+        #qobuzSourceSearchToolbar {
+        top:
+            calc(
+                var(--srova-app-header-offset, 80px) +
+                102px
+            ) !important;
+    }
+}
+
+@media
+    (orientation: landscape) and
+    (max-height: 560px) and
+    (max-width: 640px) {
+
+    #homeView
+        .srovaQobuzSourcePage
+        #qobuzSourceSearchToolbar {
+        top: 156px !important;
+    }
+}
+
+@media
+    (orientation: landscape) and
+    (max-height: 560px) and
+    (min-width: 641px) and
+    (max-width: 900px) {
+
+    #homeView
+        .srovaQobuzSourcePage
+        #qobuzSourceSearchToolbar {
+        top: 174px !important;
+    }
+}
+
+@media
+    (orientation: landscape) and
+    (max-height: 560px) and
+    (min-width: 901px) and
+    (max-width: 1180px) {
+
+    #homeView
+        .srovaQobuzSourcePage
+        #qobuzSourceSearchToolbar {
+        top: 190px !important;
+    }
+}
+
+/* ================================================================
+   Q7G-G2P -- SOURCE SEARCH STICKY CONTROL PARITY
+   ----------------------------------------------------------------
+   My Music is the visual reference.
+
+   TIDAL and Qobuz keep their provider selector in the same sticky
+   control row as provider-local Search.
+
+   Local Music, TIDAL and Qobuz Search also expose one compact
+   physically-centred clear control at the right edge of the field.
+   ================================================================ */
+
+.srovaInlineSearchClear {
+    flex: 0 0 auto !important;
+    width: 28px !important;
+    min-width: 28px !important;
+    height: 28px !important;
+    min-height: 28px !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    background: transparent !important;
+    color: rgba(237, 230, 211, 0.58) !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    text-align: center !important;
+    line-height: 1 !important;
+    box-sizing: border-box !important;
+    cursor: pointer !important;
+}
+
+.srovaInlineSearchClear.hidden {
+    display: none !important;
+}
+
+.srovaInlineSearchClear > .material-icons {
+    width: auto !important;
+    height: auto !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    color: inherit !important;
+    font-size: 18px !important;
+    line-height: 1 !important;
+    display: block !important;
+}
+
+.srovaInlineSearchClear:hover,
+.srovaInlineSearchClear:active,
+.srovaInlineSearchClear:focus-visible {
+    color: var(--srova-gold) !important;
+    background: rgba(201, 168, 76, 0.08) !important;
+    outline: none !important;
+}
+
+.srovaInlineSearchClear:disabled {
+    opacity: 0.42 !important;
+    cursor: default !important;
+}
+
+
+/* One streaming sticky row: Search left, provider buttons right. */
+#homeView
+    .srovaTidalSourcePage
+    .srovaStreamingStickyControls,
+#homeView
+    .srovaQobuzSourcePage
+    .srovaStreamingStickyControls {
+    position: sticky !important;
+    top: 206px !important;
+    z-index: 80 !important;
+    width: 100% !important;
+    min-width: 0 !important;
+    margin: 0 !important;
+    padding: 0 0 12px !important;
+    display: grid !important;
+    grid-template-columns: minmax(220px, 538px) auto !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+    gap: 14px !important;
+    background:
+        linear-gradient(
+            180deg,
+            rgba(8, 8, 8, 0.985),
+            rgba(8, 8, 8, 0.955)
+        ),
+        var(--srova-black) !important;
+    border-bottom:
+        1px solid
+        rgba(201, 168, 76, 0.10) !important;
+    box-shadow:
+        0 14px 28px
+        rgba(0, 0, 0, 0.20) !important;
+    box-sizing: border-box !important;
+}
+
+
+/* Search toolbar is now a child of the sticky row, not sticky itself. */
+#homeView
+    .srovaTidalSourcePage
+    .srovaStreamingStickyControls
+    #tidalSourceSearchToolbar,
+#homeView
+    .srovaQobuzSourcePage
+    .srovaStreamingStickyControls
+    #qobuzSourceSearchToolbar {
+    position: static !important;
+    top: auto !important;
+    z-index: auto !important;
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    box-sizing: border-box !important;
+}
+
+
+/* Keep the established 520px search width and desktop shelf inset. */
+#homeView
+    .srovaTidalSourcePage
+    .srovaStreamingStickyControls
+    #tidalSourceSearchBox,
+#homeView
+    .srovaQobuzSourcePage
+    .srovaStreamingStickyControls
+    #qobuzSourceSearchBox {
+    width: min(520px, 100%) !important;
+    max-width: 520px !important;
+    min-width: 0 !important;
+}
+
+
+/* Provider controls now occupy the right side of the sticky row. */
+#homeView
+    .srovaTidalSourcePage
+    .srovaStreamingStickyControls
+    .srovaStreamingProviderBar,
+#homeView
+    .srovaQobuzSourcePage
+    .srovaStreamingStickyControls
+    .srovaStreamingProviderBar {
+    align-self: center !important;
+    justify-self: end !important;
+    justify-content: flex-end !important;
+    flex-wrap: nowrap !important;
+    overflow-x: visible !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    gap: 10px !important;
+}
+
+
+/* Match the Local Music tablet sticky relationship. */
+@media (max-width: 900px) {
+    #homeView
+        .srovaTidalSourcePage
+        .srovaStreamingStickyControls,
+    #homeView
+        .srovaQobuzSourcePage
+        .srovaStreamingStickyControls {
+        top: 180px !important;
+        grid-template-columns:
+            minmax(0, 1fr)
+            auto !important;
+        gap: 10px !important;
+        padding-bottom: 10px !important;
+    }
+}
+
+
+/* Match the Local Music phone sticky relationship. */
+@media (max-width: 640px) {
+    #homeView
+        .srovaTidalSourcePage
+        .srovaStreamingStickyControls,
+    #homeView
+        .srovaQobuzSourcePage
+        .srovaStreamingStickyControls {
+        top: 162px !important;
+        grid-template-columns:
+            minmax(0, 1fr)
+            auto !important;
+        gap: 6px !important;
+        padding-bottom: 8px !important;
+    }
+
+    #homeView
+        .srovaTidalSourcePage
+        .srovaStreamingStickyControls
+        .srovaStreamingProviderBar,
+    #homeView
+        .srovaQobuzSourcePage
+        .srovaStreamingStickyControls
+        .srovaStreamingProviderBar {
+        gap: 5px !important;
+    }
+
+    #homeView
+        .srovaStreamingStickyControls
+        .srovaStreamingProviderBar
+        .srovaSourceSwitchItem {
+        min-width: 72px !important;
+        height: 30px !important;
+        padding: 0 8px !important;
+        font-size: 9px !important;
+    }
+
+    .srovaInlineSearchClear {
+        width: 24px !important;
+        min-width: 24px !important;
+        height: 24px !important;
+        min-height: 24px !important;
+    }
+
+    .srovaInlineSearchClear > .material-icons {
+        font-size: 16px !important;
+    }
+}
+
+
+/* Desktop seam closure matches Local Music. */
+@media (min-width: 901px) {
+    #homeView
+        .srovaTidalSourcePage
+        .srovaStreamingStickyControls,
+    #homeView
+        .srovaQobuzSourcePage
+        .srovaStreamingStickyControls {
+        top: 198px !important;
+    }
+}
+
+
+/* Tablet portrait measured-header relationship. */
+@media
+    (min-width: 701px) and
+    (max-width: 900px) and
+    (orientation: portrait) {
+
+    #homeView
+        .srovaTidalSourcePage
+        .srovaStreamingStickyControls,
+    #homeView
+        .srovaQobuzSourcePage
+        .srovaStreamingStickyControls {
+        top:
+            calc(
+                var(--srova-app-header-offset, 80px) +
+                102px
+            ) !important;
+    }
+}
+
+
+/* Mobile Landscape — narrow CSS viewport. */
+@media
+    (orientation: landscape) and
+    (max-height: 560px) and
+    (max-width: 640px) {
+
+    #homeView
+        .srovaTidalSourcePage
+        .srovaStreamingStickyControls,
+    #homeView
+        .srovaQobuzSourcePage
+        .srovaStreamingStickyControls {
+        top: 156px !important;
+    }
+}
+
+
+/* Mobile Landscape — medium CSS viewport. */
+@media
+    (orientation: landscape) and
+    (max-height: 560px) and
+    (min-width: 641px) and
+    (max-width: 900px) {
+
+    #homeView
+        .srovaTidalSourcePage
+        .srovaStreamingStickyControls,
+    #homeView
+        .srovaQobuzSourcePage
+        .srovaStreamingStickyControls {
+        top: 174px !important;
+    }
+}
+
+
+/* Mobile Landscape — wider high-density CSS viewport. */
+@media
+    (orientation: landscape) and
+    (max-height: 560px) and
+    (min-width: 901px) and
+    (max-width: 1180px) {
+
+    #homeView
+        .srovaTidalSourcePage
+        .srovaStreamingStickyControls,
+    #homeView
+        .srovaQobuzSourcePage
+        .srovaStreamingStickyControls {
+        top: 190px !important;
+    }
+}
+
+
+/* ================================================================
+   Q7G-G3 QOBUZ PROVIDER SEARCH RESULT INTEGRATION -- 090926
+   ----------------------------------------------------------------
+   Reuse the locked SROVA search card/row geometry while keeping
+   Qobuz actions, identity and quality presentation provider-local.
+   ================================================================ */
+
+#qobuzSourceSearchResults,
+#qobuzSourceSearchResults .srovaSearchShell,
+#qobuzSourceSearchResults .srovaSearchHeader,
+#qobuzSourceSearchResults .srovaSearchPanel {
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    box-sizing: border-box !important;
+}
+
+.qobuzSourceSearchTrackHead,
+.qobuzSourceSearchTrackRow {
+    grid-template-columns:
+        38px
+        46px
+        minmax(160px, 1.5fr)
+        minmax(120px, 1fr)
+        minmax(120px, 1fr)
+        58px
+        36px
+        36px
+        !important;
+}
+
+.qobuzSourceSearchAlbumCard[data-q="cd"]
+    .srovaSearchCardTitle,
+.qobuzSourceSearchTrackRow[data-q="cd"]
+    .srovaSearchTrackTitle,
+.qobuzSourceSearchTopRow[data-q="cd"]
+    .srovaSearchTopTitle {
+    color: rgba(0, 191, 255, 0.74) !important;
+}
+
+.qobuzSourceSearchAlbumCard[data-q="cd"]
+    .srovaSearchCardSub,
+.qobuzSourceSearchTrackRow[data-q="cd"]
+    .srovaSearchTrackArtist,
+.qobuzSourceSearchTrackRow[data-q="cd"]
+    .srovaSearchTrackAlbum,
+.qobuzSourceSearchTopRow[data-q="cd"]
+    .srovaSearchTopSub {
+    color: rgba(0, 191, 255, 0.58) !important;
+}
+
+.qobuzSourceSearchAlbumCard[data-q="hires"]
+    .srovaSearchCardTitle,
+.qobuzSourceSearchTrackRow[data-q="hires"]
+    .srovaSearchTrackTitle,
+.qobuzSourceSearchTopRow[data-q="hires"]
+    .srovaSearchTopTitle {
+    color: rgba(201, 168, 76, 0.84) !important;
+}
+
+.qobuzSourceSearchAlbumCard[data-q="hires"]
+    .srovaSearchCardSub,
+.qobuzSourceSearchTrackRow[data-q="hires"]
+    .srovaSearchTrackArtist,
+.qobuzSourceSearchTrackRow[data-q="hires"]
+    .srovaSearchTrackAlbum,
+.qobuzSourceSearchTopRow[data-q="hires"]
+    .srovaSearchTopSub {
+    color: rgba(201, 168, 76, 0.64) !important;
+}
+
+.qobuzSourceSearchPlaylistCard > img {
+    border-radius: 0 !important;
+}
+
+@media (max-width: 820px) {
+    .qobuzSourceSearchTrackRow {
+        grid-template-columns:
+            30px
+            42px
+            minmax(0, 1fr)
+            34px
+            34px
+            !important;
+    }
+
+    .qobuzSourceSearchTrackRow
+        .srovaSearchTrackArtist,
+    .qobuzSourceSearchTrackRow
+        .srovaSearchTrackAlbum,
+    .qobuzSourceSearchTrackRow
+        .srovaSearchTrackTime {
+        display: none !important;
+    }
+}
+
+/* ================================================================
+   Q7H H4 PROVIDER RADIO MOBILE PORTRAIT BACK UPPER RIGHT -- 090926
+   ----------------------------------------------------------------
+   Provider Radio detail only.
+
+   Restore the established upper-right Back position for:
+   - TIDAL Radio entered from SOURCE 01
+   - Qobuz provider Radio detail
+
+   Ordinary TIDAL Mix, Playlist, Album and every non-Radio detail
+   retain their existing responsive geometry.
+
+   Mobile Landscape, tablet and desktop remain unchanged.
+   ================================================================ */
+
+@media
+    (max-width: 640px) and
+    (orientation: portrait) {
+
+    #albumView.tidalTrackDetail.providerRadioDetail
+        #albumHeader {
+        grid-template-columns:
+            128px minmax(0, 1fr) auto !important;
+        grid-template-areas:
+            "info info info"
+            "art . actions" !important;
+    }
+
+    #albumView.tidalTrackDetail.providerRadioDetail
+        #albumHeader > #backBtn {
+        position: absolute !important;
+        top: 16px !important;
+        right: 14px !important;
+        bottom: auto !important;
+        left: auto !important;
+        z-index: 30 !important;
+        grid-area: auto !important;
+        align-self: auto !important;
+        justify-self: auto !important;
+        margin: 0 !important;
+        transform: none !important;
+    }
+}
+
+/* ================================================================
+   Q7G G5 -- MOBILE PORTRAIT ALBUM BACK UPPER RIGHT
+   ----------------------------------------------------------------
+   Album detail views only, Mobile Portrait only.
+
+   Local / TIDAL / Qobuz:
+   - restore Back to the independent upper-right header position;
+   - remove Back from the artwork/action row;
+   - keep artwork at the established left position;
+   - right-align the remaining album actions into the freed space.
+
+   Qobuz albums share tidalAlbumDetail with TIDAL albums, so the
+   streaming selector intentionally covers both providers.
+
+   Playlists, mixes, artists, featured track lists, Mobile Landscape,
+   tablets and desktop remain unchanged.
+   ================================================================ */
+
+@media
+    (max-width: 640px) and
+    (orientation: portrait) {
+
+    #albumView.localAlbumDetail #albumHeader,
+    #albumView.tidalAlbumDetail #albumHeader {
+        position: relative !important;
+
+        grid-template-columns:
+            128px minmax(0, 1fr) auto !important;
+
+        grid-template-areas:
+            "info info info"
+            "art . actions" !important;
+
+        align-items: end !important;
+        justify-content: start !important;
+
+        column-gap: 12px !important;
+        row-gap: 14px !important;
+        padding-bottom: 14px !important;
+    }
+
+    #albumView.localAlbumDetail
+        #albumHeader > div:not(#albumQueueBtnGroup),
+    #albumView.tidalAlbumDetail
+        #albumHeader > div:not(#albumQueueBtnGroup) {
+        grid-area: info !important;
+        min-width: 0 !important;
+        width: 100% !important;
+        padding-right: 48px !important;
+        margin: 0 !important;
+    }
+
+    #albumView.localAlbumDetail
+        #albumHeader > #albumArt,
+    #albumView.tidalAlbumDetail
+        #albumHeader > #albumArt {
+        grid-area: art !important;
+        align-self: end !important;
+        justify-self: start !important;
+        margin: 0 !important;
+    }
+
+    #albumView.localAlbumDetail
+        #albumQueueBtnGroup,
+    #albumView.tidalAlbumDetail
+        #albumQueueBtnGroup {
+        grid-area: actions !important;
+
+        width: auto !important;
+        min-width: 0 !important;
+
+        margin: 0 !important;
+
+        align-self: end !important;
+        justify-self: end !important;
+        justify-content: flex-end !important;
+
+        flex-wrap: nowrap !important;
+    }
+
+    #albumView.localAlbumDetail
+        #albumHeader > #backBtn,
+    #albumView.tidalAlbumDetail
+        #albumHeader > #backBtn {
+        position: absolute !important;
+
+        top: 16px !important;
+        right: 14px !important;
+        bottom: auto !important;
+        left: auto !important;
+
+        z-index: 40 !important;
+
+        grid-area: auto !important;
+        align-self: auto !important;
+        justify-self: auto !important;
+
+        margin: 0 !important;
+        transform: none !important;
+    }
+}
+
+/* ================================================================
+   Q9D — SERVICE-AWARE INFINITE PLAY / AUTO-MIX PROVIDER SELECTORS
+   ----------------------------------------------------------------
+   TIDAL left / QOBUZ right with a physical two-position switch.
+   Visible only while both providers are authenticated.
+   ================================================================ */
+
+#settingsView .q9dProviderTitleRow {
+    display: flex !important;
+    align-items: center !important;
+    flex-wrap: wrap !important;
+    column-gap: 16px !important;
+    row-gap: 8px !important;
+}
+
+#settingsView .q9dProviderTitleLead {
+    display: inline-flex !important;
+    align-items: center !important;
+    gap: 10px !important;
+    white-space: nowrap !important;
+}
+
+#settingsView .q9dProviderSelectorRow {
+    display: grid !important;
+    grid-template-columns:
+        minmax(72px, auto)
+        58px
+        minmax(72px, auto) !important;
+    align-items: center !important;
+    justify-content: start !important;
+    width: max-content !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    gap: 12px !important;
+    box-sizing: border-box !important;
+}
+
+#settingsView .q9dProviderSelectorRow[hidden] {
+    display: none !important;
+}
+
+#settingsView .q9dProviderSelectorLabel {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+
+    min-width: 72px !important;
+    min-height: 40px !important;
+
+    margin: 0 !important;
+    padding: 6px 8px !important;
+
+    border: 0 !important;
+    border-radius: 0 !important;
+
+    background: transparent !important;
+    color: var(--srova-cream-dim) !important;
+
+    font-family: var(--srova-display) !important;
+    font-size: 10px !important;
+    font-weight: 400 !important;
+    letter-spacing: 0.18em !important;
+    line-height: 1 !important;
+    text-align: center !important;
+    text-transform: uppercase !important;
+
+    box-sizing: border-box !important;
+    cursor: pointer !important;
+
+    opacity: 0.62 !important;
+
+    transition:
+        color 0.18s,
+        opacity 0.18s,
+        text-shadow 0.18s !important;
+}
+
+#settingsView
+.q9dProviderSelectorLabel:hover:not(:disabled) {
+    color: var(--srova-gold) !important;
+    opacity: 0.9 !important;
+}
+
+#settingsView
+.q9dProviderSelectorLabel.q9dProviderSelectorLabelActive {
+    color: var(--srova-gold) !important;
+    opacity: 1 !important;
+    text-shadow:
+        0 0 10px rgba(201, 168, 76, 0.18) !important;
+}
+
+#settingsView .q9dProviderSelectorSwitch {
+    position: relative !important;
+
+    display: block !important;
+
+    width: 58px !important;
+    min-width: 58px !important;
+    height: 28px !important;
+    min-height: 28px !important;
+
+    margin: 0 !important;
+    padding: 0 !important;
+
+    border:
+        1px solid rgba(201, 168, 76, 0.46) !important;
+    border-radius: 999px !important;
+
+    background:
+        rgba(11, 11, 11, 0.9) !important;
+
+    box-sizing: border-box !important;
+    cursor: pointer !important;
+
+    box-shadow:
+        inset 0 0 0 1px rgba(0, 0, 0, 0.32),
+        0 0 10px rgba(201, 168, 76, 0.025) !important;
+
+    transition:
+        border-color 0.18s,
+        background 0.18s,
+        box-shadow 0.18s !important;
+}
+
+#settingsView .q9dProviderSelectorSwitch::before {
+    content: "" !important;
+
+    position: absolute !important;
+    top: 3px !important;
+    left: 4px !important;
+
+    width: 20px !important;
+    height: 20px !important;
+
+    border-radius: 50% !important;
+
+    background: var(--srova-gold) !important;
+
+    box-shadow:
+        0 0 0 1px rgba(0, 0, 0, 0.34),
+        0 0 9px rgba(201, 168, 76, 0.28) !important;
+
+    transform: translateX(0) !important;
+
+    transition:
+        transform 0.20s ease,
+        box-shadow 0.18s !important;
+}
+
+#settingsView
+.q9dProviderSelectorSwitch.q9dProviderSelectorSwitchQobuz {
+    border-color:
+        rgba(201, 168, 76, 0.72) !important;
+
+    background:
+        rgba(201, 168, 76, 0.10) !important;
+}
+
+#settingsView
+.q9dProviderSelectorSwitch.q9dProviderSelectorSwitchQobuz::before {
+    transform: translateX(28px) !important;
+}
+
+#settingsView
+.q9dProviderSelectorSwitch:hover:not(:disabled) {
+    border-color:
+        rgba(201, 168, 76, 0.82) !important;
+
+    box-shadow:
+        inset 0 0 0 1px rgba(0, 0, 0, 0.32),
+        0 0 14px rgba(201, 168, 76, 0.09) !important;
+}
+
+#settingsView
+.q9dProviderSelectorSwitch:active:not(:disabled)::before {
+    box-shadow:
+        0 0 0 1px rgba(0, 0, 0, 0.34),
+        0 0 13px rgba(201, 168, 76, 0.40) !important;
+}
+
+#settingsView .q9dProviderSelectorLabel:disabled,
+#settingsView .q9dProviderSelectorSwitch:disabled {
+    cursor: wait !important;
+    opacity: 0.52 !important;
+}
+
+#settingsView
+.q9dProviderSelectorRow.q9dProviderSelectorPlaybackLocked {
+    opacity: 0.46 !important;
+    filter: grayscale(1) saturate(0.12) !important;
+}
+
+#settingsView
+.q9dProviderSelectorRow.q9dProviderSelectorPlaybackLocked
+.q9dProviderSelectorLabel,
+#settingsView
+.q9dProviderSelectorRow.q9dProviderSelectorPlaybackLocked
+.q9dProviderSelectorSwitch {
+    cursor: not-allowed !important;
+}
+
+@media (max-width: 700px) {
+    #settingsView .q9dProviderTitleRow {
+        column-gap: 8px !important;
+        row-gap: 6px !important;
+    }
+
+    #settingsView .q9dProviderSelectorRow {
+        grid-template-columns:
+            minmax(48px, auto)
+            58px
+            minmax(48px, auto) !important;
+        gap: 6px !important;
+    }
+
+    #settingsView .q9dProviderSelectorLabel {
+        min-width: 48px !important;
+        min-height: 42px !important;
+        padding-left: 2px !important;
+        padding-right: 2px !important;
+    }
+}
+
+
+/* Q10D AUTH UX REFINEMENT */
+#loginUrl.qobuzAuthChoiceBtn,
+#qobuzManualLoginUrl.qobuzAuthChoiceBtn {
+    width: 100% !important;
+    min-height: 42px !important;
+    box-sizing: border-box !important;
+    text-decoration: none !important;
+    word-break: normal !important;
+    text-align: center !important;
+    cursor: pointer !important;
+}
+
+#loginUrl.qobuzAuthChoiceBtn {
+    margin-top: 15px !important;
+}
+
+.qobuzManualLoginWrap {
+    margin: 10px 0 0 !important;
+}
+
+#qobuzLoginComplete {
+    margin-top: 20px !important;
+    padding-top: 18px !important;
+    border-top: 1px solid var(--srova-border) !important;
+}
+
+#qobuzLoginComplete .loginInstruction {
+    color: var(--srova-cream-dim) !important;
+    line-height: 1.45 !important;
+}
+
+.qobuzHandoffBody {
+    min-height: 100vh;
+    margin: 0;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    box-sizing: border-box;
+    background:
+        radial-gradient(
+            circle at 50% 5%,
+            rgba(201, 168, 76, 0.13),
+            transparent 34%
+        ),
+        linear-gradient(
+            145deg,
+            #0d0c0a,
+            #050505 64%
+        );
+    color: var(--srova-cream);
+    font-family:
+        "Helvetica Neue",
+        Arial,
+        sans-serif;
+}
+
+.qobuzHandoffCard {
+    width: min(520px, 100%);
+    box-sizing: border-box;
+    padding: 38px 38px 34px;
+    background:
+        linear-gradient(
+            145deg,
+            rgba(20, 18, 14, 0.98),
+            rgba(8, 8, 8, 0.99)
+        );
+    border: 1px solid rgba(201, 168, 76, 0.42);
+    box-shadow:
+        inset 0 1px 0 rgba(255, 244, 202, 0.06),
+        0 28px 90px rgba(0, 0, 0, 0.62),
+        0 0 40px rgba(201, 168, 76, 0.07);
+}
+
+.qobuzHandoffWordmark {
+    display: block;
+    width: 132px;
+    max-width: 45%;
+    height: auto;
+    margin: 0 0 34px;
+    opacity: 0.92;
+}
+
+.qobuzHandoffProvider {
+    margin: 0 0 10px;
+    color: var(--srova-gold);
+    font-size: 10px;
+    font-weight: 400;
+    letter-spacing: 0.30em;
+    line-height: 1;
+}
+
+.qobuzHandoffCard h1 {
+    margin: 0 0 24px;
+    color: var(--srova-gold-light);
+    font-family:
+        "Helvetica Neue",
+        Arial,
+        sans-serif;
+    font-size: 28px;
+    font-weight: 300;
+    letter-spacing: 0.035em;
+    line-height: 1.15;
+}
+
+.qobuzHandoffCard p {
+    margin: 0 0 13px;
+    color: var(--srova-cream);
+    font-size: 15px;
+    font-weight: 300;
+    line-height: 1.55;
+}
+
+.qobuzHandoffNote {
+    margin-top: 25px;
+    padding-top: 17px;
+    border-top: 1px solid var(--srova-border);
+    color: var(--srova-muted);
+    font-size: 12px;
+    font-weight: 300;
+    letter-spacing: 0.025em;
+    line-height: 1.45;
+}
+
+.qobuzHandoffError {
+    border-color: rgba(192, 64, 64, 0.48);
+}
+
+@media (max-width: 560px) {
+    .qobuzHandoffBody {
+        padding: 16px;
+    }
+
+    .qobuzHandoffCard {
+        padding: 30px 24px 27px;
+    }
+
+    .qobuzHandoffWordmark {
+        margin-bottom: 28px;
+    }
+
+    .qobuzHandoffCard h1 {
+        font-size: 24px;
+    }
+}
+
+
+/* ================================================================
+   Q10F — Provider-aware Go To Album chooser
+   Reuses the established Infinite Play menu-button visual language.
+   ================================================================ */
+
+.nowPlayingAlbumProviderMenu {
+    position: fixed !important;
+    z-index: 520 !important;
+    width: 188px !important;
+    max-width: calc(100vw - 16px) !important;
+    padding: 8px !important;
+    box-sizing: border-box !important;
+    border: 1px solid rgba(245, 210, 122, 0.22) !important;
+    border-radius: 8px !important;
+    background:
+        linear-gradient(
+            180deg,
+            rgba(20, 20, 21, 0.985) 0%,
+            rgba(7, 7, 8, 0.985) 100%
+        ) !important;
+    box-shadow:
+        0 12px 30px rgba(0, 0, 0, 0.62),
+        0 0 0 1px rgba(0, 0, 0, 0.64),
+        inset 0 1px 0 rgba(255, 244, 202, 0.07),
+        inset 0 0 22px rgba(212, 175, 55, 0.035) !important;
+}
+
+.nowPlayingAlbumProviderMenu.hidden {
+    display: none !important;
+}
+
+.nowPlayingAlbumProviderMenu
+.playerInfinitePlayMenuBtn {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    text-align: center !important;
+    min-height: 38px !important;
+    padding: 0 11px !important;
+}
+
+.nowPlayingAlbumProviderMenu
+.playerInfinitePlayMenuBtn::after {
+    display: none !important;
+}
+
+.nowPlayingAlbumProviderMenu
+.playerInfinitePlayMenuBtn + .playerInfinitePlayMenuBtn {
+    margin-top: 6px !important;
+}
+
+/* ================================================================
+   Q10H MOBILE PORTRAIT BACK-ARROW PARITY -- 150926
+   ----------------------------------------------------------------
+   Scope:
+   - TIDAL Playlist detail
+   - Qobuz Playlist detail
+   - TIDAL Mix detail
+   - Qobuz Track detail
+
+   Mobile Portrait only.
+
+   Albums are excluded because their established Q7G treatment
+   already places Back at upper-right.
+
+   Provider Radio detail is excluded because its established Q7H
+   treatment already places Back at upper-right.
+
+   Navigation behavior is unchanged.
+   ================================================================ */
+
+@media
+    (max-width: 640px) and
+    (orientation: portrait) {
+
+    #albumView.tidalTrackDetail:not(.tidalAlbumDetail):not(.providerRadioDetail)
+        #albumHeader {
+        position: relative !important;
+
+        grid-template-columns:
+            128px minmax(0, 1fr) auto !important;
+
+        grid-template-areas:
+            "info info info"
+            "art . actions" !important;
+    }
+
+    #albumView.tidalTrackDetail:not(.tidalAlbumDetail):not(.providerRadioDetail)
+        #albumHeader > div:not(#albumQueueBtnGroup) {
+        min-width: 0 !important;
+        width: 100% !important;
+        padding-right: 48px !important;
+        box-sizing: border-box !important;
+    }
+
+    #albumView.tidalTrackDetail:not(.tidalAlbumDetail):not(.providerRadioDetail)
+        #albumHeader > #backBtn {
+        position: absolute !important;
+
+        top: 16px !important;
+        right: 14px !important;
+        bottom: auto !important;
+        left: auto !important;
+
+        z-index: 40 !important;
+
+        grid-area: auto !important;
+        align-self: auto !important;
+        justify-self: auto !important;
+
+        margin: 0 !important;
+        transform: none !important;
+    }
+}
+
+/* ================================================================
+   Q10I FAVORITE HEARTS ALWAYS VISIBLE -- 150926
+
+   Favorite Hearts are primary controls on pointer AND touch UIs.
+   Empty and filled Hearts therefore remain visible at rest.
+   Hover may enhance colour, but never controls visibility.
+
+   Intentional exception:
+   Internet Radio may still hide #npBtnHeart via display:none because
+   that surface has no provider Favorite operation.
+   ================================================================ */
+
+.trackHeart,
+.artistTopTracksSection .trackHeart,
+#albumView .artistTopTracksSection.artworkViewList .trackHeart,
+.srovaSearchHeart,
+#albumHeaderHeart,
+#npBtnHeart {
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+/* ================================================================
+   Q10I ARTIST TOP TRACK HEART METADATA PLACEMENT -- 150926
+
+   Artist Top Tracks:
+   - keep artwork clear of Favorite control
+   - remove rank number from artwork mode; retain list-mode numbering
+   - retain Add/queue control behavior
+   - put duration at metadata bottom-left
+   - put Favorite Heart at metadata bottom-right
+   - preserve permanent Heart visibility for touch/pointer parity
+   ================================================================ */
+
+#albumView .artistTopTracksSection:not(.artworkViewList) > .track {
+    grid-template-columns:
+        minmax(0, 1fr) 30px !important;
+    grid-template-rows:
+        var(--srova-tile-size)
+        auto
+        auto
+        30px !important;
+}
+
+#albumView .artistTopTracksSection:not(.artworkViewList) .artistTrackThumb {
+    grid-column: 1 / -1 !important;
+    grid-row: 1 !important;
+}
+
+#albumView .artistTopTracksSection:not(.artworkViewList) .track-title {
+    grid-column: 1 / -1 !important;
+    grid-row: 2 !important;
+}
+
+#albumView .artistTopTracksSection:not(.artworkViewList) .track-artist {
+    grid-column: 1 / -1 !important;
+    grid-row: 3 !important;
+}
+
+#albumView .artistTopTracksSection:not(.artworkViewList) .track-duration {
+    grid-column: 1 !important;
+    grid-row: 4 !important;
+    justify-self: start !important;
+    align-self: center !important;
+    width: auto !important;
+    margin: 0 !important;
+}
+
+#albumView .artistTopTracksSection:not(.artworkViewList) .trackHeart {
+    position: static !important;
+
+    top: auto !important;
+    right: auto !important;
+    bottom: auto !important;
+    left: auto !important;
+
+    grid-column: 2 !important;
+    grid-row: 4 !important;
+
+    justify-self: end !important;
+    align-self: center !important;
+
+    width: 28px !important;
+    min-width: 28px !important;
+    height: 28px !important;
+
+    margin: 0 !important;
+    padding: 0 !important;
+
+    transform: none !important;
+
+    opacity: 1 !important;
+    visibility: visible !important;
+
+    background: transparent !important;
+    border-color: transparent !important;
+}
+
+/* ================================================================
+   Q10I POINTER PARITY AND ARTIST ACTION CLEANUP -- 150926
+
+   Functional pointer/touch parity:
+   - Favorite/Add/Remove controls never depend on hover visibility
+   - Search Artist navigation arrow never depends on hover
+   - horizontal shelf navigation arrow never depends on hover
+   - Artist Top Tracks artwork mode has no rank-number overlay
+   - Artist Top Tracks list mode retains normal numbering
+   - decorative hover feedback remains presentation-only
+   ================================================================ */
+
+.trackHeart,
+.trackAddBtn,
+.trackRemoveBtn,
+.artistTopTracksSection .trackHeart,
+.artistTopTracksSection .trackAddBtn {
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+.searchSection > .searchArtist .searchArrow {
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+.rowWrapper .rowArrow {
+    opacity: 1 !important;
+    pointer-events: auto !important;
+}
+
+#albumView
+.artistTopTracksSection:not(.artworkViewList)
+.track-num {
+    display: none !important;
+}
+
+/* ================================================================
+   Q10I ARTIST TOP TRACK ADD FOOTER PLACEMENT -- 150926
+
+   Shared TIDAL / Qobuz Artist Top Tracks artwork-card presentation:
+   - artwork contains no persistent Add control
+   - duration remains footer-left
+   - Favorite Heart remains footer-right
+   - Add sits immediately to the right of Favorite
+   - Add has no semi-opaque artwork box
+   - list-mode geometry remains owned by the established
+     artworkViewList rules
+   - Radio reorder handle intentionally excluded because it is a
+     temporary, user-initiated interaction rather than a persistent
+     artwork control
+   ================================================================ */
+
+#albumView .artistTopTracksSection:not(.artworkViewList) > .track {
+    grid-template-columns:
+        minmax(0, 1fr)
+        28px
+        28px !important;
+    column-gap: 4px !important;
+}
+
+#albumView .artistTopTracksSection:not(.artworkViewList) .trackAddBtn {
+    position: static !important;
+    top: auto !important;
+    right: auto !important;
+    bottom: auto !important;
+    left: auto !important;
+
+    grid-column: 3 !important;
+    grid-row: 4 !important;
+
+    justify-self: end !important;
+    align-self: center !important;
+
+    width: 28px !important;
+    min-width: 28px !important;
+    height: 28px !important;
+
+    margin: 0 !important;
+    padding: 0 !important;
+
+    transform: none !important;
+
+    opacity: 1 !important;
+    visibility: visible !important;
+
+    background: transparent !important;
+    border-color: transparent !important;
+    box-shadow: none !important;
+}
+
+/* ================================================================
+   Q10I SHORT DETAIL PAGE PHANTOM-SCROLL CORRECTION -- 160926
+   ----------------------------------------------------------------
+   The shared #albumView is in normal document flow below the SROVA
+   application header. Its historical min-height:100vh therefore makes
+   a short detail page one header-height taller than the viewport.
+
+   Use natural content height instead. Existing track-list/detail bottom
+   padding remains untouched so long pages retain Player Bar clearance.
+   Albums, playlists, mixes, tracks and artists still grow normally when
+   their real content exceeds the viewport.
+   ================================================================ */
+
+#albumView {
+    min-height: 0 !important;
+}
+
+/* ================================================================
+   SP3B SPOTIFY SETTINGS MANAGEMENT
+   ----------------------------------------------------------------
+   Settings-only management surface. Spotify remains outside SROVA's
+   source, playback, queue, volume and Now Playing presentation.
+   ================================================================ */
+
+#settings-tab-panel-spotify,
+#settingsView .spotifySettingsSection,
+#settingsView .spotifySettingsStack,
+#settingsView .spotifySettingsBlock {
+    min-width: 0 !important;
+    box-sizing: border-box !important;
+}
+
+#settingsView .spotifySettingsIntro {
+    max-width: 820px !important;
+    line-height: 1.55 !important;
+}
+
+#settingsView .spotifySettingsSetupNote {
+    max-width: 820px !important;
+    margin-bottom: 22px !important;
+}
+
+#settingsView .spotifySettingsStack {
+    display: block !important;
+    width: 100% !important;
+    max-width: 900px !important;
+}
+
+#settingsView .spotifySettingsBlock {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 12px !important;
+    width: 100% !important;
+    padding: 22px 0 !important;
+    overflow: hidden !important;
+    border-top: 1px solid var(--srova-border) !important;
+}
+
+#settingsView .spotifySettingsBlockTitle {
+    margin: 0 !important;
+    color: var(--srova-cream-dim) !important;
+    font-family: var(--srova-display) !important;
+    font-size: 12px !important;
+    font-weight: 400 !important;
+    letter-spacing: 0.16em !important;
+    line-height: 1.25 !important;
+    text-transform: uppercase !important;
+}
+
+#settingsView .spotifySettingsPrimaryStatus,
+#settingsView .spotifySettingsKeyState {
+    overflow-wrap: anywhere !important;
+    color: var(--srova-cream) !important;
+    font-family: var(--srova-body) !important;
+    font-size: 15px !important;
+    font-weight: 300 !important;
+    line-height: 1.35 !important;
+}
+
+#settingsView .spotifySettingsKeyState {
+    color: var(--srova-gold) !important;
+    font-family: var(--srova-display) !important;
+    font-size: 11px !important;
+    letter-spacing: 0.12em !important;
+}
+
+#settingsView .spotifySettingsFieldHelp,
+#settingsView .spotifySettingsStatusDetail {
+    min-height: 32px !important;
+    line-height: 1.45 !important;
+}
+
+#settingsView .spotifySettingsInput {
+    display: block !important;
+    width: 100% !important;
+    min-width: 0 !important;
+    min-height: 42px !important;
+    box-sizing: border-box !important;
+}
+
+#settingsView .spotifySettingsActions {
+    display: flex !important;
+    align-items: stretch !important;
+    justify-content: flex-start !important;
+    flex-wrap: wrap !important;
+    gap: 10px !important;
+    margin-top: auto !important;
+}
+
+#settingsView .spotifySettingsAction {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    min-height: 42px !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+    text-align: center !important;
+    white-space: normal !important;
+    line-height: 1 !important;
+}
+
+#settingsView .spotifySettingsAction:disabled {
+    opacity: 0.48 !important;
+    cursor: not-allowed !important;
+}
+
+#settingsView .spotifySettingsFeedback {
+    min-height: 18px !important;
+    overflow-wrap: anywhere !important;
+    line-height: 1.45 !important;
+}
+
+#settingsView .spotifySettingsFeedback.isError {
+    color: #e07070 !important;
+}
+
+#settingsView .spotifyControlToggleRow {
+    max-width: none !important;
+    padding-top: 0 !important;
+}
+
+#settingsView .spotifyArtifactDetails {
+    display: grid !important;
+    grid-template-columns: minmax(88px, auto) minmax(0, 1fr) !important;
+    gap: 8px 14px !important;
+    margin: 0 !important;
+    font-family: var(--srova-body) !important;
+    font-size: 13px !important;
+    font-weight: 300 !important;
+    line-height: 1.35 !important;
+}
+
+#settingsView .spotifyArtifactDetails dt {
+    color: var(--srova-muted) !important;
+}
+
+#settingsView .spotifyArtifactDetails dd {
+    min-width: 0 !important;
+    margin: 0 !important;
+    overflow-wrap: anywhere !important;
+    color: var(--srova-cream-dim) !important;
+}
+
+@media (max-width: 520px) {
+    #settingsView .spotifySettingsSection {
+        padding-left: 16px !important;
+        padding-right: 16px !important;
+    }
+
+    #settingsView .spotifySettingsActions {
+        flex-direction: column !important;
+        align-items: stretch !important;
+    }
+
+    #settingsView .spotifySettingsAction {
+        width: 100% !important;
+    }
+
+    #settingsView .spotifyArtifactDetails {
+        grid-template-columns: minmax(0, 1fr) !important;
+        gap: 3px !important;
+    }
+
+    #settingsView .spotifyArtifactDetails dd + dt {
+        margin-top: 8px !important;
+    }
+}
+
+html.srovaAndroidApkWebView #settingsView .spotifySettingsAction {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+}
+
+/* ================================================================
+   SP3C GLOBAL NATIVE PLAYBACK BLOCKER
+   ================================================================ */
+
+body.nativePlaybackBlocked {
+    overflow: hidden !important;
+}
+
+body.nativePlaybackBlocked > header,
+body.nativePlaybackBlocked > #homeView,
+body.nativePlaybackBlocked > #searchView,
+body.nativePlaybackBlocked > #albumView,
+body.nativePlaybackBlocked > #playlistsView,
+body.nativePlaybackBlocked > #queueView,
+body.nativePlaybackBlocked > #myAlbumsView,
+body.nativePlaybackBlocked > #mySongsView,
+body.nativePlaybackBlocked > #localMusicView,
+body.nativePlaybackBlocked > #nowPlayingView,
+body.nativePlaybackBlocked > #playerBar {
+    pointer-events: none !important;
+    filter: brightness(0.34) saturate(0.72) !important;
+}
+
+.nativePlaybackBlocker {
+    position: fixed !important;
+    inset: 0 !important;
+    z-index: 30000 !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    box-sizing: border-box !important;
+    padding: 24px !important;
+    overflow: auto !important;
+    background:
+        radial-gradient(circle at center, rgba(33, 27, 15, 0.36), transparent 58%),
+        rgba(2, 2, 2, 0.86) !important;
+    -webkit-overflow-scrolling: touch;
+}
+
+.nativePlaybackBlocker.hidden {
+    display: none !important;
+}
+
+.nativePlaybackBlockerCard {
+    width: min(100%, 520px) !important;
+    box-sizing: border-box !important;
+    padding: 34px 32px 30px !important;
+    border: 1px solid rgba(201, 168, 76, 0.58) !important;
+    background:
+        linear-gradient(145deg, rgba(201, 168, 76, 0.07), transparent 52%),
+        #090909 !important;
+    box-shadow:
+        inset 0 1px 0 rgba(255, 244, 202, 0.05),
+        0 24px 70px rgba(0, 0, 0, 0.72) !important;
+    text-align: center !important;
+}
+
+.nativePlaybackBlockerIcon {
+    display: block !important;
+    margin: 0 auto 14px !important;
+    color: var(--srova-gold) !important;
+    font-size: 30px !important;
+}
+
+.nativePlaybackBlockerCard h2 {
+    margin: 0 !important;
+    color: var(--srova-cream) !important;
+    font-family: var(--srova-display) !important;
+    font-size: 20px !important;
+    font-weight: 300 !important;
+    letter-spacing: 0.08em !important;
+    line-height: 1.3 !important;
+    text-transform: uppercase !important;
+}
+
+.nativePlaybackBlockerCard p {
+    max-width: 420px !important;
+    margin: 16px auto 24px !important;
+    color: var(--srova-muted) !important;
+    font-family: var(--srova-body) !important;
+    font-size: 14px !important;
+    font-weight: 300 !important;
+    line-height: 1.6 !important;
+}
+
+.nativePlaybackBlockerAction {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    min-height: 44px !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+    text-align: center !important;
+    line-height: 1.2 !important;
+}
+
+@media (max-width: 520px) {
+    .nativePlaybackBlocker {
+        align-items: center !important;
+        padding: 18px !important;
+    }
+
+    .nativePlaybackBlockerCard {
+        padding: 28px 20px 24px !important;
+    }
+
+    .nativePlaybackBlockerAction {
+        width: 100% !important;
+    }
+}
+
+html.srovaAndroidApkWebView .nativePlaybackBlocker {
+    padding-top: max(18px, env(safe-area-inset-top)) !important;
+    padding-right: max(18px, env(safe-area-inset-right)) !important;
+    padding-bottom: max(18px, env(safe-area-inset-bottom)) !important;
+    padding-left: max(18px, env(safe-area-inset-left)) !important;
 }

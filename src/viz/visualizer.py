@@ -368,12 +368,12 @@ def _build_log_bins_python(values, out_count):
 
 class SpectrumVisualizer(Gtk.DrawingArea):
     """
-    SROVA high-sensitivity spectrum visualizer.
+    HiresTI 高灵敏度频谱可视化组件 (已修复 NameError)
     """
     def __init__(self):
         super().__init__()
         self.set_draw_func(self._draw_callback, None)
-        self.set_size_request(-1, 0)
+        self.set_size_request(-1, 0) # 允许 Revealer 完全折叠
         self.theme_name = "Aurora (Default)"
         self.effect_name = "Dots"
         self.frequency_scale_name = _FREQ_SCALE_LINEAR

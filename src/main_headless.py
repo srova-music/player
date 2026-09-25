@@ -2,6 +2,7 @@ import logging
 import sys
 import os
 import json
+import ipaddress
 import socket
 import threading
 import time
@@ -9,6 +10,7 @@ import re
 import random
 import subprocess
 import uuid
+import signal
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 import argparse
@@ -26,6 +28,15 @@ from app import app_init_runtime
 from local_library import LocalLibraryBusyError, LocalLibraryIndex, local_library_rebuild_running
 import network_music
 from network_root_state import add_exact_managed_root, remove_exact_managed_root
+from services.spotify_coordinator import SpotifyCoordinator
+from services.spotify_managed_components import build_spotify_managed_components
+from services.spotify_runtime_components import (
+    SpotifyOutputBinding,
+    SpotifyRuntimeCompositionError,
+    build_spotify_endpoint_lifecycle,
+    build_spotify_runtime_components,
+)
+from services.spotify_secret_store import SpotifySecretStore
 from version_info import read_version_payload
 from update_info import read_update_payload
 
@@ -58,14 +69,27 @@ _NETWORK_MANAGED_ID_RE = re.compile(r"^(?:nfs|smb)-[0-9a-f]{12}$")
 ALSA_DRIVER = "alsa_mmap"
 ALSA_DEVICE = "hw:0,0"
 ALSA_DAC_NAME = ""
+_AUDIO_OUTPUT_SELECTED = False
 
 _AUDIO_OUTPUT_FILE = os.path.join(
     os.path.expanduser("~"), ".config", "hiresti", "audio_output.json"
 )
 _AUDIO_OUTPUT_LOCK = threading.Lock()
+_AUDIO_OUTPUT_RERESOLVE_SOURCE = 0
+_AUDIO_OUTPUT_RERESOLVE_FAST_MS = 1000
+_AUDIO_OUTPUT_RERESOLVE_SLOW_MS = 10000
+_AUDIO_OUTPUT_RERESOLVE_FAST_ATTEMPTS = 30
+_SPOTIFY_ORCHESTRATOR_LOCK = threading.Lock()
+_SPOTIFY_ARTIFACT_UPDATE_STATUS_LOCK = threading.RLock()
+_SPOTIFY_ARTIFACT_UPDATE_STATUS_CACHE = None
+_SPOTIFY_ARTIFACT_UPDATE_STATUS_TTL_SECONDS = 6 * 60 * 60
+_SPOTIFY_RECONCILE_INTERVAL_MS = 1000
+_SPOTIFY_DEVICE_NAME_MAX_ENCODED_BYTES = 256
+_SPOTIFY_DEVICE_NAME_REQUEST_MAX_BYTES = 16384
 _VALID_ALSA_DRIVERS = ("ALSA", "alsa_mmap")
 _DAC_NOT_DETECTED_ERROR = "dac_not_detected"
 _DAC_NOT_DETECTED_MESSAGE = "DAC not detected. Please connect or switch on your DAC before playback."
+_SPOTIFY_NATIVE_PLAYBACK_BLOCKED = "spotify_native_playback_blocked"
 _OTHER_AUDIO_OUTPUT_WARNING_VERSION = 1
 _AUDIO_SYS_ROOT = Path("/sys")
 _AUDIO_PROC_ROOT = Path("/proc/asound")
@@ -216,6 +240,50 @@ _TIDAL_STREAM_RESOLUTION_LOCK = threading.Lock()
 _TIDAL_STREAM_RESOLUTION_GENERATION = 0
 _TIDAL_STREAM_RESOLUTION_PENDING = None
 
+# Q4 Qobuz playback bridge state. Provider authentication/CMAF delivery
+# remains owned by backend.qobuz; the loopback media server is separate.
+_QOBUZ_PLAYBACK_BRIDGE_LOCK = threading.RLock()
+_QOBUZ_PLAYBACK_GENERATION_GATE = None
+_QOBUZ_LOOPBACK_SERVER = None
+_QOBUZ_ACTIVE_TRACK_ID = None
+_QOBUZ_ACTIVE_FORMAT_ID = None
+_QOBUZ_ACTIVE_QUEUE_ID = None
+
+# Q10B presentation continuity is deliberately separate from transport truth.
+# During a legitimate Qobuz track-to-track replacement the old loopback stream
+# is stopped while the next delivery resolves, so /status may truthfully report
+# an idle transport.  This generation-bound record tells presentation clients
+# only that the idle state is transitional, never exposing bridge internals.
+_QOBUZ_REPLACEMENT_LOCK = threading.RLock()
+_QOBUZ_REPLACEMENT_SERIAL = 0
+_QOBUZ_REPLACEMENT_PENDING = None
+
+# Q4 allows replacement while one stale provider request is winding down,
+# but never permits an unlimited number of resolver threads.
+_QOBUZ_MAX_RESOLUTION_THREADS = 2
+_QOBUZ_RESOLUTION_SLOTS = threading.BoundedSemaphore(
+    _QOBUZ_MAX_RESOLUTION_THREADS
+)
+_QOBUZ_DELIVERY_HTTP_LOCK = threading.Lock()
+
+# Q10B warm-path optimization.  This deliberately caches only already-
+# decrypted segment 1 bytes from tracks which SROVA has actually resolved.
+# Every playback still obtains a fresh Qobuz delivery/session before reuse.
+# Nothing is persisted to disk.
+_QOBUZ_WARM_SEGMENT_ONE_LOCK = threading.RLock()
+_QOBUZ_WARM_SEGMENT_ONE_CACHE = {}
+_QOBUZ_WARM_SEGMENT_ONE_TTL_SECONDS = 180.0
+_QOBUZ_WARM_SEGMENT_ONE_MAX_ENTRIES = 6
+_QOBUZ_WARM_SEGMENT_ONE_MAX_BYTES = 24 * 1024 * 1024
+
+# Q10B keeps resolver execution bounded while preserving latest-wins semantics.
+# When both resolver slots are occupied, exactly one newest request is retained
+# for deferred admission; repeated user actions replace that retained request
+# rather than spawning unbounded waiter threads or exposing resolution_busy.
+_QOBUZ_DEFERRED_RESOLUTION_LOCK = threading.RLock()
+_QOBUZ_RESOLUTION_REQUEST_SERIAL = 0
+_QOBUZ_DEFERRED_RESOLUTION = None
+
 
 def _begin_tidal_stream_resolution(index, track_id):
     global _TIDAL_STREAM_RESOLUTION_GENERATION
@@ -280,6 +348,966 @@ def _tidal_stream_resolution_matches(
 
         return queue_matches
 
+def _qobuz_bridge_components(create_server=False):
+    """Return Q4 generation state and optionally create the loopback server."""
+    global _QOBUZ_PLAYBACK_GENERATION_GATE
+    global _QOBUZ_LOOPBACK_SERVER
+
+    from backend.qobuz_stream import (
+        QobuzLoopbackServer,
+        QobuzPlaybackGeneration,
+    )
+
+    with _QOBUZ_PLAYBACK_BRIDGE_LOCK:
+        if _QOBUZ_PLAYBACK_GENERATION_GATE is None:
+            _QOBUZ_PLAYBACK_GENERATION_GATE = QobuzPlaybackGeneration()
+        if create_server and _QOBUZ_LOOPBACK_SERVER is None:
+            _QOBUZ_LOOPBACK_SERVER = QobuzLoopbackServer()
+        return _QOBUZ_PLAYBACK_GENERATION_GATE, _QOBUZ_LOOPBACK_SERVER
+
+
+_QOBUZ_HARDWARE_CLOCK_LOCK = threading.RLock()
+_QOBUZ_HARDWARE_CLOCK_PENDING = None
+
+
+def _qobuz_hardware_clock_snapshot():
+    with _QOBUZ_HARDWARE_CLOCK_LOCK:
+        state = _QOBUZ_HARDWARE_CLOCK_PENDING
+        return dict(state) if isinstance(state, dict) else None
+
+
+def _qobuz_hardware_clock_is_pending():
+    with _QOBUZ_HARDWARE_CLOCK_LOCK:
+        return isinstance(_QOBUZ_HARDWARE_CLOCK_PENDING, dict)
+
+
+def _clear_qobuz_hardware_clock_pending(
+    reason,
+    *,
+    generation=None,
+    target_queue_id=None,
+):
+    global _QOBUZ_HARDWARE_CLOCK_PENDING
+
+    target = (
+        str(target_queue_id or "").strip()
+        if target_queue_id is not None
+        else None
+    )
+
+    with _QOBUZ_HARDWARE_CLOCK_LOCK:
+        state = _QOBUZ_HARDWARE_CLOCK_PENDING
+        if not isinstance(state, dict):
+            return False
+
+        if generation is not None:
+            try:
+                if int(state.get("generation")) != int(generation):
+                    return False
+            except Exception:
+                return False
+
+        if target is not None:
+            if str(state.get("target_queue_id") or "").strip() != target:
+                return False
+
+        cleared = dict(state)
+        _QOBUZ_HARDWARE_CLOCK_PENDING = None
+
+    logger.info(
+        "Qobuz hardware clock pending cleared: "
+        "reason=%s generation=%s target=%s",
+        reason,
+        cleared.get("generation"),
+        cleared.get("target_queue_id"),
+    )
+    return True
+
+
+def _arm_qobuz_hardware_clock_commit(
+    generation,
+    target_queue_id,
+    *,
+    scrobble=False,
+):
+    global _QOBUZ_HARDWARE_CLOCK_PENDING
+    global PLAYBACK_START_TIME
+
+    target = str(target_queue_id or "").strip()
+    if not target:
+        return False
+
+    state = {
+        "generation": int(generation),
+        "target_queue_id": target,
+        "scrobble": bool(scrobble),
+    }
+
+    with _QOBUZ_HARDWARE_CLOCK_LOCK:
+        _QOBUZ_HARDWARE_CLOCK_PENDING = state
+
+    PLAYBACK_START_TIME = None
+
+    logger.info(
+        "Qobuz hardware clock armed: generation=%s target=%s "
+        "scrobble=%s",
+        state["generation"],
+        target,
+        bool(scrobble),
+    )
+    return True
+
+
+def _maybe_commit_qobuz_hardware_clock_ready():
+    global _QOBUZ_HARDWARE_CLOCK_PENDING
+    global PLAYBACK_START_TIME
+
+    state = _qobuz_hardware_clock_snapshot()
+    if not isinstance(state, dict):
+        return False
+
+    if not _qobuz_hardware_playback_committed():
+        return False
+
+    with _QOBUZ_PLAYBACK_BRIDGE_LOCK:
+        active_track_id = _QOBUZ_ACTIVE_TRACK_ID
+        active_queue_id = _QOBUZ_ACTIVE_QUEUE_ID
+
+    active_target = str(active_queue_id or "").strip()
+    if not active_target and active_track_id is not None:
+        active_target = "qobuz:" + str(active_track_id)
+
+    expected_target = str(state.get("target_queue_id") or "").strip()
+    if not active_target or active_target != expected_target:
+        return False
+
+    expected_generation = int(state.get("generation"))
+    committed_at = time.time()
+
+    with _QOBUZ_HARDWARE_CLOCK_LOCK:
+        current = _QOBUZ_HARDWARE_CLOCK_PENDING
+        if not isinstance(current, dict):
+            return False
+
+        try:
+            if int(current.get("generation")) != expected_generation:
+                return False
+        except Exception:
+            return False
+
+        if (
+            str(current.get("target_queue_id") or "").strip()
+            != expected_target
+        ):
+            return False
+
+        scrobble = bool(current.get("scrobble"))
+        _QOBUZ_HARDWARE_CLOCK_PENDING = None
+        PLAYBACK_START_TIME = committed_at
+
+    logger.info(
+        "Qobuz hardware clock committed: generation=%s target=%s",
+        expected_generation,
+        expected_target,
+    )
+
+    if scrobble:
+        try:
+            start_current_scrobble(
+                build_current_scrobble_track("qobuz"),
+                committed_at,
+            )
+        except Exception as exc:
+            logger.debug(
+                "schedule Qobuz hardware-commit scrobble failed: %s",
+                exc,
+            )
+
+    return True
+
+
+def _qobuz_playback_is_active():
+    with _QOBUZ_PLAYBACK_BRIDGE_LOCK:
+        return _QOBUZ_ACTIVE_TRACK_ID is not None
+
+
+def _qobuz_playback_state():
+    with _QOBUZ_PLAYBACK_BRIDGE_LOCK:
+        gate = _QOBUZ_PLAYBACK_GENERATION_GATE
+        server = _QOBUZ_LOOPBACK_SERVER
+        track_id = _QOBUZ_ACTIVE_TRACK_ID
+        format_id = _QOBUZ_ACTIVE_FORMAT_ID
+        queue_id = _QOBUZ_ACTIVE_QUEUE_ID
+
+    active = track_id is not None
+    return {
+        "active": bool(active),
+        "resolving": bool(gate is not None and gate.pending),
+        "track_id": str(track_id) if active else None,
+        "queue_track_id": str(queue_id) if queue_id else None,
+        "format_id": int(format_id) if format_id is not None else None,
+        "loopback_host": "127.0.0.1",
+        "loopback_port": (
+            int(server.port)
+            if server is not None
+            and server.running
+            and server.port is not None
+            else None
+        ),
+    }
+
+
+def _qobuz_active_queue_id():
+    with _QOBUZ_PLAYBACK_BRIDGE_LOCK:
+        queue_id = _QOBUZ_ACTIVE_QUEUE_ID
+    return str(queue_id) if queue_id else ""
+
+
+def _qobuz_replacement_snapshot():
+    with _QOBUZ_REPLACEMENT_LOCK:
+        state = _QOBUZ_REPLACEMENT_PENDING
+        return dict(state) if isinstance(state, dict) else None
+
+
+def _selected_alsa_pcm_running():
+    """Return selected hw:C,D PCM RUNNING state, or None when not observable."""
+    device = str(ALSA_DEVICE or "").strip()
+    match = re.fullmatch(r"hw:(\d+)(?:,(\d+))?", device)
+    if not match:
+        return None
+
+    card_idx = str(match.group(1))
+    pcm_idx = str(match.group(2) or "0")
+    pcm_dir = _AUDIO_PROC_ROOT / f"card{card_idx}" / f"pcm{pcm_idx}p"
+    if not pcm_dir.exists():
+        return None
+
+    found = False
+    for subdir in sorted(pcm_dir.glob("sub*")):
+        status_path = subdir / "status"
+        if not status_path.exists():
+            continue
+        found = True
+        try:
+            status_text = status_path.read_text(
+                encoding="utf-8",
+                errors="ignore",
+            )
+        except Exception:
+            continue
+        if "RUNNING" in status_text.upper():
+            return True
+
+    return False if found else None
+
+
+def _qobuz_hardware_playback_committed():
+    """Return True only once the selected output has committed playback."""
+    if ALSA_DRIVER == "alsa_mmap":
+        return _selected_alsa_pcm_running() is True
+
+    # Q10B's strict /proc proof applies to the mmap path. Preserve existing
+    # behaviour for other supported ALSA modes rather than making them wait
+    # forever when a selected hw:C,D RUNNING state is not observable here.
+    player = APP_INSTANCE.player if APP_INSTANCE is not None else None
+    if player is None:
+        return False
+    try:
+        return bool(player.is_playing())
+    except Exception:
+        return False
+
+
+def _maybe_commit_qobuz_replacement_hardware_ready():
+    """Clear only an armed matching replacement after real output starts."""
+    state = _qobuz_replacement_snapshot()
+    if not isinstance(state, dict) or not state.get("armed"):
+        return False
+    if not _qobuz_hardware_playback_committed():
+        return False
+
+    generation = state.get("generation")
+    target_queue_id = state.get("target_queue_id")
+    if generation is None or not target_queue_id:
+        return False
+
+    return _clear_qobuz_replacement_pending(
+        "qobuz-replacement-hardware-running",
+        generation=generation,
+        target_queue_id=target_queue_id,
+    )
+
+
+def _qobuz_replacement_is_pending():
+    # /status and /session are the existing lightweight observation points.
+    # Once selected mmap hardware reaches RUNNING, commit the matching
+    # generation before exporting the presentation-continuity boolean.
+    _maybe_commit_qobuz_replacement_hardware_ready()
+    with _QOBUZ_REPLACEMENT_LOCK:
+        return isinstance(_QOBUZ_REPLACEMENT_PENDING, dict)
+
+
+def _prepare_qobuz_replacement_pending(target_queue_id, reason):
+    """Mark presentation continuity before tearing down an active Qobuz track."""
+    global _QOBUZ_REPLACEMENT_SERIAL
+    global _QOBUZ_REPLACEMENT_PENDING
+
+    target_queue_id = str(target_queue_id or "").strip()
+    if not target_queue_id.startswith("qobuz:"):
+        return None
+
+    active = _qobuz_playback_is_active()
+    with _QOBUZ_REPLACEMENT_LOCK:
+        current = _QOBUZ_REPLACEMENT_PENDING
+
+        # The queue action marks the replacement before teardown; the later
+        # resolver entry reuses that same unbound record and binds its token.
+        if (
+            isinstance(current, dict)
+            and current.get("target_queue_id") == target_queue_id
+            and current.get("generation") is None
+        ):
+            return int(current["request_id"])
+
+        if not active and not isinstance(current, dict):
+            return None
+
+        _QOBUZ_REPLACEMENT_SERIAL += 1
+        request_id = int(_QOBUZ_REPLACEMENT_SERIAL)
+        _QOBUZ_REPLACEMENT_PENDING = {
+            "request_id": request_id,
+            "target_queue_id": target_queue_id,
+            "generation": None,
+            "armed": False,
+        }
+
+    logger.info(
+        "Qobuz replacement presentation pending: request=%s target=%s reason=%s",
+        request_id,
+        target_queue_id,
+        reason,
+    )
+    return request_id
+
+
+def _bind_qobuz_replacement_generation(request_id, target_queue_id, generation):
+    target_queue_id = str(target_queue_id or "").strip()
+    with _QOBUZ_REPLACEMENT_LOCK:
+        state = _QOBUZ_REPLACEMENT_PENDING
+        if not isinstance(state, dict):
+            return False
+        if int(state.get("request_id") or -1) != int(request_id):
+            return False
+        if state.get("target_queue_id") != target_queue_id:
+            return False
+        state["generation"] = int(generation)
+        state["armed"] = False
+        return True
+
+
+def _arm_qobuz_replacement_hardware_commit(
+    request_id,
+    target_queue_id,
+    generation,
+):
+    target_queue_id = str(target_queue_id or "").strip()
+    with _QOBUZ_REPLACEMENT_LOCK:
+        state = _QOBUZ_REPLACEMENT_PENDING
+        if not isinstance(state, dict):
+            return False
+        if int(state.get("request_id") or -1) != int(request_id):
+            return False
+        if state.get("target_queue_id") != target_queue_id:
+            return False
+        if int(state.get("generation") or -1) != int(generation):
+            return False
+        state["armed"] = True
+
+    logger.info(
+        "Qobuz replacement hardware commit armed: "
+        "request=%s target=%s generation=%s",
+        request_id,
+        target_queue_id,
+        generation,
+    )
+    return True
+
+
+def _clear_qobuz_replacement_pending(
+    reason,
+    *,
+    generation=None,
+    target_queue_id=None,
+    require_unbound=False,
+):
+    """Clear only the matching replacement, unless called for genuine idle."""
+    global _QOBUZ_REPLACEMENT_PENDING
+
+    target_queue_id = (
+        str(target_queue_id or "").strip()
+        if target_queue_id is not None
+        else None
+    )
+
+    with _QOBUZ_REPLACEMENT_LOCK:
+        state = _QOBUZ_REPLACEMENT_PENDING
+        if not isinstance(state, dict):
+            return False
+        if generation is not None and int(state.get("generation") or -1) != int(generation):
+            return False
+        if target_queue_id is not None and state.get("target_queue_id") != target_queue_id:
+            return False
+        if require_unbound and state.get("generation") is not None:
+            return False
+        cleared = dict(state)
+        _QOBUZ_REPLACEMENT_PENDING = None
+
+    logger.info(
+        "Qobuz replacement presentation cleared: request=%s target=%s reason=%s",
+        cleared.get("request_id"),
+        cleared.get("target_queue_id"),
+        reason,
+    )
+    return True
+
+
+def _next_qobuz_resolution_request_serial():
+    global _QOBUZ_RESOLUTION_REQUEST_SERIAL
+    with _QOBUZ_DEFERRED_RESOLUTION_LOCK:
+        _QOBUZ_RESOLUTION_REQUEST_SERIAL += 1
+        return int(_QOBUZ_RESOLUTION_REQUEST_SERIAL)
+
+
+def _defer_qobuz_resolution(
+    request_serial,
+    payload,
+    queue_context,
+    target_queue_id,
+):
+    """Retain exactly one newest bounded resolver request."""
+    global _QOBUZ_DEFERRED_RESOLUTION
+
+    deferred = {
+        "request_serial": int(request_serial),
+        "payload": dict(payload or {}),
+        "queue_context": (
+            dict(queue_context)
+            if isinstance(queue_context, dict)
+            else None
+        ),
+        "target_queue_id": str(target_queue_id or "").strip(),
+    }
+
+    with _QOBUZ_DEFERRED_RESOLUTION_LOCK:
+        current = _QOBUZ_DEFERRED_RESOLUTION
+        if (
+            isinstance(current, dict)
+            and int(current.get("request_serial") or -1)
+            > int(request_serial)
+        ):
+            return False
+        replaced = dict(current) if isinstance(current, dict) else None
+        _QOBUZ_DEFERRED_RESOLUTION = deferred
+
+    logger.info(
+        "Qobuz resolver deferred latest-wins: "
+        "serial=%s target=%s replaced_serial=%s",
+        request_serial,
+        deferred.get("target_queue_id"),
+        (
+            replaced.get("request_serial")
+            if isinstance(replaced, dict)
+            else None
+        ),
+    )
+    return True
+
+
+def _clear_qobuz_deferred_resolution(reason, max_serial=None):
+    global _QOBUZ_DEFERRED_RESOLUTION
+
+    with _QOBUZ_DEFERRED_RESOLUTION_LOCK:
+        current = _QOBUZ_DEFERRED_RESOLUTION
+        if not isinstance(current, dict):
+            return False
+        if (
+            max_serial is not None
+            and int(current.get("request_serial") or -1) > int(max_serial)
+        ):
+            return False
+        cleared = dict(current)
+        _QOBUZ_DEFERRED_RESOLUTION = None
+
+    logger.info(
+        "Qobuz deferred resolver cleared: serial=%s target=%s reason=%s",
+        cleared.get("request_serial"),
+        cleared.get("target_queue_id"),
+        reason,
+    )
+    return True
+
+
+def _take_qobuz_deferred_resolution():
+    global _QOBUZ_DEFERRED_RESOLUTION
+    with _QOBUZ_DEFERRED_RESOLUTION_LOCK:
+        current = _QOBUZ_DEFERRED_RESOLUTION
+        if not isinstance(current, dict):
+            return None
+        _QOBUZ_DEFERRED_RESOLUTION = None
+        return dict(current)
+
+
+def _drain_qobuz_deferred_resolution():
+    """Attempt the single newest deferred request after resolver capacity frees."""
+    deferred = _take_qobuz_deferred_resolution()
+    if not isinstance(deferred, dict):
+        return False
+
+    payload = dict(deferred.get("payload") or {})
+    queue_context = deferred.get("queue_context")
+    target_queue_id = str(deferred.get("target_queue_id") or "").strip()
+
+    if (
+        isinstance(queue_context, dict)
+        and not _qobuz_queue_context_matches(queue_context)
+    ):
+        logger.info(
+            "Discarding deferred Qobuz resolution after queue supersession: "
+            "serial=%s target=%s",
+            deferred.get("request_serial"),
+            target_queue_id,
+        )
+        _clear_qobuz_replacement_pending(
+            "qobuz-deferred-queue-context-superseded",
+            target_queue_id=target_queue_id,
+            require_unbound=True,
+        )
+        return False
+
+    normalized_queue_context = (
+        dict(queue_context)
+        if isinstance(queue_context, dict)
+        else None
+    )
+
+    result = _qobuz_test_play_payload(
+        payload,
+        _queue_context=normalized_queue_context,
+    )
+    result = _apply_qobuz_queue_resolution_policy(
+        result,
+        payload,
+        normalized_queue_context,
+        int(deferred.get("request_serial") or 0),
+    )
+
+    if not result.get("ok"):
+        logger.warning(
+            "Deferred Qobuz resolution failed: target=%s error=%s",
+            target_queue_id,
+            result.get("error"),
+        )
+        _clear_qobuz_replacement_pending(
+            "qobuz-deferred-resolution-failed",
+            target_queue_id=target_queue_id,
+            require_unbound=True,
+        )
+
+    return False
+
+
+
+def _apply_qobuz_queue_resolution_policy(
+    result,
+    payload,
+    queue_context,
+    request_serial,
+):
+    """Layer queue latest-wins semantics on top of the locked Q4 result."""
+    result = dict(result or {})
+    request_serial = int(request_serial)
+
+    target_queue_id = str(
+        (queue_context or {}).get("queue_id")
+        or (
+            "qobuz:" + str((payload or {}).get("track_id"))
+            if (payload or {}).get("track_id") is not None
+            else ""
+        )
+    ).strip()
+
+    if result.get("error") != "qobuz_resolution_busy":
+        if result.get("ok"):
+            _clear_qobuz_deferred_resolution(
+                "superseded-by-admitted-resolution",
+                max_serial=request_serial,
+            )
+        return result
+
+    _prepare_qobuz_replacement_pending(
+        target_queue_id,
+        "qobuz-resolution-busy-deferred",
+    )
+    _defer_qobuz_resolution(
+        request_serial,
+        payload,
+        queue_context,
+        target_queue_id,
+    )
+
+    return {
+        "ok": True,
+        "source": "qobuz",
+        "state": "queued",
+        "track_id": str((payload or {}).get("track_id") or ""),
+        "format_id": int((payload or {}).get("format_id") or 27),
+    }
+
+
+def _qobuz_warm_segment_one_expected_length(delivery):
+    try:
+        table = tuple(getattr(delivery, "segment_table", ()) or ())
+        if not table:
+            return 0
+        return max(0, int(table[0].byte_len))
+    except Exception:
+        return 0
+
+
+def _qobuz_warm_segment_one_key(track_id, format_id, delivery):
+    expected_length = _qobuz_warm_segment_one_expected_length(delivery)
+    if expected_length <= 0:
+        return None
+
+    native_track_id = str(track_id or "").strip()
+    if not native_track_id:
+        return None
+
+    delivery_track_id = str(
+        getattr(delivery, "track_id", "") or ""
+    ).strip()
+    if delivery_track_id and delivery_track_id != native_track_id:
+        return None
+
+    try:
+        format_id = int(format_id)
+    except Exception:
+        return None
+
+    return (native_track_id, format_id, expected_length)
+
+
+def _qobuz_warm_segment_one_get(track_id, format_id, delivery):
+    """Return verified RAM-only segment 1 bytes for this exact delivery shape."""
+    key = _qobuz_warm_segment_one_key(track_id, format_id, delivery)
+    if key is None:
+        return None
+
+    now = time.monotonic()
+
+    with _QOBUZ_WARM_SEGMENT_ONE_LOCK:
+        expired = [
+            cached_key
+            for cached_key, entry in _QOBUZ_WARM_SEGMENT_ONE_CACHE.items()
+            if (
+                now - float((entry or {}).get("stored_at") or 0.0)
+                > _QOBUZ_WARM_SEGMENT_ONE_TTL_SECONDS
+            )
+        ]
+        for cached_key in expired:
+            _QOBUZ_WARM_SEGMENT_ONE_CACHE.pop(cached_key, None)
+
+        entry = _QOBUZ_WARM_SEGMENT_ONE_CACHE.get(key)
+        if not isinstance(entry, dict):
+            return None
+
+        payload = entry.get("payload")
+        try:
+            payload = bytes(payload)
+        except Exception:
+            _QOBUZ_WARM_SEGMENT_ONE_CACHE.pop(key, None)
+            return None
+
+        if len(payload) != int(key[2]):
+            _QOBUZ_WARM_SEGMENT_ONE_CACHE.pop(key, None)
+            return None
+
+        # Refresh insertion order without extending the absolute TTL.
+        _QOBUZ_WARM_SEGMENT_ONE_CACHE.pop(key, None)
+        _QOBUZ_WARM_SEGMENT_ONE_CACHE[key] = entry
+
+        return payload
+
+
+def _qobuz_warm_segment_one_put(track_id, format_id, delivery, payload):
+    """Retain one verified segment 1 under hard count/byte bounds."""
+    key = _qobuz_warm_segment_one_key(track_id, format_id, delivery)
+    if key is None:
+        return False
+
+    try:
+        payload = bytes(payload)
+    except Exception:
+        return False
+
+    if len(payload) != int(key[2]):
+        return False
+
+    if len(payload) > _QOBUZ_WARM_SEGMENT_ONE_MAX_BYTES:
+        return False
+
+    with _QOBUZ_WARM_SEGMENT_ONE_LOCK:
+        _QOBUZ_WARM_SEGMENT_ONE_CACHE.pop(key, None)
+        _QOBUZ_WARM_SEGMENT_ONE_CACHE[key] = {
+            "payload": payload,
+            "stored_at": time.monotonic(),
+        }
+
+        def _cache_bytes():
+            return sum(
+                len(bytes((entry or {}).get("payload") or b""))
+                for entry in _QOBUZ_WARM_SEGMENT_ONE_CACHE.values()
+            )
+
+        while (
+            len(_QOBUZ_WARM_SEGMENT_ONE_CACHE)
+            > _QOBUZ_WARM_SEGMENT_ONE_MAX_ENTRIES
+            or _cache_bytes() > _QOBUZ_WARM_SEGMENT_ONE_MAX_BYTES
+        ):
+            oldest_key = next(iter(_QOBUZ_WARM_SEGMENT_ONE_CACHE), None)
+            if oldest_key is None:
+                break
+            _QOBUZ_WARM_SEGMENT_ONE_CACHE.pop(oldest_key, None)
+
+    return True
+
+
+def _clear_qobuz_warm_segment_one_cache(reason):
+    with _QOBUZ_WARM_SEGMENT_ONE_LOCK:
+        count = len(_QOBUZ_WARM_SEGMENT_ONE_CACHE)
+        _QOBUZ_WARM_SEGMENT_ONE_CACHE.clear()
+
+    if count:
+        logger.info(
+            "Qobuz warm segment-1 cache cleared: entries=%s reason=%s",
+            count,
+            reason,
+        )
+
+    return count
+
+
+def _qobuz_next_replacement_target_queue_id():
+    with _QUEUE_LOCK:
+        if not (PLAY_QUEUE and 0 <= QUEUE_INDEX < len(PLAY_QUEUE)):
+            return ""
+        if REPEAT_MODE == "one":
+            target_index = int(QUEUE_INDEX)
+        else:
+            target_index = int(QUEUE_INDEX) + 1
+            if REPEAT_MODE == "all" and target_index >= len(PLAY_QUEUE):
+                target_index = 0
+        if not (0 <= target_index < len(PLAY_QUEUE)):
+            return ""
+        queue_id = str(PLAY_QUEUE[target_index])
+        meta = dict(PLAY_QUEUE_META_CACHE.get(queue_id, {}) or {})
+
+    return queue_id if _queue_item_source(queue_id, meta) == "qobuz" else ""
+
+
+def _qobuz_previous_replacement_target_queue_id():
+    with _QUEUE_LOCK:
+        if not (PLAY_QUEUE and 0 <= QUEUE_INDEX < len(PLAY_QUEUE)):
+            return ""
+        target_index = max(0, int(QUEUE_INDEX) - 1)
+        queue_id = str(PLAY_QUEUE[target_index])
+        meta = dict(PLAY_QUEUE_META_CACHE.get(queue_id, {}) or {})
+
+    return queue_id if _queue_item_source(queue_id, meta) == "qobuz" else ""
+
+
+def _qobuz_queue_native_track_id(track_id, meta=None):
+    """Return native provider ID for canonical qobuz:<id> queue identity."""
+    queue_id = str(track_id or "").strip()
+    prefix = "qobuz:"
+    if not queue_id.startswith(prefix):
+        return None
+
+    native_id = queue_id[len(prefix):].strip()
+    if (
+        not native_id
+        or not native_id.isascii()
+        or not native_id.isdigit()
+        or int(native_id) <= 0
+    ):
+        return None
+
+    provider_track_id = str(
+        (meta or {}).get("provider_track_id") or ""
+    ).strip()
+    if provider_track_id and provider_track_id != native_id:
+        return None
+
+    return native_id
+
+
+def _qobuz_queue_context_matches(queue_context):
+    """Reject a queued Qobuz completion after queue selection changes."""
+    if not queue_context:
+        return True
+
+    try:
+        expected_index = int(queue_context.get("queue_index"))
+        expected_id = str(queue_context.get("queue_id") or "")
+    except Exception:
+        return False
+
+    if not expected_id:
+        return False
+
+    with _QUEUE_LOCK:
+        return bool(
+            0 <= expected_index < len(PLAY_QUEUE)
+            and QUEUE_INDEX == expected_index
+            and str(PLAY_QUEUE[expected_index]) == expected_id
+        )
+
+
+def _cancel_qobuz_for_queue_transition(reason, target_queue_id=None):
+    """Invalidate Qobuz and stop its transport before shared-queue movement."""
+    was_active = _qobuz_playback_is_active()
+
+    # Preserve the established shared-queue call contract while deriving the
+    # concrete Qobuz replacement target synchronously before old transport
+    # invalidation/stop.
+    if target_queue_id is None:
+        if reason == "user-next":
+            target_queue_id = _qobuz_next_replacement_target_queue_id()
+        elif reason == "user-previous":
+            target_queue_id = _qobuz_previous_replacement_target_queue_id()
+        elif reason == "queue-jump":
+            # The queue-jump route updates QUEUE_INDEX before entering this
+            # shared transition helper. Resolve that selected queue item here
+            # so the historical Q5 call shape remains unchanged.
+            with _QUEUE_LOCK:
+                if PLAY_QUEUE and 0 <= QUEUE_INDEX < len(PLAY_QUEUE):
+                    jump_queue_id = str(PLAY_QUEUE[QUEUE_INDEX])
+                    jump_queue_meta = dict(
+                        PLAY_QUEUE_META_CACHE.get(jump_queue_id, {}) or {}
+                    )
+                else:
+                    jump_queue_id = ""
+                    jump_queue_meta = {}
+
+            if (
+                jump_queue_id
+                and _queue_item_source(
+                    jump_queue_id,
+                    jump_queue_meta,
+                ) == "qobuz"
+            ):
+                target_queue_id = jump_queue_id
+
+    replacement_request = _prepare_qobuz_replacement_pending(
+        target_queue_id,
+        reason,
+    )
+    changed = _invalidate_qobuz_playback(
+        reason,
+        preserve_replacement=replacement_request is not None,
+    )
+
+    if was_active:
+        try:
+            APP_INSTANCE.player.stop()
+        except Exception as exc:
+            logger.debug(
+                "Qobuz queue-transition player.stop() failed safely: %s",
+                exc,
+            )
+
+    return changed
+
+
+def _begin_qobuz_stream_resolution(track_id, format_id):
+    gate, _server = _qobuz_bridge_components(create_server=False)
+    return gate.begin((str(track_id), int(format_id)))
+
+
+def _qobuz_stream_resolution_matches(
+    token,
+    track_id,
+    format_id,
+    consume=False,
+):
+    with _QOBUZ_PLAYBACK_BRIDGE_LOCK:
+        gate = _QOBUZ_PLAYBACK_GENERATION_GATE
+    if gate is None:
+        return False
+    return gate.matches(
+        int(token),
+        (str(track_id), int(format_id)),
+        consume=bool(consume),
+    )
+
+
+def _invalidate_qobuz_playback(reason, preserve_replacement=False):
+    """Invalidate pending/active Q4 media without stopping another source."""
+    _clear_qobuz_hardware_clock_pending(reason)
+    if not preserve_replacement:
+        _clear_qobuz_replacement_pending(reason)
+        _clear_qobuz_deferred_resolution(reason)
+
+    global _QOBUZ_ACTIVE_TRACK_ID
+    global _QOBUZ_ACTIVE_FORMAT_ID
+    global _QOBUZ_ACTIVE_QUEUE_ID
+
+    with _QOBUZ_PLAYBACK_BRIDGE_LOCK:
+        gate = _QOBUZ_PLAYBACK_GENERATION_GATE
+        server = _QOBUZ_LOOPBACK_SERVER
+        was_active = _QOBUZ_ACTIVE_TRACK_ID is not None
+        was_pending = bool(gate is not None and gate.pending)
+        _QOBUZ_ACTIVE_TRACK_ID = None
+        _QOBUZ_ACTIVE_FORMAT_ID = None
+        _QOBUZ_ACTIVE_QUEUE_ID = None
+
+    if gate is not None:
+        gate.invalidate(reason)
+    if server is not None:
+        server.invalidate()
+
+    if was_active or was_pending:
+        logger.info("Qobuz Q4 playback invalidated: %s", reason)
+
+    return bool(was_active or was_pending)
+
+
+def _shutdown_qobuz_playback_bridge(reason):
+    """Invalidate media and close the loopback listener completely."""
+    _clear_qobuz_hardware_clock_pending(reason)
+    _clear_qobuz_replacement_pending(reason)
+    _clear_qobuz_deferred_resolution(reason)
+    global _QOBUZ_PLAYBACK_GENERATION_GATE
+    global _QOBUZ_LOOPBACK_SERVER
+    global _QOBUZ_ACTIVE_TRACK_ID
+    global _QOBUZ_ACTIVE_FORMAT_ID
+
+    with _QOBUZ_PLAYBACK_BRIDGE_LOCK:
+        gate = _QOBUZ_PLAYBACK_GENERATION_GATE
+        server = _QOBUZ_LOOPBACK_SERVER
+        _QOBUZ_PLAYBACK_GENERATION_GATE = None
+        _QOBUZ_LOOPBACK_SERVER = None
+        _QOBUZ_ACTIVE_TRACK_ID = None
+        _QOBUZ_ACTIVE_FORMAT_ID = None
+
+    if gate is not None:
+        gate.invalidate(reason)
+    if server is not None:
+        server.stop()
+
+    logger.info("Qobuz Q4 playback bridge shut down: %s", reason)
+
+
 # Temporary/test-only local playback allowlist. This is intentionally separate
 # from TIDAL queue state and does not implement a local library scanner.
 _LOCAL_TEST_ROOTS_ENV = "SROVA_LOCAL_TEST_ROOTS"
@@ -327,9 +1355,16 @@ _APP_SETTINGS_LOCK = threading.Lock()
 _APP_SETTINGS = {
     "tidal_infinite_play": False,
     "tidal_infinite_play_mode": "similar_artist",
+    "infinite_play_provider": "tidal",
+    "automix_provider": "tidal",
+    "playlist_maintenance_provider": "tidal",
     "recommended_audio_outputs_only": True,
     "other_audio_outputs_warning_version": 0,
     "other_audio_outputs_acknowledged_at": 0,
+    "show_tidal_radio": False,
+    "show_qobuz_radio": False,
+    "spotify_device_name": "",
+    "spotify_enabled": False,
 }
 
 # Scrobble credentials file
@@ -1401,11 +2436,21 @@ def _restart_srova_service_later(delay=0.35):
                 _SROVA_RESTART_EXIT_CODE,
             )
 
+            _shutdown_existing_spotify_endpoint("service-restart")
+
             try:
                 _invalidate_tidal_stream_resolution("service-restart")
             except Exception as exc:
                 logger.debug(
                     "Restart TIDAL resolution cancellation failed: %s",
+                    exc,
+                )
+
+            try:
+                _shutdown_qobuz_playback_bridge("service-restart")
+            except Exception as exc:
+                logger.debug(
+                    "Restart Qobuz playback shutdown failed: %s",
                     exc,
                 )
 
@@ -1522,11 +2567,23 @@ def _normalise_dac_name(name):
 
 
 class AudioOutputUnavailable(Exception):
-    def __init__(self, detail=""):
-        super().__init__(detail or _DAC_NOT_DETECTED_MESSAGE)
+    def __init__(self, detail="", error_code=None):
+        self.error_code = error_code or _DAC_NOT_DETECTED_ERROR
+        default_detail = (
+            _DAC_NOT_DETECTED_MESSAGE
+            if self.error_code == _DAC_NOT_DETECTED_ERROR
+            else self.error_code
+        )
+        super().__init__(detail or default_detail)
         self.detail = detail or ""
 
     def to_payload(self):
+        if self.error_code != _DAC_NOT_DETECTED_ERROR:
+            return {
+                "ok": False,
+                "error": self.error_code,
+                "message": self.detail or self.error_code,
+            }
         return {
             "ok": False,
             "error": _DAC_NOT_DETECTED_ERROR,
@@ -1541,7 +2598,9 @@ def _load_audio_output_config():
     value is used during startup so Settings-saved DAC choices survive systemd
     restarts even when older service files still pass --alsa-driver/--alsa-device.
     """
-    global ALSA_DRIVER, ALSA_DEVICE, ALSA_DAC_NAME
+    global ALSA_DRIVER, ALSA_DEVICE, ALSA_DAC_NAME, _AUDIO_OUTPUT_SELECTED
+    with _AUDIO_OUTPUT_LOCK:
+        _AUDIO_OUTPUT_SELECTED = False
     try:
         path = _audio_output_path()
         if not os.path.exists(path):
@@ -1555,6 +2614,7 @@ def _load_audio_output_config():
             ALSA_DRIVER   = driver
             ALSA_DEVICE   = device
             ALSA_DAC_NAME = name
+            _AUDIO_OUTPUT_SELECTED = True
         logger.info("Audio output preference loaded: %s / %s (%s)", driver, device, name or "unnamed")
         return True
     except Exception as e:
@@ -1615,6 +2675,418 @@ def _alsa_device_numbers(device):
     if not m:
         return None, None
     return m.group(1), m.group(2)
+
+
+def _validate_spotify_device_name(value):
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError("invalid Spotify device name")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("invalid Spotify device name")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("invalid Spotify device name") from None
+    if len(encoded) > _SPOTIFY_DEVICE_NAME_MAX_ENCODED_BYTES:
+        raise ValueError("invalid Spotify device name")
+    return value
+
+
+def _spotify_enabled_intent():
+    """Return the persisted user policy for Spotify Connect availability."""
+
+    with _APP_SETTINGS_LOCK:
+        return _APP_SETTINGS.get("spotify_enabled", False) is True
+
+
+def _set_spotify_enabled_intent(enabled):
+    """Persist the explicit Spotify Connect master-switch policy."""
+
+    if type(enabled) is not bool:
+        raise ValueError("invalid Spotify enabled intent")
+
+    missing = object()
+    with _APP_SETTINGS_LOCK:
+        previous = _APP_SETTINGS.get("spotify_enabled", missing)
+        if previous is enabled:
+            return False
+        _APP_SETTINGS["spotify_enabled"] = enabled
+
+    try:
+        persisted = _save_app_settings()
+    except Exception:
+        persisted = False
+
+    if persisted is True:
+        return True
+
+    with _APP_SETTINGS_LOCK:
+        if previous is missing:
+            _APP_SETTINGS.pop("spotify_enabled", None)
+        else:
+            _APP_SETTINGS["spotify_enabled"] = previous
+
+    raise RuntimeError("Spotify enabled intent could not be persisted")
+
+
+def _configured_spotify_device_name():
+    with _APP_SETTINGS_LOCK:
+        value = _APP_SETTINGS.get("spotify_device_name", "")
+    try:
+        return _validate_spotify_device_name(value)
+    except ValueError:
+        return None
+
+
+def _spotify_device_name_snapshot():
+    configured_name = _configured_spotify_device_name()
+    if configured_name is not None:
+        return {
+            "device_name": configured_name,
+            "configured": True,
+        }
+    with _AUDIO_OUTPUT_LOCK:
+        fallback = ""
+        if _AUDIO_OUTPUT_SELECTED:
+            fallback = str(ALSA_DAC_NAME or "").strip() or str(
+                ALSA_DEVICE or ""
+            ).strip()
+    return {
+        "device_name": fallback,
+        "configured": False,
+    }
+
+
+def _spotify_selected_dac_available():
+    """Return True only when the selected physical DAC is presently usable."""
+
+    try:
+        available, _reason = _selected_audio_output_available_for_playback()
+    except Exception:
+        return False
+    return available is True
+
+
+class _SpotifyDeviceNameMutationError(RuntimeError):
+    def __init__(self, error_code):
+        self.error_code = error_code
+        super().__init__(error_code)
+
+
+def _set_spotify_device_name(value):
+    name = _validate_spotify_device_name(value)
+
+    if not _spotify_selected_dac_available():
+        raise _SpotifyDeviceNameMutationError(
+            "spotify_dac_unavailable"
+        )
+
+    with _SPOTIFY_ORCHESTRATOR_LOCK:
+        app = APP_INSTANCE
+        coordinator = getattr(app, "spotify_coordinator", None)
+        if coordinator is None:
+            raise _SpotifyDeviceNameMutationError(
+                "spotify_device_name_update_failed"
+            )
+        try:
+            snapshot = coordinator.status_snapshot()
+        except Exception:
+            raise _SpotifyDeviceNameMutationError(
+                "spotify_device_name_update_failed"
+            ) from None
+        if (
+            not isinstance(snapshot, dict)
+            or set(snapshot) != {
+                "state",
+                "spotify_owner",
+                "native_blocked",
+            }
+            or not isinstance(snapshot.get("state"), str)
+            or type(snapshot.get("spotify_owner")) is not bool
+            or type(snapshot.get("native_blocked")) is not bool
+        ):
+            raise _SpotifyDeviceNameMutationError(
+                "spotify_device_name_update_failed"
+            )
+        if snapshot["native_blocked"] is True:
+            raise _SpotifyDeviceNameMutationError(
+                "spotify_device_name_blocked"
+            )
+
+        lifecycle = getattr(app, "spotify_orchestrator", None)
+        binding = getattr(app, "spotify_orchestrator_binding", None)
+        if (lifecycle is None) != (binding is None):
+            raise _SpotifyDeviceNameMutationError(
+                "spotify_device_name_update_failed"
+            )
+        if lifecycle is not None:
+            try:
+                lifecycle.retire()
+            except Exception:
+                raise _SpotifyDeviceNameMutationError(
+                    "spotify_device_name_update_failed"
+                ) from None
+            app.spotify_orchestrator = None
+            app.spotify_orchestrator_binding = None
+
+        with _APP_SETTINGS_LOCK:
+            previous_present = "spotify_device_name" in _APP_SETTINGS
+            previous_value = _APP_SETTINGS.get("spotify_device_name")
+            _APP_SETTINGS["spotify_device_name"] = name
+        try:
+            persisted = _save_app_settings()
+        except Exception:
+            persisted = False
+        if persisted is not True:
+            with _APP_SETTINGS_LOCK:
+                if previous_present:
+                    _APP_SETTINGS["spotify_device_name"] = previous_value
+                else:
+                    _APP_SETTINGS.pop("spotify_device_name", None)
+            raise _SpotifyDeviceNameMutationError(
+                "spotify_device_name_update_failed"
+            )
+
+    return {
+        "ok": True,
+        "device_name": name,
+        "configured": True,
+    }
+
+
+def _spotify_current_output_binding():
+    """Snapshot the current physical ALSA identity without probing hardware."""
+
+    with _AUDIO_OUTPUT_LOCK:
+        device = str(ALSA_DEVICE or "").strip()
+        card_number, device_number = _alsa_device_numbers(device)
+        if card_number is None or device_number is None:
+            raise SpotifyRuntimeCompositionError(
+                "Selected Spotify output is unavailable"
+            )
+    try:
+        return SpotifyOutputBinding(
+            card_number=int(card_number),
+            device_number=int(device_number),
+        )
+    except (TypeError, ValueError, SpotifyRuntimeCompositionError):
+        raise SpotifyRuntimeCompositionError(
+            "Selected Spotify output is unavailable"
+        ) from None
+
+
+def _spotify_orchestrator_for_current_output():
+    """Return one dormant orchestrator bound to the current selected DAC."""
+
+    with _SPOTIFY_ORCHESTRATOR_LOCK:
+        app = APP_INSTANCE
+        if app is None:
+            raise SpotifyRuntimeCompositionError(
+                "Spotify application is unavailable"
+            )
+
+        binding = _spotify_current_output_binding()
+        try:
+            orchestrator = app.spotify_orchestrator
+            saved_binding = app.spotify_orchestrator_binding
+        except Exception:
+            raise SpotifyRuntimeCompositionError(
+                "Spotify composition state is unavailable"
+            ) from None
+
+        if orchestrator is not None:
+            if saved_binding == binding:
+                return orchestrator
+            raise SpotifyRuntimeCompositionError(
+                "Spotify output binding changed"
+            )
+        if saved_binding is not None:
+            raise SpotifyRuntimeCompositionError(
+                "Spotify composition state is invalid"
+            )
+
+        try:
+            orchestrator = build_spotify_endpoint_lifecycle(
+                binding=binding,
+                device_name=_spotify_device_name_snapshot()["device_name"],
+                coordinator=app.spotify_coordinator,
+                secret_store=app.spotify_secret_store,
+                managed=app.spotify_managed,
+                runtime=app.spotify_runtime,
+            )
+        except SpotifyRuntimeCompositionError:
+            raise
+        except Exception:
+            raise SpotifyRuntimeCompositionError(
+                "Spotify orchestrator could not be composed"
+            ) from None
+
+        app.spotify_orchestrator_binding = binding
+        app.spotify_orchestrator = orchestrator
+        return orchestrator
+
+
+def _existing_spotify_endpoint_lifecycle():
+    """Return the composed endpoint lifecycle without constructing it."""
+
+    with _SPOTIFY_ORCHESTRATOR_LOCK:
+        app = APP_INSTANCE
+        if app is None:
+            return None
+        return getattr(app, "spotify_orchestrator", None)
+
+
+def _spotify_endpoint_control_payload(changed):
+    """Build the exact public response from coordinator authority."""
+
+    app = APP_INSTANCE
+    coordinator = getattr(app, "spotify_coordinator", None)
+    if coordinator is None:
+        raise ValueError("Spotify coordinator unavailable")
+    snapshot = coordinator.status_snapshot()
+    if (
+        not isinstance(snapshot, dict)
+        or set(snapshot) != {
+            "state",
+            "spotify_owner",
+            "native_blocked",
+        }
+        or not isinstance(snapshot.get("state"), str)
+        or type(snapshot.get("spotify_owner")) is not bool
+        or type(snapshot.get("native_blocked")) is not bool
+    ):
+        raise ValueError("Invalid Spotify coordinator status")
+    return {
+        "ok": True,
+        "changed": bool(changed),
+        "state": snapshot["state"],
+        "spotify_owner": snapshot["spotify_owner"],
+        "native_blocked": snapshot["native_blocked"],
+    }
+
+
+def _spotify_rearm_pcm_is_free():
+    """Return True only when the selected Spotify PCM is positively free."""
+
+    app = APP_INSTANCE
+    if app is None:
+        raise SpotifyRuntimeCompositionError(
+            "Spotify application is unavailable"
+        )
+
+    runtime = getattr(app, "spotify_runtime", None)
+    verifier = getattr(runtime, "pcm_verifier", None)
+    if verifier is None:
+        raise SpotifyRuntimeCompositionError(
+            "Spotify PCM verifier is unavailable"
+        )
+
+    binding = _spotify_current_output_binding()
+    return verifier.is_free(
+        card_number=binding.card_number,
+        device_number=binding.device_number,
+    ) is True
+
+
+def _reconcile_existing_spotify_endpoint():
+    """Reconcile runtime state and rearm user-enabled Spotify when safe."""
+
+    try:
+        lifecycle = _existing_spotify_endpoint_lifecycle()
+    except Exception:
+        logger.warning("Spotify endpoint reconciliation lookup failed safely")
+        return True
+
+    if lifecycle is not None:
+        try:
+            if _spotify_selected_dac_available():
+                lifecycle.reconcile()
+            else:
+                # The persisted master intent remains enabled. Physical loss
+                # of the selected DAC withdraws the current endpoint runtime;
+                # automatic rearm below remains responsible for recreating it
+                # only after the selected PCM becomes safely usable again.
+                lifecycle.disable()
+        except Exception:
+            logger.warning("Spotify endpoint reconciliation failed safely")
+            return True
+
+    if not _spotify_enabled_intent():
+        return True
+
+    app = APP_INSTANCE
+    coordinator = getattr(app, "spotify_coordinator", None) if app is not None else None
+    if coordinator is None:
+        return True
+
+    try:
+        snapshot = coordinator.status_snapshot()
+    except Exception:
+        return True
+
+    if (
+        not isinstance(snapshot, dict)
+        or snapshot.get("state") != "disabled"
+        or snapshot.get("spotify_owner") is not False
+        or snapshot.get("native_blocked") is not False
+    ):
+        return True
+
+    if not _spotify_selected_dac_available():
+        return True
+
+    try:
+        if _spotify_rearm_pcm_is_free() is not True:
+            return True
+    except Exception:
+        return True
+
+    try:
+        if lifecycle is None:
+            lifecycle = _spotify_orchestrator_for_current_output()
+        lifecycle.enable()
+    except Exception:
+        logger.debug("Spotify automatic rearm deferred safely")
+
+    return True
+
+
+def _register_spotify_endpoint_reconcile():
+    """Register the single production endpoint reconciliation callback."""
+
+    return GLib.timeout_add(
+        _SPOTIFY_RECONCILE_INTERVAL_MS,
+        _reconcile_existing_spotify_endpoint,
+    )
+
+
+def _shutdown_existing_spotify_endpoint(reason):
+    """Disable an already-composed Spotify lifecycle without constructing it."""
+
+    try:
+        with _SPOTIFY_ORCHESTRATOR_LOCK:
+            app = APP_INSTANCE
+            if app is None:
+                return False
+            lifecycle = getattr(app, "spotify_orchestrator", None)
+            if lifecycle is None:
+                return False
+            return bool(lifecycle.disable())
+    except Exception:
+        logger.warning(
+            "Spotify endpoint cleanup failed safely during %s",
+            str(reason or "shutdown"),
+        )
+        return False
+
+
+def _install_sigterm_main_loop_handler(loop):
+    """Route SIGTERM to the normal GLib main-loop cleanup path."""
+
+    def _request_loop_quit(_signum, _frame):
+        loop.quit()
+
+    signal.signal(signal.SIGTERM, _request_loop_quit)
+    return _request_loop_quit
 
 
 def _read_audio_identity_text(path, limit=16384):
@@ -1792,9 +3264,13 @@ def _selected_audio_output_available_for_playback():
     output and, when saved, requires the DAC identity to still match.
     """
     with _AUDIO_OUTPUT_LOCK:
+        output_selected = _AUDIO_OUTPUT_SELECTED
         driver = ALSA_DRIVER
         device = ALSA_DEVICE
         dac_name = ALSA_DAC_NAME
+
+    if not output_selected:
+        return False, "no audio output selected"
 
     if driver not in _VALID_ALSA_DRIVERS:
         return False, f"unsupported ALSA driver: {driver}"
@@ -1833,7 +3309,176 @@ def _selected_audio_output_available_for_playback():
     return False, f"selected ALSA device {device} not found"
 
 
+def _prepare_spotify_for_native_output_claim():
+    """Withdraw an existing Spotify claim before native output mutation."""
+
+    with _SPOTIFY_ORCHESTRATOR_LOCK:
+        app = APP_INSTANCE
+        if app is None:
+            return False
+        try:
+            orchestrator = app.spotify_orchestrator
+            saved_binding = app.spotify_orchestrator_binding
+        except Exception:
+            return False
+
+        if orchestrator is None and saved_binding is None:
+            return True
+        if orchestrator is None or saved_binding is None:
+            return False
+
+        try:
+            current_binding = _spotify_current_output_binding()
+        except Exception:
+            return False
+        if saved_binding != current_binding:
+            return False
+
+        try:
+            with _AUDIO_OUTPUT_LOCK:
+                selected_driver = str(ALSA_DRIVER or "").strip()
+                selected_device = str(ALSA_DEVICE or "").strip()
+                card_number, device_number = _alsa_device_numbers(selected_device)
+                selected_binding = SpotifyOutputBinding(
+                    card_number=int(card_number),
+                    device_number=int(device_number),
+                )
+            if selected_binding != current_binding:
+                return False
+
+            player = app.player
+            current_driver = str(
+                getattr(player, "current_driver", "") or ""
+            ).strip()
+            current_device = str(
+                getattr(player, "current_device_id", "") or ""
+            ).strip()
+            output_state = str(
+                getattr(player, "output_state", "") or ""
+            ).strip()
+
+            route_matches_selected = (
+                current_driver == selected_driver
+                and current_device == selected_device
+            )
+
+            stable_native_owned = output_state == "active"
+            switching_native_owned = False
+
+            if (
+                output_state == "switching"
+                and getattr(player, "_output_switch_inflight", None) is True
+            ):
+                restore = getattr(player, "_output_switch_restore", None)
+                switching_native_owned = (
+                    isinstance(restore, dict)
+                    and str(restore.get("current_driver") or "").strip()
+                    == selected_driver
+                    and str(restore.get("current_device_id") or "").strip()
+                    == selected_device
+                    and str(restore.get("output_state") or "").strip()
+                    == "active"
+                )
+
+            native_output_owned = (
+                getattr(player, "bit_perfect_mode", None) is True
+                and getattr(player, "exclusive_lock_mode", None) is True
+                and route_matches_selected
+                and (
+                    stable_native_owned
+                    or switching_native_owned
+                )
+            )
+        except Exception:
+            return False
+
+        if native_output_owned:
+            try:
+                snapshot = app.spotify_coordinator.status_snapshot()
+            except Exception:
+                return False
+            return (
+                isinstance(snapshot, dict)
+                and set(snapshot) == {
+                    "state",
+                    "spotify_owner",
+                    "native_blocked",
+                }
+                and snapshot.get("state") == "disabled"
+                and snapshot.get("spotify_owner") is False
+                and snapshot.get("native_blocked") is False
+            )
+
+        try:
+            prepare = getattr(orchestrator, "prepare_native_claim")
+            return bool(prepare())
+        except Exception:
+            logger.error("Spotify native-output handoff failed safely")
+            return False
+
+
+def _native_audio_allowed(operation="playback_start", **_details):
+    app = APP_INSTANCE
+    if app is None:
+        return True
+    try:
+        coordinator = getattr(app, "spotify_coordinator", None)
+    except Exception:
+        coordinator = None
+    if coordinator is None:
+        logger.error(
+            "Native audio permission denied: coordinator unavailable "
+            "operation=%s",
+            operation,
+        )
+        return False
+    try:
+        if not bool(coordinator.can_native_play()):
+            return False
+    except Exception:
+        logger.error(
+            "Native audio permission denied: coordinator check failed "
+            "operation=%s",
+            operation,
+        )
+        return False
+
+    if operation != "output_claim":
+        return True
+
+    source = str(_details.get("source") or "")
+    if source not in ("configure-audio", "set-output"):
+        return True
+
+    if not _prepare_spotify_for_native_output_claim():
+        return False
+
+    try:
+        return bool(coordinator.can_native_play())
+    except Exception:
+        logger.error(
+            "Native audio permission denied after Spotify handoff "
+            "operation=%s",
+            operation,
+        )
+        return False
+
+
+def _install_native_audio_guard(player):
+    setter = getattr(player, "set_native_audio_guard", None)
+    if callable(setter):
+        setter(_native_audio_allowed)
+        return True
+    return False
+
+
 def _require_audio_output_for_playback(reason="playback"):
+    if not _native_audio_allowed("playback_start", source="intentional-play"):
+        logger.warning("Native playback blocked before %s", reason)
+        raise AudioOutputUnavailable(
+            _SPOTIFY_NATIVE_PLAYBACK_BLOCKED,
+            error_code=_SPOTIFY_NATIVE_PLAYBACK_BLOCKED,
+        )
     ok, detail = _selected_audio_output_available_for_playback()
     if ok:
         return True
@@ -1889,6 +3534,213 @@ def _find_discovered_audio_device(device):
     return None
 
 
+# P13_SAVED_DAC_NUMERIC_BINDING_RECOVERY
+def _discovered_audio_device_matches_saved_identity(candidate, saved_name):
+    """Return True only when a discovered device matches saved DAC identity."""
+    if not candidate:
+        return False
+    saved = _normalise_dac_name(saved_name)
+    if not saved:
+        return True
+    return _dac_identity_matches(
+        saved,
+        candidate.get("name"),
+        candidate.get("label"),
+    )
+
+
+def _reresolve_saved_audio_output_binding(*, _return_status=False):
+    """Relocate an existing saved hw:X,Y binding by its saved DAC identity.
+
+    This never establishes first-run selection authority. It operates only
+    when a valid saved output is already authoritative, preserves the saved
+    PCM device number, requires one unique identity match, and routes the
+    physical-binding change through the normal Spotify-safe preference setter.
+
+    Private status mode lets the automatic recovery watch distinguish an
+    already-correct binding from a DAC that has not enumerated yet.
+    """
+
+    def _result(status):
+        if _return_status:
+            return status
+        return status == "relocated"
+
+    with _AUDIO_OUTPUT_LOCK:
+        output_selected = _AUDIO_OUTPUT_SELECTED
+        driver = str(ALSA_DRIVER or "").strip()
+        saved_device = str(ALSA_DEVICE or "").strip()
+        saved_name = _normalise_dac_name(ALSA_DAC_NAME)
+
+    # P6: enumeration never creates selection authority.
+    if not output_selected:
+        return _result("ineligible")
+
+    # Without persisted DAC identity there is no safe automatic relocation key.
+    if not saved_name:
+        return _result("ineligible")
+
+    if driver not in _VALID_ALSA_DRIVERS:
+        return _result("ineligible")
+
+    # Current Settings persistence uses direct hw:X,Y. Legacy plughw entries
+    # remain fail-closed rather than being silently rewritten.
+    if not saved_device.startswith("hw:"):
+        return _result("ineligible")
+
+    _saved_card, saved_device_number = _alsa_device_numbers(saved_device)
+    if saved_device_number is None:
+        return _result("ineligible")
+
+    devices = _discover_audio_devices(include_other=True)
+
+    current = next(
+        (
+            candidate
+            for candidate in devices
+            if str(candidate.get("device") or "").strip() == saved_device
+        ),
+        None,
+    )
+
+    if _discovered_audio_device_matches_saved_identity(
+        current,
+        saved_name,
+    ):
+        return _result("resolved")
+
+    matches = []
+
+    for candidate in devices:
+        candidate_device = str(candidate.get("device") or "").strip()
+
+        _candidate_card, candidate_device_number = _alsa_device_numbers(
+            candidate_device
+        )
+
+        if candidate_device_number != saved_device_number:
+            continue
+
+        if _discovered_audio_device_matches_saved_identity(
+            candidate,
+            saved_name,
+        ):
+            matches.append(candidate)
+
+    if len(matches) == 0:
+        return _result("pending")
+
+    if len(matches) > 1:
+        logger.warning(
+            "Saved DAC identity relocation is ambiguous: "
+            "device=%s name=%s matches=%d",
+            saved_device,
+            saved_name,
+            len(matches),
+        )
+        return _result("ambiguous")
+
+    target = matches[0]
+    target_device = str(target.get("device") or "").strip()
+
+    if not target_device or target_device == saved_device:
+        return _result("pending")
+
+    try:
+        _set_audio_output_preference(
+            driver,
+            target_device,
+            target.get("name") or saved_name,
+            _allow_saved_rebind=True,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Saved DAC identity relocation failed safely: "
+            "%s -> %s (%s)",
+            saved_device,
+            target_device,
+            type(exc).__name__,
+        )
+        return _result("blocked")
+
+    logger.info(
+        "Saved DAC numeric binding relocated: %s -> %s (%s)",
+        saved_device,
+        target_device,
+        saved_name,
+    )
+
+    return _result("relocated")
+
+
+def _saved_audio_output_reresolve_tick(attempt=1):
+    """Retry unresolved saved-DAC identity without fixed boot sleeps."""
+    global _AUDIO_OUTPUT_RERESOLVE_SOURCE
+
+    _AUDIO_OUTPUT_RERESOLVE_SOURCE = 0
+
+    status = _reresolve_saved_audio_output_binding(
+        _return_status=True,
+    )
+
+    if status in ("ineligible", "resolved", "relocated"):
+        logger.info(
+            "Saved DAC recovery watch complete: status=%s attempt=%d",
+            status,
+            int(attempt),
+        )
+        return False
+
+    delay_ms = (
+        _AUDIO_OUTPUT_RERESOLVE_FAST_MS
+        if int(attempt) < _AUDIO_OUTPUT_RERESOLVE_FAST_ATTEMPTS
+        else _AUDIO_OUTPUT_RERESOLVE_SLOW_MS
+    )
+
+    logger.info(
+        "Saved DAC recovery deferred: status=%s attempt=%d retry_ms=%d",
+        status,
+        int(attempt),
+        int(delay_ms),
+    )
+
+    _AUDIO_OUTPUT_RERESOLVE_SOURCE = GLib.timeout_add(
+        delay_ms,
+        lambda: _saved_audio_output_reresolve_tick(attempt + 1),
+    )
+
+    return False
+
+
+def _register_saved_audio_output_reresolve():
+    """Resolve a saved DAC immediately, then watch only while unresolved."""
+    global _AUDIO_OUTPUT_RERESOLVE_SOURCE
+
+    with _AUDIO_OUTPUT_LOCK:
+        output_selected = _AUDIO_OUTPUT_SELECTED
+
+    # P6: no saved selection means no probing and no watch.
+    if not output_selected:
+        return 0
+
+    if _AUDIO_OUTPUT_RERESOLVE_SOURCE:
+        return _AUDIO_OUTPUT_RERESOLVE_SOURCE
+
+    status = _reresolve_saved_audio_output_binding(
+        _return_status=True,
+    )
+
+    if status in ("ineligible", "resolved", "relocated"):
+        return 0
+
+    _AUDIO_OUTPUT_RERESOLVE_SOURCE = GLib.timeout_add(
+        _AUDIO_OUTPUT_RERESOLVE_FAST_MS,
+        lambda: _saved_audio_output_reresolve_tick(1),
+    )
+
+    return _AUDIO_OUTPUT_RERESOLVE_SOURCE
+
+
 def _resolve_dac_name(device=None):
     target = str(device or ALSA_DEVICE or "").strip()
     with _AUDIO_OUTPUT_LOCK:
@@ -1921,12 +3773,14 @@ def _audio_output_locked_state():
 
 def _audio_output_state():
     with _AUDIO_OUTPUT_LOCK:
+        output_selected = _AUDIO_OUTPUT_SELECTED
         driver = ALSA_DRIVER
         device = ALSA_DEVICE
         # Keep /status lightweight: do not run aplay during polling.
         # The Settings devices endpoint resolves friendly names on demand.
-        name = ALSA_DAC_NAME or ALSA_DEVICE
+        name = (ALSA_DAC_NAME or ALSA_DEVICE) if output_selected else ""
     out = {
+        "output_selected": output_selected,
         "alsa_driver": driver,
         "alsa_device": device,
         "dac_name": name,
@@ -1937,7 +3791,21 @@ def _audio_output_state():
 
 def _audio_output_settings_state():
     out = _audio_output_state()
-    selected = _find_discovered_audio_device(out.get("alsa_device"))
+    with _AUDIO_OUTPUT_LOCK:
+        saved_name = ALSA_DAC_NAME
+    selected = (
+        _find_discovered_audio_device(out.get("alsa_device"))
+        if out.get("output_selected") is True
+        else None
+    )
+    if (
+        selected is not None
+        and not _discovered_audio_device_matches_saved_identity(
+            selected,
+            saved_name,
+        )
+    ):
+        selected = None
     recommended_only = _recommended_audio_outputs_only()
     out.update({
         "recommended_only": recommended_only,
@@ -2087,10 +3955,43 @@ def _status_playback_context(player):
             "context": CURRENT_CONTEXT,
         }
 
+    if _qobuz_playback_is_active():
+        qobuz_track_id = (
+            _qobuz_active_queue_id()
+            or str(CURRENT_CONTEXT.get("track_id") or "")
+        )
+        return {
+            "playback_state": "playing" if is_playing else "paused",
+            "current_track_valid": bool(qobuz_track_id),
+            "source": "qobuz",
+            "current_track_id": qobuz_track_id or None,
+            "context": CURRENT_CONTEXT,
+        }
+
     context = LOCAL_PLAYBACK_CONTEXT if _is_local_playback_context() else CURRENT_CONTEXT
     context_track_id = str(context.get("track_id") or "")
-    queue_source = str((queue_meta or {}).get("source") or "").lower()
-    queue_is_local = bool(queue_track_id) and (queue_source == "local" or str(queue_track_id).startswith("local:"))
+    queue_source = (
+        _queue_item_source(queue_track_id, queue_meta)
+        if queue_track_id else None
+    )
+    queue_is_local = bool(queue_track_id) and queue_source == "local"
+
+    # Direct/test Local playback can intentionally leave an unrelated cloud
+    # queue loaded.  An explicitly active Local playback context is transport
+    # truth and must not be reclassified as that retained non-Local queue.
+    if (
+        _is_local_playback_context()
+        and context_track_id
+        and queue_track_id
+        and queue_source != "local"
+    ):
+        return {
+            "playback_state": "playing" if is_playing else "paused",
+            "current_track_valid": True,
+            "source": "local",
+            "current_track_id": context_track_id,
+            "context": context,
+        }
 
     if queue_is_local:
         if _is_local_playback_context() and context_track_id == str(queue_track_id):
@@ -2170,7 +4071,7 @@ def _status_playback_context(player):
             return {
                 "playback_state": "playing",
                 "current_track_valid": True,
-                "source": "tidal",
+                "source": _queue_item_source(queue_track_id, queue_meta),
                 "current_track_id": queue_track_id,
                 "context": derived,
             }
@@ -2194,7 +4095,18 @@ def _status_playback_context(player):
         return {
             "playback_state": "playing" if is_playing else "paused",
             "current_track_valid": True,
-            "source": "local" if _is_local_playback_context() else "tidal",
+            "source": (
+                "local"
+                if _is_local_playback_context()
+                else (
+                    _queue_item_source(queue_track_id, queue_meta)
+                    if (
+                        queue_track_id
+                        and context_track_id == str(queue_track_id)
+                    )
+                    else "tidal"
+                )
+            ),
             "current_track_id": context_track_id,
             "context": context,
         }
@@ -2331,6 +4243,7 @@ def _reset_idle_playback_context():
 def _finalize_end_of_queue_playback(reason):
     """Stop final queue playback while preserving queue/repeat/shuffle state."""
     _invalidate_tidal_stream_resolution(reason)
+    _invalidate_qobuz_playback(reason)
     global PAUSED_PLAYBACK_POSITION, PAUSED_PLAYBACK_TRACK_ID
     logger.info("%s", reason)
     try:
@@ -2599,28 +4512,68 @@ def _bit_perfect_state(audio_state=None):
     return payload
 
 
-def _set_audio_output_preference(driver, device, dac_name=""):
-    global ALSA_DRIVER, ALSA_DEVICE, ALSA_DAC_NAME
+def _set_audio_output_preference(
+    driver,
+    device,
+    dac_name="",
+    *,
+    _allow_saved_rebind=False,
+):
+    global ALSA_DRIVER, ALSA_DEVICE, ALSA_DAC_NAME, _AUDIO_OUTPUT_SELECTED
     driver = _validate_audio_driver(driver)
     device = _validate_audio_device(device)
     discovered = _find_discovered_audio_device(device)
     if not discovered:
         raise ValueError("Selected ALSA output is not currently available.")
-    if _recommended_audio_outputs_only() and not discovered.get("recommended"):
+    if (
+        not _allow_saved_rebind
+        and _recommended_audio_outputs_only()
+        and not discovered.get("recommended")
+    ):
         raise ValueError(
             "This is an Other output. Turn off Only show recommended devices "
             "and accept the Volume Safety warning before selecting it."
         )
-    name = (
-        _normalise_dac_name(discovered.get("name"))
-        or _normalise_dac_name(dac_name)
-        or device
+    name = _normalise_dac_name(discovered.get("name")) or device
+    card_number, device_number = _alsa_device_numbers(device)
+    requested_binding = SpotifyOutputBinding(
+        card_number=int(card_number),
+        device_number=int(device_number),
     )
-    _save_audio_output_config(driver, device, name)
-    with _AUDIO_OUTPUT_LOCK:
-        ALSA_DRIVER = driver
-        ALSA_DEVICE = device
-        ALSA_DAC_NAME = name
+
+    with _SPOTIFY_ORCHESTRATOR_LOCK:
+        app = APP_INSTANCE
+        lifecycle = (
+            getattr(app, "spotify_orchestrator", None)
+            if app is not None
+            else None
+        )
+        saved_binding = (
+            getattr(app, "spotify_orchestrator_binding", None)
+            if app is not None
+            else None
+        )
+        if (lifecycle is None) != (saved_binding is None):
+            raise SpotifyRuntimeCompositionError(
+                "Spotify composition state is invalid"
+            )
+
+        if lifecycle is not None and saved_binding != requested_binding:
+            try:
+                lifecycle.retire()
+            except Exception:
+                raise SpotifyRuntimeCompositionError(
+                    "Spotify endpoint could not be retired safely"
+                ) from None
+            app.spotify_orchestrator = None
+            app.spotify_orchestrator_binding = None
+
+        _save_audio_output_config(driver, device, name)
+        with _AUDIO_OUTPUT_LOCK:
+            ALSA_DRIVER = driver
+            ALSA_DEVICE = device
+            ALSA_DAC_NAME = name
+            _AUDIO_OUTPUT_SELECTED = True
     logger.info("Audio output preference saved: %s / %s (%s)", driver, device, name or "unnamed")
     return _audio_output_settings_state()
 
@@ -2650,8 +4603,10 @@ def _save_app_settings():
         with open(tmp, "w") as f:
             json.dump(data, f)
         os.replace(tmp, _APP_SETTINGS_FILE)
+        return True
     except Exception as e:
         logger.warning("save_app_settings failed: %s", e)
+        return False
 
 
 def _recommended_audio_outputs_only():
@@ -2738,17 +4693,551 @@ def _tidal_infinite_play_mode():
         return _normalise_tidal_infinite_play_mode(_APP_SETTINGS.get("tidal_infinite_play_mode"))
 
 
-def _set_tidal_infinite_play_settings(enabled=None, mode=None):
+
+def _normalise_infinite_play_provider(provider):
+    provider = str(provider or "").strip().lower()
+    if provider in ("tidal", "qobuz"):
+        return provider
+    return "tidal"
+
+
+def _infinite_play_saved_provider():
     with _APP_SETTINGS_LOCK:
-        if enabled is not None:
-            _APP_SETTINGS["tidal_infinite_play"] = bool(enabled)
-        if mode is not None:
-            _APP_SETTINGS["tidal_infinite_play_mode"] = _normalise_tidal_infinite_play_mode(mode)
-    _save_app_settings()
+        return _normalise_infinite_play_provider(
+            _APP_SETTINGS.get("infinite_play_provider")
+        )
+
+
+def _qobuz_infinite_play_available():
+    try:
+        backend = (
+            getattr(APP_INSTANCE, "qobuz_backend", None)
+            if APP_INSTANCE is not None
+            else None
+        )
+        if backend is None:
+            return False
+        state = backend.status()
+        return bool(
+            isinstance(state, dict)
+            and state.get("usable") is True
+        )
+    except Exception as exc:
+        logger.debug(
+            "Infinite Play Qobuz availability check failed safely: %s",
+            exc,
+        )
+        return False
+
+
+def _effective_infinite_play_provider():
+    """Resolve runtime provider without destroying the saved preference."""
+    saved = _infinite_play_saved_provider()
+
+    try:
+        tidal_available = bool(_tidal_login_snapshot())
+    except Exception:
+        tidal_available = False
+
+    qobuz_available = _qobuz_infinite_play_available()
+
+    if tidal_available and qobuz_available:
+        return saved
+    if tidal_available:
+        return "tidal"
+    if qobuz_available:
+        return "qobuz"
+    return None
+
+
+def _infinite_play_settings_state():
     return {
         "enabled": _tidal_infinite_play_enabled(),
         "mode": _tidal_infinite_play_mode(),
+        "provider": _infinite_play_saved_provider(),
+        "effective_provider": _effective_infinite_play_provider(),
     }
+
+
+def _set_tidal_infinite_play_settings(
+    enabled=None,
+    mode=None,
+    provider=None,
+):
+    normalized_provider = None
+
+    if provider is not None:
+        normalized_provider = str(provider or "").strip().lower()
+        if normalized_provider not in ("tidal", "qobuz"):
+            raise ValueError(
+                "Infinite Play provider must be tidal or qobuz."
+            )
+
+    with _APP_SETTINGS_LOCK:
+        if enabled is not None:
+            _APP_SETTINGS["tidal_infinite_play"] = bool(enabled)
+
+        if mode is not None:
+            _APP_SETTINGS["tidal_infinite_play_mode"] = (
+                _normalise_tidal_infinite_play_mode(mode)
+            )
+
+        if normalized_provider is not None:
+            _APP_SETTINGS["infinite_play_provider"] = (
+                normalized_provider
+            )
+
+    _save_app_settings()
+    return _infinite_play_settings_state()
+
+
+def _normalise_automix_provider(provider):
+    provider = str(provider or "").strip().lower()
+
+    if provider in ("tidal", "qobuz"):
+        return provider
+
+    return "tidal"
+
+
+def _automix_saved_provider():
+    with _APP_SETTINGS_LOCK:
+        return _normalise_automix_provider(
+            _APP_SETTINGS.get("automix_provider")
+        )
+
+
+def _qobuz_automix_available():
+    try:
+        backend = (
+            getattr(APP_INSTANCE, "qobuz_backend", None)
+            if APP_INSTANCE is not None
+            else None
+        )
+
+        if backend is None:
+            return False
+
+        state = backend.status()
+
+        return bool(
+            isinstance(state, dict)
+            and state.get("usable") is True
+        )
+
+    except Exception as exc:
+        logger.debug(
+            "Auto-Mix Qobuz availability check failed safely: %s",
+            exc,
+        )
+        return False
+
+
+def _effective_automix_provider():
+    """Resolve runtime provider without overwriting saved preference."""
+    saved = _automix_saved_provider()
+
+    try:
+        tidal_available = bool(
+            _tidal_login_snapshot()
+        )
+    except Exception:
+        tidal_available = False
+
+    qobuz_available = _qobuz_automix_available()
+
+    if tidal_available and qobuz_available:
+        return saved
+
+    if tidal_available:
+        return "tidal"
+
+    if qobuz_available:
+        return "qobuz"
+
+    return None
+
+
+def _automix_settings_state():
+    return {
+        "provider": _automix_saved_provider(),
+        "effective_provider": _effective_automix_provider(),
+    }
+
+
+def _set_automix_settings(provider=None):
+    normalized_provider = None
+
+    if provider is not None:
+        normalized_provider = str(
+            provider or ""
+        ).strip().lower()
+
+        if normalized_provider not in (
+            "tidal",
+            "qobuz",
+        ):
+            raise ValueError(
+                "Auto-Mix provider must be tidal or qobuz."
+            )
+
+    with _APP_SETTINGS_LOCK:
+        if normalized_provider is not None:
+            _APP_SETTINGS["automix_provider"] = (
+                normalized_provider
+            )
+
+    _save_app_settings()
+
+    return _automix_settings_state()
+
+
+
+
+
+def _normalise_playlist_maintenance_provider(provider):
+    provider = str(provider or "").strip().lower()
+    if provider in ("tidal", "qobuz"):
+        return provider
+    return "tidal"
+
+
+def _playlist_maintenance_saved_provider():
+    with _APP_SETTINGS_LOCK:
+        return _normalise_playlist_maintenance_provider(
+            _APP_SETTINGS.get("playlist_maintenance_provider")
+        )
+
+
+def _qobuz_playlist_maintenance_available():
+    try:
+        backend = (
+            getattr(APP_INSTANCE, "qobuz_backend", None)
+            if APP_INSTANCE is not None
+            else None
+        )
+        if backend is None:
+            return False
+
+        state = backend.status()
+        return bool(
+            isinstance(state, dict)
+            and state.get("usable") is True
+        )
+    except Exception as exc:
+        logger.debug(
+            "Playlist Maintenance Qobuz availability check failed safely: %s",
+            exc,
+        )
+        return False
+
+
+def _effective_playlist_maintenance_provider():
+    """Resolve runtime provider without overwriting saved preference."""
+    saved = _playlist_maintenance_saved_provider()
+
+    try:
+        tidal_available = bool(_tidal_login_snapshot())
+    except Exception:
+        tidal_available = False
+
+    qobuz_available = _qobuz_playlist_maintenance_available()
+
+    if tidal_available and qobuz_available:
+        return saved
+    if tidal_available:
+        return "tidal"
+    if qobuz_available:
+        return "qobuz"
+    return None
+
+
+def _playlist_maintenance_settings_state():
+    return {
+        "provider": _playlist_maintenance_saved_provider(),
+        "effective_provider": _effective_playlist_maintenance_provider(),
+    }
+
+
+def _set_playlist_maintenance_settings(provider=None):
+    normalized_provider = None
+
+    if provider is not None:
+        normalized_provider = str(provider or "").strip().lower()
+
+        if normalized_provider not in ("tidal", "qobuz"):
+            raise ValueError(
+                "Playlist Maintenance provider must be tidal or qobuz."
+            )
+
+    with _APP_SETTINGS_LOCK:
+        if normalized_provider is not None:
+            _APP_SETTINGS["playlist_maintenance_provider"] = (
+                normalized_provider
+            )
+
+    _save_app_settings()
+    return _playlist_maintenance_settings_state()
+
+
+def _qobuz_playlist_duplicate_scan():
+    """Find duplicate owned Qobuz playlists without provider mutation."""
+    backend = (
+        getattr(APP_INSTANCE, "qobuz_backend", None)
+        if APP_INSTANCE is not None
+        else None
+    )
+
+    if backend is None:
+        raise RuntimeError("Qobuz playlist service is unavailable.")
+
+    state = backend.status()
+
+    if (
+        not isinstance(state, dict)
+        or state.get("usable") is not True
+    ):
+        raise RuntimeError("Qobuz authentication is required.")
+
+    playlists = backend.get_user_playlists()
+
+    if not isinstance(playlists, list):
+        raise RuntimeError("Qobuz playlist list is invalid.")
+
+    from collections import defaultdict
+
+    normalized = []
+
+    for playlist in playlists:
+        if not isinstance(playlist, dict):
+            continue
+
+        if playlist.get("playlist_editable") is not True:
+            continue
+
+        playlist_id = str(
+            playlist.get("playlist_id") or ""
+        ).strip()
+
+        if not playlist_id:
+            continue
+
+        name = str(
+            playlist.get("name") or ""
+        ).strip()
+
+        try:
+            track_count = int(
+                playlist.get("track_count", 0) or 0
+            )
+        except (TypeError, ValueError):
+            continue
+
+        if track_count < 0:
+            continue
+
+        normalized.append({
+            "id": playlist_id,
+            "name": name,
+            "num_tracks": track_count,
+        })
+
+    by_name = defaultdict(list)
+
+    for playlist in normalized:
+        by_name[
+            playlist["name"].strip()
+        ].append(playlist)
+
+    candidates = []
+
+    for _name, group in by_name.items():
+        by_count = defaultdict(list)
+
+        for playlist in group:
+            by_count[
+                int(playlist.get("num_tracks", 0))
+            ].append(playlist)
+
+        for _count, matches in by_count.items():
+            if len(matches) >= 2:
+                candidates.append(matches)
+
+    if not candidates:
+        return {
+            "groups": [],
+            "total_to_delete": 0,
+        }
+
+    duration_results = {}
+
+    for group in candidates:
+        for playlist in group:
+            playlist_id = playlist["id"]
+
+            if playlist_id in duration_results:
+                continue
+
+            try:
+                complete = _complete_streaming_playlist_payload(
+                    "qobuz",
+                    playlist_id,
+                    qobuz_backend=backend,
+                )
+
+                if (
+                    not isinstance(complete, dict)
+                    or complete.get("complete") is not True
+                ):
+                    raise RuntimeError(
+                        "Qobuz playlist did not resolve completely."
+                    )
+
+                resolved_total = int(
+                    complete.get("total", -1)
+                )
+
+                if resolved_total != int(
+                    playlist["num_tracks"]
+                ):
+                    raise RuntimeError(
+                        "Qobuz playlist changed during duplicate scan."
+                    )
+
+                tracks = complete.get("tracks")
+
+                if not isinstance(tracks, list):
+                    raise RuntimeError(
+                        "Qobuz playlist tracks are invalid."
+                    )
+
+                total_duration = sum(
+                    int(track.get("duration", 0) or 0)
+                    for track in tracks
+                    if isinstance(track, dict)
+                )
+
+                duration_results[
+                    playlist_id
+                ] = total_duration
+
+            except Exception as exc:
+                logger.warning(
+                    "Qobuz duplicate duration fetch failed for %s: %s",
+                    playlist_id,
+                    exc,
+                )
+                duration_results[playlist_id] = None
+
+    result_groups = []
+
+    for group in candidates:
+        valid = []
+
+        for playlist in group:
+            duration = duration_results.get(
+                playlist["id"]
+            )
+
+            if duration is None:
+                continue
+
+            item = dict(playlist)
+            item["duration"] = duration
+            valid.append(item)
+
+        if len(valid) < 2:
+            continue
+
+        valid.sort(
+            key=lambda playlist: playlist["duration"],
+            reverse=True,
+        )
+
+        to_keep = []
+        to_delete = []
+        used = set()
+
+        for i in range(len(valid)):
+            if i in used:
+                continue
+
+            keep = valid[i]
+            duplicates = []
+
+            for j in range(i + 1, len(valid)):
+                if j in used:
+                    continue
+
+                if abs(
+                    valid[j]["duration"]
+                    - keep["duration"]
+                ) <= 30:
+                    duplicates.append(valid[j])
+                    used.add(j)
+
+            if duplicates:
+                used.add(i)
+                to_keep.append(keep)
+                to_delete.extend(duplicates)
+
+        if to_delete:
+            result_groups.append({
+                "name": valid[0]["name"],
+                "keep": to_keep,
+                "delete": to_delete,
+            })
+
+    total_to_delete = sum(
+        len(group["delete"])
+        for group in result_groups
+    )
+
+    logger.info(
+        "Qobuz find_duplicates: %d groups, %d to delete",
+        len(result_groups),
+        total_to_delete,
+    )
+
+    return {
+        "groups": result_groups,
+        "total_to_delete": total_to_delete,
+    }
+
+
+def _provider_radio_visibility_settings():
+    with _APP_SETTINGS_LOCK:
+        return {
+            "show_tidal_radio": bool(
+                _APP_SETTINGS.get("show_tidal_radio", False)
+            ),
+            "show_qobuz_radio": bool(
+                _APP_SETTINGS.get("show_qobuz_radio", False)
+            ),
+        }
+
+
+def _set_provider_radio_visibility_settings(
+    show_tidal_radio=None,
+    show_qobuz_radio=None,
+):
+    updates = (
+        ("show_tidal_radio", show_tidal_radio),
+        ("show_qobuz_radio", show_qobuz_radio),
+    )
+
+    with _APP_SETTINGS_LOCK:
+        for key, value in updates:
+            if value is None:
+                continue
+            if not isinstance(value, bool):
+                raise ValueError(
+                    key + " must be true or false."
+                )
+            _APP_SETTINGS[key] = value
+
+    _save_app_settings()
+    return _provider_radio_visibility_settings()
 
 
 # =========================================================================
@@ -2925,7 +5414,7 @@ def _queue_group_key_locked(track_id):
     album_id = str(meta.get("album_id") or "").strip().lower()
     album = str(meta.get("album") or "").strip().lower()
     artist = str(meta.get("album_artist") or meta.get("artist") or "").strip().lower()
-    source = str(meta.get("source") or ("local" if str(track_id).startswith("local:") else "tidal")).lower()
+    source = _queue_item_source(track_id, meta)
     return album_id or context_id or (artist + "\0" + album if album else "") or source
 
 
@@ -4227,6 +6716,8 @@ def build_current_scrobble_track(source=None):
             "album": album,
             "duration": 0,
         }
+    elif context_source == "qobuz":
+        context = CURRENT_CONTEXT
     else:
         context_source = "tidal"
         context = CURRENT_CONTEXT
@@ -4532,6 +7023,964 @@ def _resolve_now_playing_tidal_album():
     }
 
 
+# ---------------------------------------------------------------------------
+# Q10F — provider-aware Go To Album
+# ---------------------------------------------------------------------------
+
+def _q10f_qobuz_authenticated():
+    backend = (
+        getattr(APP_INSTANCE, "qobuz_backend", None)
+        if APP_INSTANCE else None
+    )
+    if backend is None:
+        return False
+
+    try:
+        status = backend.status()
+        return bool(
+            isinstance(status, dict)
+            and status.get("authenticated") is True
+        )
+    except Exception:
+        return bool(getattr(backend, "authenticated", False))
+
+
+def _q10f_qobuz_native_track_id(playback):
+    playback = playback or {}
+    context = playback.get("context") or {}
+
+    candidates = [
+        playback.get("current_track_id"),
+        context.get("track_id"),
+    ]
+
+    for value in candidates:
+        value = str(value or "").strip()
+        if value.startswith("qobuz:"):
+            value = value[6:]
+        if value.isascii() and value.isdigit() and int(value) > 0:
+            return value
+
+    return ""
+
+
+def _q10f_qobuz_playback_metadata(playback):
+    """Return authoritative Qobuz metadata, enriching from track/get if needed."""
+    playback = playback or {}
+    context = dict(playback.get("context") or {})
+
+    metadata = {
+        "artist": str(context.get("artist") or "").strip(),
+        "title": str(context.get("title") or "").strip(),
+        "album": str(context.get("album") or "").strip(),
+        "album_id": str(context.get("album_id") or "").strip(),
+        "cover": str(context.get("cover") or "").strip(),
+        "duration": context.get("duration") or 0,
+    }
+
+    need_detail = not (
+        metadata["artist"]
+        and metadata["title"]
+        and metadata["album"]
+        and metadata["album_id"]
+    )
+
+    if not need_detail:
+        return metadata
+
+    backend = (
+        getattr(APP_INSTANCE, "qobuz_backend", None)
+        if APP_INSTANCE else None
+    )
+    native_track_id = _q10f_qobuz_native_track_id(playback)
+
+    if backend is None or not native_track_id:
+        return metadata
+
+    try:
+        detail = backend.get_track(native_track_id)
+    except Exception as exc:
+        logger.info(
+            "Q10F Qobuz track metadata enrichment unavailable "
+            "track_id=%s error=%s",
+            native_track_id,
+            exc,
+        )
+        return metadata
+
+    if not isinstance(detail, dict):
+        return metadata
+
+    metadata["artist"] = (
+        str(detail.get("artist") or "").strip()
+        or metadata["artist"]
+    )
+    metadata["title"] = (
+        str(detail.get("title") or "").strip()
+        or metadata["title"]
+    )
+    metadata["album"] = (
+        str(detail.get("album") or "").strip()
+        or metadata["album"]
+    )
+    metadata["album_id"] = (
+        str(detail.get("album_id") or "").strip()
+        or metadata["album_id"]
+    )
+    metadata["cover"] = (
+        str(detail.get("artwork_url") or "").strip()
+        or metadata["cover"]
+    )
+    metadata["duration"] = (
+        detail.get("duration")
+        or metadata["duration"]
+        or 0
+    )
+    metadata["isrc"] = str(detail.get("isrc") or "").strip()
+
+    return metadata
+
+
+def _q10f_album_family_norm(value):
+    """
+    Normalize an album into a conservative release-family identity.
+
+    Only trailing edition/remaster qualifiers are ignored. Meaningful
+    album-title text remains part of the identity.
+    """
+    import re
+
+    raw = str(value or "").strip()
+
+    if not raw:
+        return ""
+
+    qualifier_words = (
+        r"remaster(?:ed)?"
+        r"|deluxe"
+        r"|expanded"
+        r"|anniversary"
+        r"|special\s+edition"
+        r"|legacy\s+edition"
+        r"|collector(?:'s|s)?\s+edition"
+        r"|reissue"
+    )
+
+    previous = None
+
+    while raw != previous:
+        previous = raw
+
+        # Trailing parenthetical/bracketed edition qualifier:
+        #   Album (Remastered)
+        #   Album [2022 Remaster]
+        raw = re.sub(
+            r"\s*[\(\[]"
+            r"(?=[^\)\]]*(?:" + qualifier_words + r"))"
+            r"[^\)\]]*"
+            r"[\)\]]\s*$",
+            "",
+            raw,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        # Trailing dash/colon edition qualifier:
+        #   Album - 20th Anniversary Edition
+        #   Album: 2022 Remaster
+        raw = re.sub(
+            r"\s*[-–—:]\s*"
+            r"(?=.*(?:" + qualifier_words + r"))"
+            r"(?:"
+            r"\d{4}\s+"
+            r"|\d+(?:st|nd|rd|th)\s+"
+            r")?"
+            r".*$",
+            "",
+            raw,
+            flags=re.IGNORECASE,
+        ).strip()
+
+    return _now_playing_album_norm(raw)
+
+
+def _q10f_choose_album_family_candidate(
+    candidates,
+    expected_album,
+):
+    """
+    Pick one deterministic representative of an already-validated
+    album family.
+
+    Priority:
+      1. exact requested edition title
+      2. plain/base album title
+      3. least-qualified family edition
+      4. stable album-ID tie-break
+
+    candidates:
+        iterable of (album_id, album_title, payload)
+    """
+    expected_album = str(expected_album or "").strip()
+
+    expected_norm = _now_playing_album_norm(
+        expected_album
+    )
+    expected_family = _q10f_album_family_norm(
+        expected_album
+    )
+
+    if not expected_family:
+        return None
+
+    dedup = {}
+
+    for album_id, album_title, payload in candidates:
+        album_id = str(album_id or "").strip()
+        album_title = str(album_title or "").strip()
+
+        if not album_id or not album_title:
+            continue
+
+        if (
+            _q10f_album_family_norm(album_title)
+            != expected_family
+        ):
+            continue
+
+        dedup.setdefault(
+            album_id,
+            (
+                album_id,
+                album_title,
+                payload,
+            ),
+        )
+
+    if not dedup:
+        return None
+
+    def rank(item):
+        album_id, album_title, _payload = item
+
+        candidate_norm = _now_playing_album_norm(
+            album_title
+        )
+
+        if candidate_norm == expected_norm:
+            tier = 0
+        elif candidate_norm == expected_family:
+            tier = 1
+        else:
+            tier = 2
+
+        qualifier_cost = max(
+            0,
+            len(candidate_norm) - len(expected_family),
+        )
+
+        return (
+            tier,
+            qualifier_cost,
+            candidate_norm,
+            str(album_id),
+        )
+
+    return min(
+        dedup.values(),
+        key=rank,
+    )
+
+
+def _q10f_strict_tidal_cross_provider_match(
+    artist,
+    title,
+    album,
+    duration=0,
+):
+    """Resolve one exact TIDAL album for non-TIDAL provider metadata."""
+    artist = str(artist or "").strip()
+    title = str(title or "").strip()
+    album = str(album or "").strip()
+
+    if not artist or not title or not album:
+        return ""
+
+    expected_artist = _now_playing_album_norm(artist)
+    expected_title = _now_playing_album_norm(title)
+    expected_album = _now_playing_album_norm(album)
+    expected_album_family = _q10f_album_family_norm(album)
+
+    try:
+        expected_duration = int(round(float(duration or 0)))
+    except Exception:
+        expected_duration = 0
+
+    backend = APP_INSTANCE.backend if APP_INSTANCE else None
+    session = getattr(backend, "session", None)
+
+    if not session:
+        return ""
+
+    query = " ".join((artist, title)).strip()
+
+    try:
+        raw = session.search(query, limit=30)
+        tracks = getattr(raw, "tracks", None)
+        if tracks is None and isinstance(raw, dict):
+            tracks = raw.get("tracks")
+        tracks = list(tracks or [])
+    except Exception as exc:
+        logger.info(
+            "Q10F TIDAL cross-provider album search unavailable "
+            "artist=%r title=%r album=%r error=%s",
+            artist,
+            title,
+            album,
+            exc,
+        )
+        return ""
+
+    family_candidates = []
+
+    for track in tracks:
+        candidate_title = str(
+            getattr(track, "name", "") or ""
+        ).strip()
+
+        artist_obj = getattr(track, "artist", None)
+        candidate_artist = (
+            str(getattr(artist_obj, "name", "") or "").strip()
+            if artist_obj else ""
+        )
+
+        album_obj = getattr(track, "album", None)
+        candidate_album = (
+            str(getattr(album_obj, "name", "") or "").strip()
+            if album_obj else ""
+        )
+        candidate_album_id = (
+            str(getattr(album_obj, "id", "") or "").strip()
+            if album_obj else ""
+        )
+
+        if not candidate_album_id:
+            continue
+        if _now_playing_album_norm(candidate_artist) != expected_artist:
+            continue
+        if _now_playing_album_norm(candidate_title) != expected_title:
+            continue
+        candidate_album_norm = _now_playing_album_norm(
+            candidate_album
+        )
+        candidate_album_family = _q10f_album_family_norm(
+            candidate_album
+        )
+
+        exact_album_match = (
+            candidate_album_norm == expected_album
+        )
+
+        family_album_match = bool(
+            expected_album_family
+            and candidate_album_family
+            and candidate_album_family == expected_album_family
+        )
+
+        if not exact_album_match and not family_album_match:
+            continue
+
+        if expected_duration > 0:
+            try:
+                candidate_duration = int(round(float(
+                    getattr(track, "duration", 0) or 0
+                )))
+            except Exception:
+                candidate_duration = 0
+
+            if (
+                candidate_duration > 0
+                and abs(candidate_duration - expected_duration) > 4
+            ):
+                continue
+
+        family_candidates.append(
+            (
+                candidate_album_id,
+                candidate_album,
+                track,
+            )
+        )
+
+    chosen = _q10f_choose_album_family_candidate(
+        family_candidates,
+        album,
+    )
+
+    if not chosen:
+        return ""
+
+    chosen_album_id, chosen_album, _track = chosen
+
+    if len({
+        candidate[0]
+        for candidate in family_candidates
+    }) > 1:
+        logger.info(
+            "Q10F TIDAL album-family representative selected "
+            "artist=%r title=%r album=%r selected_album=%r "
+            "selected_id=%s candidate_albums=%d",
+            artist,
+            title,
+            album,
+            chosen_album,
+            chosen_album_id,
+            len({
+                candidate[0]
+                for candidate in family_candidates
+            }),
+        )
+
+    return chosen_album_id
+
+
+def _q10f_strict_qobuz_album_match(
+    source,
+    artist,
+    title,
+    album="",
+    duration=0,
+):
+    """Return one unambiguous normalized Qobuz album destination."""
+    source = str(source or "").strip().lower()
+    artist = str(artist or "").strip()
+    title = str(title or "").strip()
+    album = str(album or "").strip()
+
+    if source not in ("tidal", "local", "radio"):
+        return None
+
+    if not artist or not title:
+        return None
+
+    # TIDAL and Local normally carry trustworthy release identity. Refuse
+    # cross-provider guessing when it is absent.
+    if source in ("tidal", "local") and not album:
+        return None
+
+    expected_artist = _now_playing_album_norm(artist)
+    expected_title = _now_playing_album_norm(title)
+    expected_album = _now_playing_album_norm(album)
+    expected_album_family = _q10f_album_family_norm(album)
+
+    try:
+        expected_duration = int(round(float(duration or 0)))
+    except Exception:
+        expected_duration = 0
+
+    backend = (
+        getattr(APP_INSTANCE, "qobuz_backend", None)
+        if APP_INSTANCE else None
+    )
+
+    if backend is None:
+        return None
+
+    query = " ".join((artist, title)).strip()
+
+    try:
+        result = backend.search_tracks(
+            query,
+            limit=30,
+            offset=0,
+        )
+    except Exception:
+        raise
+
+    tracks = (
+        result.get("items")
+        if isinstance(result, dict)
+        else None
+    )
+    tracks = list(tracks or [])
+
+    family_candidates = []
+    unqualified_matches = {}
+
+    for track in tracks:
+        if not isinstance(track, dict):
+            continue
+
+        candidate_album_id = str(
+            track.get("album_id") or ""
+        ).strip()
+
+        if not candidate_album_id:
+            continue
+
+        if (
+            _now_playing_album_norm(track.get("artist"))
+            != expected_artist
+        ):
+            continue
+
+        if (
+            _now_playing_album_norm(track.get("title"))
+            != expected_title
+        ):
+            continue
+
+        candidate_album = str(
+            track.get("album") or ""
+        ).strip()
+
+        candidate_album_norm = _now_playing_album_norm(
+            candidate_album
+        )
+        candidate_album_family = _q10f_album_family_norm(
+            candidate_album
+        )
+
+        exact_album_match = bool(
+            expected_album
+            and candidate_album_norm == expected_album
+        )
+
+        family_album_match = bool(
+            expected_album_family
+            and candidate_album_family
+            and candidate_album_family == expected_album_family
+        )
+
+        if (
+            expected_album
+            and not exact_album_match
+            and not family_album_match
+        ):
+            continue
+
+        # Duration corroborates finite provider/local recordings. Radio has no
+        # reliable duration and therefore intentionally skips this evidence.
+        if source != "radio" and expected_duration > 0:
+            try:
+                candidate_duration = int(round(float(
+                    track.get("duration") or 0
+                )))
+            except Exception:
+                candidate_duration = 0
+
+            if (
+                candidate_duration > 0
+                and abs(candidate_duration - expected_duration) > 4
+            ):
+                continue
+
+        if expected_album:
+            family_candidates.append(
+                (
+                    candidate_album_id,
+                    candidate_album,
+                    track,
+                )
+            )
+        else:
+            # Radio may legitimately have no album metadata. Preserve
+            # the older safety rule in that case: artist/title alone
+            # must identify exactly one provider album.
+            unqualified_matches.setdefault(
+                candidate_album_id,
+                track,
+            )
+
+    if expected_album:
+        chosen = _q10f_choose_album_family_candidate(
+            family_candidates,
+            album,
+        )
+
+        if not chosen:
+            return None
+
+        album_id, chosen_album, track = chosen
+
+        confidence = (
+            "strict_metadata"
+            if _now_playing_album_norm(chosen_album)
+            == expected_album
+            else "album_family"
+        )
+
+        unique_family_ids = {
+            candidate[0]
+            for candidate in family_candidates
+        }
+
+        if len(unique_family_ids) > 1:
+            logger.info(
+                "Q10F Qobuz album-family representative selected "
+                "source=%s artist=%r title=%r album=%r "
+                "selected_album=%r selected_id=%s "
+                "candidate_albums=%d",
+                source,
+                artist,
+                title,
+                album,
+                chosen_album,
+                album_id,
+                len(unique_family_ids),
+            )
+
+    else:
+        if len(unqualified_matches) != 1:
+            if unqualified_matches:
+                logger.info(
+                    "Q10F Qobuz artist/title-only match rejected "
+                    "ambiguity source=%s artist=%r title=%r "
+                    "candidate_albums=%d",
+                    source,
+                    artist,
+                    title,
+                    len(unqualified_matches),
+                )
+            return None
+
+        album_id, track = next(
+            iter(unqualified_matches.items())
+        )
+        confidence = "strict_metadata"
+
+    return {
+        "available": True,
+        "provider": "qobuz",
+        "album_id": album_id,
+        "album_title": str(
+            track.get("album") or album
+        ).strip(),
+        "album_artist": str(
+            track.get("artist") or artist
+        ).strip(),
+        "album_cover": str(
+            track.get("artwork_url") or ""
+        ).strip(),
+        "confidence": confidence,
+    }
+
+
+def _resolve_now_playing_qobuz_album(playback=None):
+    if not _q10f_qobuz_authenticated():
+        return {
+            "available": False,
+            "provider": "qobuz",
+            "reason": "qobuz_logged_out",
+        }
+
+    app = APP_INSTANCE
+    player = getattr(app, "player", None) if app else None
+
+    if not app or not player:
+        return {
+            "available": False,
+            "provider": "qobuz",
+            "reason": "player_unavailable",
+        }
+
+    playback = playback or _status_playback_context(player)
+
+    if not playback.get("current_track_valid"):
+        return {
+            "available": False,
+            "provider": "qobuz",
+            "reason": "no_active_track",
+        }
+
+    source = str(
+        playback.get("source") or ""
+    ).strip().lower()
+
+    context = playback.get("context") or {}
+
+    if source == "qobuz":
+        metadata = _q10f_qobuz_playback_metadata(
+            playback
+        )
+
+        album_id = str(
+            metadata.get("album_id") or ""
+        ).strip()
+
+        if not album_id:
+            return {
+                "available": False,
+                "provider": "qobuz",
+                "source": "qobuz",
+                "reason": "album_id_unavailable",
+            }
+
+        return {
+            "available": True,
+            "provider": "qobuz",
+            "source": "qobuz",
+            "album_id": album_id,
+            "album_title": str(
+                metadata.get("album") or ""
+            ).strip(),
+            "album_artist": str(
+                metadata.get("artist") or ""
+            ).strip(),
+            "album_cover": str(
+                metadata.get("cover") or ""
+            ).strip(),
+            "confidence": (
+                "direct"
+                if str(context.get("album_id") or "").strip()
+                else "native_track"
+            ),
+        }
+
+    if source == "radio":
+        track = build_current_scrobble_track(
+            "radio"
+        )
+
+        if not track:
+            return {
+                "available": False,
+                "provider": "qobuz",
+                "source": "radio",
+                "reason": "radio_metadata_unreliable",
+            }
+
+        artist = str(
+            track.get("artist") or ""
+        ).strip()
+        title = str(
+            track.get("title") or ""
+        ).strip()
+        album = str(
+            track.get("album") or ""
+        ).strip()
+        duration = 0
+
+    elif source in ("local", "tidal"):
+        artist = str(
+            context.get("artist") or ""
+        ).strip()
+        title = str(
+            context.get("title") or ""
+        ).strip()
+        album = str(
+            context.get("album") or ""
+        ).strip()
+
+        try:
+            duration = int(float(
+                context.get("duration") or 0
+            ))
+        except Exception:
+            duration = 0
+
+        if not artist or not title or not album:
+            return {
+                "available": False,
+                "provider": "qobuz",
+                "source": source,
+                "reason": "metadata_insufficient",
+            }
+
+    else:
+        return {
+            "available": False,
+            "provider": "qobuz",
+            "source": source,
+            "reason": "unsupported_source",
+        }
+
+    matched = _q10f_strict_qobuz_album_match(
+        source,
+        artist,
+        title,
+        album=album,
+        duration=duration,
+    )
+
+    if not matched:
+        return {
+            "available": False,
+            "provider": "qobuz",
+            "source": source,
+            "reason": "no_confident_match",
+        }
+
+    matched["source"] = source
+    return matched
+
+
+def _resolve_now_playing_tidal_for_qobuz(playback):
+    if not _tidal_login_snapshot():
+        return {
+            "available": False,
+            "provider": "tidal",
+            "reason": "tidal_logged_out",
+        }
+
+    metadata = _q10f_qobuz_playback_metadata(
+        playback
+    )
+
+    artist = str(
+        metadata.get("artist") or ""
+    ).strip()
+    title = str(
+        metadata.get("title") or ""
+    ).strip()
+    album = str(
+        metadata.get("album") or ""
+    ).strip()
+
+    try:
+        duration = int(float(
+            metadata.get("duration") or 0
+        ))
+    except Exception:
+        duration = 0
+
+    if not artist or not title or not album:
+        return {
+            "available": False,
+            "provider": "tidal",
+            "source": "qobuz",
+            "reason": "metadata_insufficient",
+        }
+
+    album_id = _q10f_strict_tidal_cross_provider_match(
+        artist,
+        title,
+        album,
+        duration=duration,
+    )
+
+    if not album_id:
+        return {
+            "available": False,
+            "provider": "tidal",
+            "source": "qobuz",
+            "reason": "no_confident_match",
+        }
+
+    return {
+        "available": True,
+        "provider": "tidal",
+        "source": "qobuz",
+        "album_id": album_id,
+        "album_title": album,
+        "album_artist": artist,
+        "album_cover": "",
+        "confidence": "strict_metadata",
+    }
+
+
+def _resolve_now_playing_album_destinations():
+    """Resolve TIDAL and Qobuz album destinations independently."""
+    app = APP_INSTANCE
+    player = getattr(app, "player", None) if app else None
+
+    unavailable_tidal = {
+        "available": False,
+        "provider": "tidal",
+        "reason": "player_unavailable",
+    }
+    unavailable_qobuz = {
+        "available": False,
+        "provider": "qobuz",
+        "reason": "player_unavailable",
+    }
+
+    if not app or not player:
+        return {
+            "available": False,
+            "source": "",
+            "tidal": unavailable_tidal,
+            "qobuz": unavailable_qobuz,
+        }
+
+    playback = _status_playback_context(player)
+
+    if not playback.get("current_track_valid"):
+        unavailable_tidal["reason"] = "no_active_track"
+        unavailable_qobuz["reason"] = "no_active_track"
+        return {
+            "available": False,
+            "source": "",
+            "tidal": unavailable_tidal,
+            "qobuz": unavailable_qobuz,
+        }
+
+    source = str(
+        playback.get("source") or ""
+    ).strip().lower()
+
+    # Provider failures are deliberately isolated. One catalog being
+    # unavailable must never suppress the other's valid destination.
+    try:
+        if source == "qobuz":
+            tidal_result = (
+                _resolve_now_playing_tidal_for_qobuz(
+                    playback
+                )
+            )
+        else:
+            tidal_result = (
+                _resolve_now_playing_tidal_album()
+            )
+            tidal_result = dict(
+                tidal_result
+                if isinstance(tidal_result, dict)
+                else {}
+            )
+            tidal_result.setdefault(
+                "provider",
+                "tidal",
+            )
+    except Exception as exc:
+        logger.info(
+            "Q10F TIDAL destination resolution failed safely: %s",
+            exc,
+        )
+        tidal_result = {
+            "available": False,
+            "provider": "tidal",
+            "reason": "provider_error",
+        }
+
+    try:
+        qobuz_result = (
+            _resolve_now_playing_qobuz_album(
+                playback
+            )
+        )
+    except Exception as exc:
+        logger.info(
+            "Q10F Qobuz destination resolution failed safely: %s",
+            exc,
+        )
+        qobuz_result = {
+            "available": False,
+            "provider": "qobuz",
+            "reason": "provider_error",
+        }
+
+    available = bool(
+        tidal_result.get("available") is True
+        or qobuz_result.get("available") is True
+    )
+
+    return {
+        "available": available,
+        "source": source,
+        "tidal": tidal_result,
+        "qobuz": qobuz_result,
+    }
+
+
 def start_current_scrobble(track=None, timestamp=None):
     """Send now-playing and schedule final scrobble for the current track."""
     track = track or build_current_scrobble_track()
@@ -4608,6 +8057,17 @@ class HeadlessApp:
 
     # AudioLatency map (matches 1.8.0)
     LATENCY_MAP = AudioLatency.MAP
+
+    def __init__(self):
+        self.spotify_coordinator = SpotifyCoordinator()
+        self.spotify_secret_store = SpotifySecretStore()
+        self.spotify_managed = build_spotify_managed_components()
+        self.spotify_runtime = build_spotify_runtime_components(
+            paths=self.spotify_managed.paths,
+            managed=self.spotify_managed,
+        )
+        self.spotify_orchestrator = None
+        self.spotify_orchestrator_binding = None
 
     def on_next_track(self):              logger.info("Track ended")
     def update_tech_label(self, *a):
@@ -4730,12 +8190,22 @@ def _ensure_audio_output_for_playback(reason="playback"):
     need to manually press Exclusive Mode before starting SROVA playback.
     The actual output application still goes through configure_audio().
     """
+    _reresolve_saved_audio_output_binding()
     _require_audio_output_for_playback(reason)
     if _playback_audio_output_ready():
         return False
     logger.info("Auto-locking DAC before %s: driver=%s device=%s",
                 reason, ALSA_DRIVER, ALSA_DEVICE)
-    configure_audio()
+    if configure_audio() is False:
+        if not _native_audio_allowed(
+            "output_claim",
+            source="ensure-audio-output",
+        ):
+            raise AudioOutputUnavailable(
+                _SPOTIFY_NATIVE_PLAYBACK_BLOCKED,
+                error_code=_SPOTIFY_NATIVE_PLAYBACK_BLOCKED,
+            )
+        raise AudioOutputUnavailable("selected audio output claim failed")
     return True
 
 
@@ -5771,6 +9241,7 @@ def _local_library_play_payload(payload):
         return payload
 
     _invalidate_tidal_stream_resolution("local-playback")
+    _invalidate_qobuz_playback("local-playback")
     queue_meta = PLAY_QUEUE_META_CACHE.get(track_id, {}) or {}
     artwork_url = (
         (payload or {}).get("artwork_url")
@@ -6406,6 +9877,983 @@ def _local_cue_has_continuation():
         return bool(PLAY_QUEUE and QUEUE_INDEX + 1 < len(PLAY_QUEUE))
 
 
+def _complete_qobuz_test_play(
+    token,
+    track_id,
+    format_id,
+    delivery,
+    resolution_error,
+    _audio_ready=False,
+    _queue_context=None,
+    _replacement_request=None,
+    _audio_overlap=None,
+    _prefetched_segment_one=None,
+):
+    """Apply one resolved Qobuz delivery on the GLib/main playback thread."""
+    global RADIO_MODE, CURRENT_RADIO, CURRENT_RADIO_METADATA
+    global CURRENT_STREAM_INFO, PLAYBACK_START_TIME
+    global PAUSED_PLAYBACK_POSITION, PAUSED_PLAYBACK_TRACK_ID
+    global PAUSED_PIPELINE_RELEASED
+    global _QOBUZ_ACTIVE_TRACK_ID, _QOBUZ_ACTIVE_FORMAT_ID
+    global _QOBUZ_ACTIVE_QUEUE_ID
+
+    replacement_target_queue_id = str(
+        (_queue_context or {}).get("queue_id")
+        or ("qobuz:" + str(track_id))
+    ).strip()
+
+    if not _qobuz_stream_resolution_matches(
+        token,
+        track_id,
+        format_id,
+        consume=False,
+    ):
+        logger.info(
+            "Discarding superseded Qobuz resolution before playback: "
+            "token=%s track_id=%s format_id=%s",
+            token,
+            track_id,
+            format_id,
+        )
+        return False
+
+    if _queue_context is not None and not _qobuz_queue_context_matches(
+        _queue_context
+    ):
+        _qobuz_stream_resolution_matches(
+            token,
+            track_id,
+            format_id,
+            consume=True,
+        )
+        logger.info(
+            "Discarding superseded queued Qobuz resolution before playback: "
+            "token=%s queue_id=%s",
+            token,
+            str((_queue_context or {}).get("queue_id") or ""),
+        )
+        _clear_qobuz_replacement_pending(
+            "qobuz-queue-context-superseded",
+            generation=token,
+            target_queue_id=replacement_target_queue_id,
+        )
+        return False
+
+    if resolution_error is not None:
+        _qobuz_stream_resolution_matches(
+            token,
+            track_id,
+            format_id,
+            consume=True,
+        )
+        logger.warning(
+            "Qobuz Q4 delivery resolution failed safely: "
+            "track_id=%s format_id=%s error=%s",
+            track_id,
+            format_id,
+            type(resolution_error).__name__,
+        )
+        _clear_qobuz_replacement_pending(
+            "qobuz-delivery-resolution-failed",
+            generation=token,
+            target_queue_id=replacement_target_queue_id,
+        )
+        return False
+
+    audio_overlap = (
+        _audio_overlap
+        if isinstance(_audio_overlap, dict)
+        else {}
+    )
+
+    overlap_error = audio_overlap.get("error")
+    if overlap_error is not None:
+        _qobuz_stream_resolution_matches(
+            token,
+            track_id,
+            format_id,
+            consume=True,
+        )
+        logger.warning(
+            "Qobuz Q10B overlapped audio output unavailable: %s",
+            overlap_error,
+        )
+        _clear_qobuz_replacement_pending(
+            "qobuz-audio-output-unavailable",
+            generation=token,
+            target_queue_id=replacement_target_queue_id,
+        )
+        return False
+
+    if not _audio_ready:
+        overlap_configured_at = audio_overlap.get("configured_at")
+        overlap_already_ready = bool(
+            audio_overlap.get("already_ready")
+        )
+
+        if overlap_configured_at is not None:
+            try:
+                overlap_elapsed_ms = max(
+                    0.0,
+                    (
+                        time.monotonic()
+                        - float(overlap_configured_at)
+                    ) * 1000.0,
+                )
+            except Exception:
+                overlap_elapsed_ms = 0.0
+
+            remaining_ms = max(
+                0,
+                int(round(1500.0 - overlap_elapsed_ms)),
+            )
+
+            if remaining_ms > 0:
+                logger.info(
+                    "Q10B overlap audio-ready remaining WAIT: "
+                    "track_id=%s elapsed_ms=%.1f remaining_ms=%s",
+                    track_id,
+                    overlap_elapsed_ms,
+                    remaining_ms,
+                )
+                GLib.timeout_add(
+                    remaining_ms,
+                    lambda: _complete_qobuz_test_play(
+                        token,
+                        track_id,
+                        format_id,
+                        delivery,
+                        resolution_error,
+                        _audio_ready=True,
+                        _queue_context=_queue_context,
+                        _replacement_request=_replacement_request,
+                        _audio_overlap=audio_overlap,
+                        _prefetched_segment_one=(
+                            _prefetched_segment_one
+                        ),
+                    ),
+                )
+                return False
+
+            logger.info(
+                "Q10B overlap audio-ready wait fully hidden: "
+                "track_id=%s elapsed_ms=%.1f",
+                track_id,
+                overlap_elapsed_ms,
+            )
+            _audio_ready = True
+
+        elif overlap_already_ready:
+            logger.info(
+                "Q10B overlap audio output already ready: "
+                "track_id=%s",
+                track_id,
+            )
+            _audio_ready = True
+
+    if not _audio_ready:
+        try:
+            configured = _ensure_audio_output_for_playback(
+                "Qobuz playback"
+            )
+        except AudioOutputUnavailable as exc:
+            _qobuz_stream_resolution_matches(
+                token,
+                track_id,
+                format_id,
+                consume=True,
+            )
+            logger.warning(
+                "Qobuz Q4 audio output unavailable: %s",
+                exc,
+            )
+            _clear_qobuz_replacement_pending(
+                "qobuz-audio-output-unavailable",
+                generation=token,
+                target_queue_id=replacement_target_queue_id,
+            )
+            return False
+
+        if configured:
+            GLib.timeout_add(
+                1500,
+                lambda: _complete_qobuz_test_play(
+                    token,
+                    track_id,
+                    format_id,
+                    delivery,
+                    resolution_error,
+                    _audio_ready=True,
+                    _queue_context=_queue_context,
+                    _replacement_request=_replacement_request,
+                    _audio_overlap=audio_overlap,
+                    _prefetched_segment_one=(
+                        _prefetched_segment_one
+                    ),
+                ),
+            )
+            return False
+    else:
+        try:
+            _require_audio_output_for_playback("Qobuz playback")
+        except AudioOutputUnavailable as exc:
+            _qobuz_stream_resolution_matches(
+                token,
+                track_id,
+                format_id,
+                consume=True,
+            )
+            logger.warning(
+                "Qobuz Q4 audio output unavailable after configure: %s",
+                exc,
+            )
+            _clear_qobuz_replacement_pending(
+                "qobuz-audio-output-unavailable-after-configure",
+                generation=token,
+                target_queue_id=replacement_target_queue_id,
+            )
+            return False
+
+    if _queue_context is not None and not _qobuz_queue_context_matches(
+        _queue_context
+    ):
+        _qobuz_stream_resolution_matches(
+            token,
+            track_id,
+            format_id,
+            consume=True,
+        )
+        logger.info(
+            "Discarding superseded queued Qobuz resolution at playback handoff: "
+            "token=%s queue_id=%s",
+            token,
+            str((_queue_context or {}).get("queue_id") or ""),
+        )
+        _clear_qobuz_replacement_pending(
+            "qobuz-queue-context-superseded-at-handoff",
+            generation=token,
+            target_queue_id=replacement_target_queue_id,
+        )
+        return False
+
+    if not _qobuz_stream_resolution_matches(
+        token,
+        track_id,
+        format_id,
+        consume=True,
+    ):
+        logger.info(
+            "Discarding superseded Qobuz resolution at playback handoff: "
+            "token=%s track_id=%s format_id=%s",
+            token,
+            track_id,
+            format_id,
+        )
+        return False
+
+    resource = None
+    server = None
+
+    try:
+        from backend.qobuz_stream import QobuzVirtualFlacResource
+
+        backend = getattr(APP_INSTANCE, "qobuz_backend", None)
+        if backend is None:
+            raise RuntimeError("Qobuz backend is unavailable")
+
+        _gate, server = _qobuz_bridge_components(create_server=True)
+
+        _q10b_segment_probe = {"count": 0}
+        _q10b_prefetched_segment_one = (
+            bytes(_prefetched_segment_one)
+            if _prefetched_segment_one is not None
+            else None
+        )
+
+        def _q10b_timed_segment_fetch(
+            delivery_for_fetch,
+            segment_index,
+        ):
+            _q10b_segment_probe["count"] += 1
+            probe_number = int(_q10b_segment_probe["count"])
+            probe_enabled = probe_number <= 3
+
+            if probe_enabled:
+                logger.info(
+                    "Q10B latency segment FETCH START: "
+                    "track_id=%s segment=%s probe=%s",
+                    track_id,
+                    segment_index,
+                    probe_number,
+                )
+                _q10b_segment_t0 = time.monotonic()
+
+            try:
+                if (
+                    int(segment_index) == 1
+                    and _q10b_prefetched_segment_one is not None
+                ):
+                    payload = _q10b_prefetched_segment_one
+                    if probe_enabled:
+                        logger.info(
+                            "Q10B latency segment PREFETCH HIT: "
+                            "track_id=%s segment=%s bytes=%s",
+                            track_id,
+                            segment_index,
+                            len(payload),
+                        )
+                else:
+                    payload = backend.fetch_decrypt_cmaf_segment(
+                        delivery_for_fetch,
+                        segment_index,
+                    )
+            except BaseException as exc:
+                if probe_enabled:
+                    logger.info(
+                        "Q10B latency segment FETCH FAILED: "
+                        "track_id=%s segment=%s probe=%s "
+                        "elapsed_ms=%.1f error=%s",
+                        track_id,
+                        segment_index,
+                        probe_number,
+                        (
+                            time.monotonic() - _q10b_segment_t0
+                        ) * 1000.0,
+                        type(exc).__name__,
+                    )
+                raise
+
+            if probe_enabled:
+                logger.info(
+                    "Q10B latency segment FETCH DONE: "
+                    "track_id=%s segment=%s probe=%s "
+                    "elapsed_ms=%.1f bytes=%s",
+                    track_id,
+                    segment_index,
+                    probe_number,
+                    (
+                        time.monotonic() - _q10b_segment_t0
+                    ) * 1000.0,
+                    len(payload),
+                )
+
+            return payload
+
+        resource = QobuzVirtualFlacResource(
+            delivery,
+            _q10b_timed_segment_fetch,
+        )
+        local_uri = server.publish(resource)
+
+        logger.info(
+            "Q10B latency loopback PUBLISHED: "
+            "track_id=%s port=%s",
+            track_id,
+            server.port,
+        )
+
+        _invalidate_tidal_stream_resolution("qobuz-playback")
+        _disarm_queue_auto_advance("qobuz-playback")
+        _clear_local_playback_context()
+        cancel_scrobble()
+
+        if RADIO_MODE:
+            _cancel_pending_radio_start()
+            _METADATA_REGISTRY.detach()
+            _set_radio_switching_guard()
+            CURRENT_RADIO_METADATA = {}
+            _set_current_radio_artwork({})
+            RADIO_MODE = False
+            CURRENT_RADIO = None
+
+        player = APP_INSTANCE.player
+        _set_player_live_radio_mode(player, False)
+
+        PAUSED_PLAYBACK_POSITION = 0.0
+        PAUSED_PLAYBACK_TRACK_ID = None
+        PAUSED_PIPELINE_RELEASED = False
+
+        _arm_qobuz_hardware_clock_commit(
+            token,
+            replacement_target_queue_id,
+            scrobble=bool((_queue_context or {}).get("queue_id")),
+        )
+        _cancel_idle_release()
+
+        # Existing Rust/GStreamer engine remains the sole audio engine.
+        logger.info(
+            "Q10B latency player.load START: track_id=%s",
+            track_id,
+        )
+        _q10b_load_t0 = time.monotonic()
+        player.load(local_uri)
+        logger.info(
+            "Q10B latency player.load DONE: "
+            "track_id=%s elapsed_ms=%.1f",
+            track_id,
+            (time.monotonic() - _q10b_load_t0) * 1000.0,
+        )
+
+        logger.info(
+            "Q10B latency player.play START: track_id=%s",
+            track_id,
+        )
+        _q10b_play_t0 = time.monotonic()
+        player.play()
+        logger.info(
+            "Q10B latency player.play DONE: "
+            "track_id=%s elapsed_ms=%.1f",
+            track_id,
+            (time.monotonic() - _q10b_play_t0) * 1000.0,
+        )
+
+        CURRENT_STREAM_INFO["sample_rate"] = int(delivery.sample_rate)
+        CURRENT_STREAM_INFO["bit_depth"] = int(delivery.bit_depth)
+        CURRENT_STREAM_INFO["codec"] = "FLAC"
+        CURRENT_STREAM_INFO["channels"] = int(delivery.channels)
+
+        for key in (
+            "observed_sample_rate",
+            "observed_bit_depth",
+            "output_sample_rate",
+            "output_bit_depth",
+            "output_channels",
+            "radio_observed_sample_rate",
+            "radio_observed_bit_depth",
+            "radio_observed_output_sample_rate",
+            "radio_observed_output_bit_depth",
+            "radio_observed_rate_confidence",
+        ):
+            CURRENT_STREAM_INFO.pop(key, None)
+
+        duration = (
+            int(round(
+                float(delivery.total_samples) /
+                float(delivery.sample_rate)
+            ))
+            if int(delivery.sample_rate) > 0
+            else 0
+        )
+
+        queue_meta = dict((_queue_context or {}).get("meta") or {})
+        queue_id = str(
+            (_queue_context or {}).get("queue_id") or ""
+        ).strip()
+
+        try:
+            queue_duration = int(float(queue_meta.get("duration") or 0))
+        except Exception:
+            queue_duration = 0
+
+        CURRENT_CONTEXT.update({
+            "track_id": queue_id or str(track_id),
+            "title": str(queue_meta.get("title") or "") if queue_id else None,
+            "artist": str(queue_meta.get("artist") or "") if queue_id else None,
+            "artist_id": str(queue_meta.get("artist_id") or "") if queue_id else None,
+            "cover": (
+                str(
+                    queue_meta.get("cover")
+                    or queue_meta.get("artwork_url")
+                    or ""
+                )
+                if queue_id else None
+            ),
+            "duration": queue_duration or duration,
+            "album": str(queue_meta.get("album") or "") if queue_id else None,
+            "album_id": str(queue_meta.get("album_id") or "") if queue_id else None,
+            "context_title": (
+                str(queue_meta.get("context_title") or "Play Queue")
+                if queue_id else "Qobuz Q4 Playback Proof"
+            ),
+            "context_type": (
+                str(queue_meta.get("context_type") or "qobuz_queue")
+                if queue_id else "qobuz_q4_test"
+            ),
+            "context_id": (
+                str(queue_meta.get("context_id") or "queue")
+                if queue_id else None
+            ),
+        })
+
+        with _QOBUZ_PLAYBACK_BRIDGE_LOCK:
+            _QOBUZ_ACTIVE_TRACK_ID = str(track_id)
+            _QOBUZ_ACTIVE_FORMAT_ID = int(format_id)
+            _QOBUZ_ACTIVE_QUEUE_ID = queue_id or None
+
+        if _replacement_request is not None:
+            _arm_qobuz_replacement_hardware_commit(
+                _replacement_request,
+                replacement_target_queue_id,
+                token,
+            )
+
+        if queue_id:
+            _arm_active_queue_auto_advance()
+
+        logger.info(
+            "Qobuz Q4 playback loaded: track_id=%s format_id=%s "
+            "sample_rate=%s bit_depth=%s channels=%s "
+            "loopback_host=127.0.0.1 loopback_port=%s",
+            track_id,
+            format_id,
+            int(delivery.sample_rate),
+            int(delivery.bit_depth),
+            int(delivery.channels),
+            server.port,
+        )
+    except Exception as exc:
+        if resource is not None:
+            try:
+                resource.invalidate()
+            except Exception:
+                pass
+        if server is not None:
+            try:
+                server.invalidate()
+            except Exception:
+                pass
+
+        with _QOBUZ_PLAYBACK_BRIDGE_LOCK:
+            _QOBUZ_ACTIVE_TRACK_ID = None
+            _QOBUZ_ACTIVE_FORMAT_ID = None
+            _QOBUZ_ACTIVE_QUEUE_ID = None
+
+        logger.warning(
+            "Qobuz Q4 playback handoff failed safely: "
+            "track_id=%s format_id=%s error=%s",
+            track_id,
+            format_id,
+            type(exc).__name__,
+        )
+        _clear_qobuz_hardware_clock_pending(
+            "qobuz-playback-handoff-failed",
+            generation=token,
+            target_queue_id=replacement_target_queue_id,
+        )
+        _clear_qobuz_replacement_pending(
+            "qobuz-playback-handoff-failed",
+            generation=token,
+            target_queue_id=replacement_target_queue_id,
+        )
+
+    return False
+
+
+def _qobuz_test_play_payload(payload, _queue_context=None):
+    """Schedule authenticated Qobuz playback through the Q4 bridge."""
+    if not isinstance(payload, dict):
+        return {
+            "ok": False,
+            "source": "qobuz",
+            "error": "invalid_payload",
+        }
+
+    backend = getattr(APP_INSTANCE, "qobuz_backend", None)
+    if backend is None:
+        return {
+            "ok": False,
+            "source": "qobuz",
+            "error": "qobuz_backend_unavailable",
+        }
+
+    try:
+        track_id = int(payload.get("track_id"))
+        format_id = int(payload.get("format_id", 27))
+    except (TypeError, ValueError):
+        return {
+            "ok": False,
+            "source": "qobuz",
+            "error": "invalid_track_or_format",
+        }
+
+    if track_id <= 0 or format_id not in backend.CMAF_FORMAT_IDS:
+        return {
+            "ok": False,
+            "source": "qobuz",
+            "error": "invalid_track_or_format",
+        }
+
+    if not backend.status().get("usable"):
+        return {
+            "ok": False,
+            "source": "qobuz",
+            "error": "qobuz_authentication_required",
+        }
+
+    if not _QOBUZ_RESOLUTION_SLOTS.acquire(blocking=False):
+        return {
+            "ok": False,
+            "source": "qobuz",
+            "error": "qobuz_resolution_busy",
+        }
+
+    replacement_target_queue_id = str(
+        (_queue_context or {}).get("queue_id")
+        or ("qobuz:" + str(track_id))
+    ).strip()
+
+    replacing_active = _qobuz_playback_is_active()
+    replacement_request = _prepare_qobuz_replacement_pending(
+        replacement_target_queue_id,
+        "qobuz-track-replacement",
+    )
+
+    _invalidate_tidal_stream_resolution("qobuz-test-play")
+
+    # Locked Q4 literal call remains present when no Q10B continuity state
+    # exists. When continuity is active, preserve that exact pending record.
+    if replacement_request is None:
+        _invalidate_qobuz_playback("qobuz-track-replacement")
+    else:
+        _invalidate_qobuz_playback(
+            "qobuz-track-replacement",
+            preserve_replacement=replacement_request is not None,
+        )
+
+    if replacing_active:
+        try:
+            APP_INSTANCE.player.stop()
+        except Exception as exc:
+            logger.debug(
+                "Qobuz replacement player.stop() failed safely: %s",
+                exc,
+            )
+
+    token = _begin_qobuz_stream_resolution(track_id, format_id)
+    if replacement_request is not None:
+        _bind_qobuz_replacement_generation(
+            replacement_request,
+            replacement_target_queue_id,
+            token,
+        )
+
+    audio_overlap = {
+        "configured_at": None,
+        "already_ready": False,
+        "error": None,
+    }
+
+    def _prepare_qobuz_audio_overlap():
+        if not _qobuz_stream_resolution_matches(
+            token,
+            track_id,
+            format_id,
+            consume=False,
+        ):
+            logger.info(
+                "Q10B overlap audio prep skipped: "
+                "superseded token=%s track_id=%s",
+                token,
+                track_id,
+            )
+            return False
+
+        if (
+            _queue_context is not None
+            and not _qobuz_queue_context_matches(_queue_context)
+        ):
+            logger.info(
+                "Q10B overlap audio prep skipped: "
+                "stale queue context token=%s track_id=%s",
+                token,
+                track_id,
+            )
+            return False
+
+        logger.info(
+            "Q10B overlap audio prep START: "
+            "token=%s track_id=%s",
+            token,
+            track_id,
+        )
+
+        try:
+            configured = _ensure_audio_output_for_playback(
+                "Qobuz playback"
+            )
+        except AudioOutputUnavailable as exc:
+            audio_overlap["error"] = exc
+            logger.warning(
+                "Q10B overlap audio prep FAILED: "
+                "token=%s track_id=%s error=%s",
+                token,
+                track_id,
+                type(exc).__name__,
+            )
+            return False
+
+        if configured:
+            audio_overlap["configured_at"] = time.monotonic()
+            logger.info(
+                "Q10B overlap audio prep CONFIGURED: "
+                "token=%s track_id=%s",
+                token,
+                track_id,
+            )
+        else:
+            audio_overlap["already_ready"] = True
+            logger.info(
+                "Q10B overlap audio prep ALREADY READY: "
+                "token=%s track_id=%s",
+                token,
+                track_id,
+            )
+
+        return False
+
+    GLib.idle_add(_prepare_qobuz_audio_overlap)
+
+    def _resolve_qobuz_delivery():
+        delivery = None
+        resolution_error = None
+        prefetched_segment_one = None
+        try:
+            try:
+                # Long sequential playback has physically exposed stale
+                # pooled Qobuz API transport state after a long idle interval.
+                # Serialize transport replacement and delivery resolution so
+                # concurrent bounded resolver workers cannot replace _http
+                # underneath one another. Persistent Qobuz authentication is
+                # independent of this requests.Session transport.
+                with _QOBUZ_DELIVERY_HTTP_LOCK:
+                    retired_http = backend._http
+                    backend._http = backend._build_http_session()
+
+                    try:
+                        # Each new track also receives a fresh ephemeral CMAF
+                        # playback session. This does not alter the persisted
+                        # Qobuz login/authentication session.
+                        with backend._cmaf_lock:
+                            cached_cmaf = backend._cmaf_session
+                            cached_cmaf_session_id = (
+                                cached_cmaf.get("session_id")
+                                if isinstance(cached_cmaf, dict)
+                                else None
+                            )
+
+                        if cached_cmaf_session_id:
+                            backend._discard_cmaf_session(
+                                cached_cmaf_session_id
+                            )
+
+                        _q10b_resolve_t0 = time.monotonic()
+                        logger.info(
+                            "Q10B latency resolver START: "
+                            "track_id=%s format_id=%s",
+                            track_id,
+                            format_id,
+                        )
+                        delivery = backend.resolve_track_delivery(
+                            track_id,
+                            format_id,
+                        )
+                        logger.info(
+                            "Q10B latency resolver DONE: "
+                            "track_id=%s format_id=%s elapsed_ms=%.1f "
+                            "sample_rate=%s bit_depth=%s segments=%s",
+                            track_id,
+                            format_id,
+                            (time.monotonic() - _q10b_resolve_t0) * 1000.0,
+                            getattr(delivery, "sample_rate", None),
+                            getattr(delivery, "bit_depth", None),
+                            getattr(delivery, "n_segments", None),
+                        )
+
+                        if _qobuz_stream_resolution_matches(
+                            token,
+                            track_id,
+                            format_id,
+                            consume=False,
+                        ):
+                            prefetched_segment_one = (
+                                _qobuz_warm_segment_one_get(
+                                    track_id,
+                                    format_id,
+                                    delivery,
+                                )
+                            )
+
+                            if prefetched_segment_one is not None:
+                                logger.info(
+                                    "Q10B warm segment-1 CACHE HIT: "
+                                    "track_id=%s format_id=%s bytes=%s",
+                                    track_id,
+                                    format_id,
+                                    len(prefetched_segment_one),
+                                )
+                            else:
+                                _q10b_prefetch_t0 = time.monotonic()
+                                logger.info(
+                                    "Q10B latency segment PREFETCH START: "
+                                    "track_id=%s segment=1",
+                                    track_id,
+                                )
+                                try:
+                                    prefetched_segment_one = (
+                                        backend.fetch_decrypt_cmaf_segment(
+                                            delivery,
+                                            1,
+                                        )
+                                    )
+                                    _qobuz_warm_segment_one_put(
+                                        track_id,
+                                        format_id,
+                                        delivery,
+                                        prefetched_segment_one,
+                                    )
+                                    logger.info(
+                                        "Q10B latency segment PREFETCH DONE: "
+                                        "track_id=%s segment=1 "
+                                        "elapsed_ms=%.1f bytes=%s",
+                                        track_id,
+                                        (
+                                            time.monotonic()
+                                            - _q10b_prefetch_t0
+                                        ) * 1000.0,
+                                        len(prefetched_segment_one),
+                                    )
+                                except Exception as exc:
+                                    prefetched_segment_one = None
+                                    logger.info(
+                                        "Q10B latency segment PREFETCH FAILED: "
+                                        "track_id=%s segment=1 "
+                                        "elapsed_ms=%.1f error=%s",
+                                        track_id,
+                                        (
+                                            time.monotonic()
+                                            - _q10b_prefetch_t0
+                                        ) * 1000.0,
+                                        type(exc).__name__,
+                                    )
+                        else:
+                            logger.info(
+                                "Q10B latency segment PREFETCH SKIPPED: "
+                                "superseded token=%s track_id=%s",
+                                token,
+                                track_id,
+                            )
+                    finally:
+                        try:
+                            retired_http.close()
+                        except Exception as exc:
+                            logger.debug(
+                                "Retired Qobuz HTTP transport close "
+                                "failed safely: %s",
+                                exc,
+                            )
+            except Exception as exc:
+                resolution_error = exc
+
+            GLib.idle_add(
+                lambda: _complete_qobuz_test_play(
+                    token,
+                    track_id,
+                    format_id,
+                    delivery,
+                    resolution_error,
+                    _queue_context=_queue_context,
+                    _replacement_request=replacement_request,
+                    _audio_overlap=audio_overlap,
+                    _prefetched_segment_one=(
+                        prefetched_segment_one
+                    ),
+                )
+            )
+        finally:
+            _QOBUZ_RESOLUTION_SLOTS.release()
+            GLib.idle_add(_drain_qobuz_deferred_resolution)
+
+    resolver = threading.Thread(
+        target=_resolve_qobuz_delivery,
+        name=f"srova-qobuz-resolve-{token}",
+        daemon=True,
+    )
+    try:
+        resolver.start()
+    except BaseException:
+        _QOBUZ_RESOLUTION_SLOTS.release()
+        _invalidate_qobuz_playback("qobuz-resolver-start-failed")
+        raise
+
+    return {
+        "ok": True,
+        "source": "qobuz",
+        "state": "resolving",
+        "track_id": str(track_id),
+        "format_id": int(format_id),
+    }
+
+
+def _qobuz_test_stop_payload():
+    """Stop active Q4 playback or cancel a pending Qobuz resolution."""
+    was_active = _qobuz_playback_is_active()
+    before = _qobuz_playback_state()
+
+    _invalidate_qobuz_playback("qobuz-test-stop")
+
+    if was_active:
+        try:
+            APP_INSTANCE.player.stop()
+        except Exception as exc:
+            logger.debug(
+                "Qobuz Q4 player.stop() failed safely: %s",
+                exc,
+            )
+        _reset_idle_playback_context()
+        _schedule_idle_release(1)
+
+    return {
+        "ok": True,
+        "source": "qobuz",
+        "stopped": bool(was_active),
+        "cancelled_resolution": bool(before.get("resolving")),
+    }
+
+
+def _qobuz_test_status_payload():
+    """Return sanitized Q4 state without exposing the opaque media URI."""
+    _maybe_commit_qobuz_hardware_clock_ready()
+    hardware_clock_pending = _qobuz_hardware_clock_is_pending()
+    state = _qobuz_playback_state()
+    player = APP_INSTANCE.player if APP_INSTANCE is not None else None
+
+    try:
+        playing = bool(
+            player is not None
+            and hasattr(player, "is_playing")
+            and player.is_playing()
+            and not hardware_clock_pending
+        )
+    except Exception:
+        playing = False
+
+    state.update({
+        "ok": True,
+        "source": "qobuz",
+        "playing": playing,
+        "position": (
+            0.0
+            if hardware_clock_pending
+            else (
+                round(
+                    max(0.0, time.time() - PLAYBACK_START_TIME),
+                    3,
+                )
+                if PLAYBACK_START_TIME
+                else round(
+                    max(0.0, _player_position_seconds(player)),
+                    3,
+                )
+            )
+        ),
+        "sample_rate": CURRENT_STREAM_INFO.get("sample_rate"),
+        "bit_depth": CURRENT_STREAM_INFO.get("bit_depth"),
+        "codec": CURRENT_STREAM_INFO.get("codec"),
+        "channels": CURRENT_STREAM_INFO.get("channels"),
+    })
+    return state
+
+
 def play_queue_index(
     index,
     _audio_ready=False,
@@ -6437,22 +10885,41 @@ def play_queue_index(
         logger.info("Queue finished")
         return False
 
-    # If the user previously released the DAC, automatically reclaim the
-    # selected output on the next intentional playback action. Give the Rust
-    # audio engine a brief moment to open the device before loading audio.
-    if not _audio_ready:
-        try:
-            audio_configured = _ensure_audio_output_for_playback("Tidal playback")
-        except AudioOutputUnavailable:
-            return False
-        if audio_configured:
-            GLib.timeout_add(1500, lambda: play_queue_index(index, _audio_ready=True, _resume_position=_resume_position))
-            return False
-    else:
-        try:
-            _require_audio_output_for_playback("Tidal playback")
-        except AudioOutputUnavailable:
-            return False
+    track_id = PLAY_QUEUE[index]
+    queue_meta = PLAY_QUEUE_META_CACHE.get(str(track_id), {}) or {}
+    queue_source = _queue_item_source(track_id, queue_meta)
+
+    # Preserve the existing generic DAC-open wait exactly for Local, TIDAL,
+    # and Radio. Qobuz owns an equivalent request-local wait inside its Q4
+    # completion so provider delivery work can overlap the DAC-open window.
+    if queue_source != "qobuz":
+        if not _audio_ready:
+            try:
+                audio_configured = _ensure_audio_output_for_playback(
+                    "queue playback"
+                )
+            except AudioOutputUnavailable:
+                return False
+            if audio_configured:
+                logger.info(
+                    "Q10B latency fixed audio-ready WAIT: "
+                    "index=%s delay_ms=1500",
+                    index,
+                )
+                GLib.timeout_add(
+                    1500,
+                    lambda: play_queue_index(
+                        index,
+                        _audio_ready=True,
+                        _resume_position=_resume_position,
+                    ),
+                )
+                return False
+        else:
+            try:
+                _require_audio_output_for_playback("queue playback")
+            except AudioOutputUnavailable:
+                return False
 
     _clear_local_playback_context()
     _RADIO_SCROBBLE_CURRENT_KEY = None
@@ -6462,9 +10929,7 @@ def play_queue_index(
     _set_player_live_radio_mode(APP_INSTANCE.player, False)
     QUEUE_INDEX = index
     PLAYBACK_START_TIME = time.time()
-    track_id    = PLAY_QUEUE[index]
-    queue_meta  = PLAY_QUEUE_META_CACHE.get(str(track_id), {}) or {}
-    if str(queue_meta.get("source") or "").lower() == "radio" or str(track_id).startswith("radio:station:"):
+    if queue_source == "radio":
         station = _radio_queue_station_from_meta(track_id, queue_meta)
         if not station.get("url"):
             logger.warning("Radio queue playback failed: missing station URL for %s", track_id)
@@ -6474,7 +10939,7 @@ def play_queue_index(
         save_queue()
         _request_radio_station_start(station, reason="radio queue playback")
         return False
-    if str(queue_meta.get("source") or "").lower() == "local" or str(track_id).startswith("local:"):
+    if queue_source == "local":
         payload = {
             "id": str(track_id),
             "context_type": "local_queue",
@@ -6492,6 +10957,93 @@ def play_queue_index(
             logger.warning("Local queue playback failed: %s", result.get("error"))
         return False
 
+    if queue_source == "qobuz":
+        native_track_id = _qobuz_queue_native_track_id(
+            track_id,
+            queue_meta,
+        )
+        if not native_track_id:
+            logger.warning(
+                "Qobuz queue playback rejected malformed identity: %s",
+                track_id,
+            )
+            _clear_qobuz_replacement_pending(
+                "qobuz-queue-invalid-identity",
+                target_queue_id=str(track_id),
+                require_unbound=True,
+            )
+            return False
+
+        try:
+            format_id = int(
+                queue_meta.get("format_id")
+                or queue_meta.get("qobuz_format_id")
+                or 27
+            )
+        except Exception:
+            logger.warning(
+                "Qobuz queue playback rejected invalid format: %s",
+                track_id,
+            )
+            _clear_qobuz_replacement_pending(
+                "qobuz-queue-invalid-format",
+                target_queue_id=str(track_id),
+                require_unbound=True,
+            )
+            return False
+
+        # The generic queue clock above remains authoritative for the
+        # established non-Qobuz paths. Qobuz begins at hardware RUNNING.
+        PLAYBACK_START_TIME = None
+
+        qobuz_payload = {
+            "track_id": native_track_id,
+            "format_id": format_id,
+        }
+        qobuz_queue_context = {
+            "queue_index": int(index),
+            "queue_id": str(track_id),
+            "meta": dict(queue_meta),
+        }
+        qobuz_request_serial = _next_qobuz_resolution_request_serial()
+
+        # Q5 provider dispatch remains the locked Q4 primitive.
+        result = _qobuz_test_play_payload(
+            qobuz_payload,
+            _queue_context=qobuz_queue_context,
+        )
+
+        # Q10B policy consumes the primitive result without replacing it.
+        result = _apply_qobuz_queue_resolution_policy(
+            result,
+            qobuz_payload,
+            qobuz_queue_context,
+            qobuz_request_serial,
+        )
+
+        if not result.get("ok"):
+            logger.warning(
+                "Qobuz queue playback failed: queue_id=%s error=%s",
+                track_id,
+                result.get("error"),
+            )
+            _clear_qobuz_replacement_pending(
+                "qobuz-queue-play-request-failed",
+                target_queue_id=str(track_id),
+                require_unbound=True,
+            )
+        return False
+
+    if queue_source != "tidal":
+        logger.warning(
+            "Queue playback rejected unsupported provider: "
+            "source=%s track_id=%s",
+            queue_source,
+            track_id,
+        )
+        return False
+
+    _invalidate_qobuz_playback("tidal-playback")
     backend     = APP_INSTANCE.backend
     player      = APP_INSTANCE.player
     try:
@@ -6688,14 +11240,53 @@ def play_next_track():
         GLib.idle_add(lambda: play_queue_index(next_index))
     else:
         current_meta = PLAY_QUEUE_META_CACHE.get(current_id, {}) or {}
-        if current_id.startswith("local:") or str(current_meta.get("source") or "").lower() == "local":
-            GLib.idle_add(_finalize_end_of_queue_playback, "End of local queue")
+        current_source = _queue_item_source(current_id, current_meta)
+
+        if current_source not in ("tidal", "qobuz"):
+            GLib.idle_add(
+                _finalize_end_of_queue_playback,
+                "End of %s queue" % current_source,
+            )
             return
+
         if not _tidal_infinite_play_enabled():
-            GLib.idle_add(_finalize_end_of_queue_playback, "End of queue -- Infinite Play disabled")
+            GLib.idle_add(
+                _finalize_end_of_queue_playback,
+                "End of queue -- Infinite Play disabled",
+            )
             return
-        logger.info("End of queue -- triggering autofill")
-        threading.Thread(target=_autofill_queue, daemon=True).start()
+
+        effective_provider = _effective_infinite_play_provider()
+
+        if current_source != effective_provider:
+            GLib.idle_add(
+                _finalize_end_of_queue_playback,
+                "End of %s queue -- Infinite Play provider=%s"
+                % (current_source, effective_provider or "unavailable"),
+            )
+            return
+
+        if (
+            current_source == "qobuz"
+            and not _valid_qobuz_infinite_play_seed(
+                current_id,
+                current_meta,
+            )
+        ):
+            GLib.idle_add(
+                _finalize_end_of_queue_playback,
+                "End of Qobuz queue -- invalid Infinite Play seed",
+            )
+            return
+
+        logger.info(
+            "End of queue -- triggering Infinite Play autofill provider=%s",
+            effective_provider,
+        )
+        threading.Thread(
+            target=_autofill_queue,
+            daemon=True,
+        ).start()
 
 
 def _radio_station_key(station):
@@ -6768,6 +11359,7 @@ def _request_radio_station_start(station, reason="radio playback"):
         return payload
 
     _invalidate_tidal_stream_resolution("radio-start")
+    _invalidate_qobuz_playback("radio-start")
     _disarm_queue_auto_advance("radio-start")
     station = dict(station or {})
     station_key = _radio_station_key(station)
@@ -7132,18 +11724,60 @@ def _seed_artist_name_for_track(seed_id):
     seed_id = str(seed_id or "").strip()
     if not seed_id:
         return ""
+
     try:
         meta = PLAY_QUEUE_META_CACHE.get(seed_id, {}) or {}
         if meta.get("artist"):
             return _safe_str(meta.get("artist"))
     except Exception:
-        pass
+        meta = {}
+
+    seed_source = _queue_item_source(seed_id, meta)
+
+    if seed_source == "qobuz":
+        try:
+            native_id = _qobuz_queue_native_track_id(
+                seed_id,
+                meta,
+            )
+            if not native_id:
+                return ""
+
+            backend = getattr(
+                APP_INSTANCE,
+                "qobuz_backend",
+                None,
+            )
+            if backend is None:
+                return ""
+
+            track = backend.get_track(native_id)
+            if isinstance(track, dict):
+                return _safe_str(track.get("artist"))
+        except Exception as e:
+            logger.info(
+                "Infinite Play: could not resolve Qobuz seed artist "
+                "for %s: %s",
+                seed_id,
+                e,
+            )
+        return ""
+
+    if seed_source != "tidal":
+        return ""
+
     try:
         seed_track = APP_INSTANCE.backend.session.track(seed_id)
         return _tidal_track_artist_name(seed_track)
     except Exception as e:
-        logger.info("Infinite Play: could not resolve seed track artist for %s: %s", seed_id, e)
+        logger.info(
+            "Infinite Play: could not resolve TIDAL seed track artist "
+            "for %s: %s",
+            seed_id,
+            e,
+        )
         return ""
+
 
 
 INFINITE_PLAY_HISTORY_LIMIT = 50
@@ -7161,16 +11795,142 @@ def _normalise_infinite_play_album(album):
     return " ".join(str(album or "").strip().lower().split())
 
 
-def _infinite_play_track_info(track):
-    """Return stable diversity metadata without performing network I/O."""
-    tid = str(getattr(track, "id", "") or "").strip()
-    title = _normalise_infinite_play_title(getattr(track, "name", ""))
-    artist = _normalise_infinite_play_artist(_tidal_track_artist_name(track))
+
+def _infinite_play_track_id(track):
+    if isinstance(track, dict):
+        return str(
+            track.get("id")
+            or track.get("track_id")
+            or ""
+        ).strip()
+    return str(getattr(track, "id", "") or "").strip()
+
+
+def _infinite_play_track_title(track):
+    if isinstance(track, dict):
+        return _safe_str(
+            track.get("title")
+            or track.get("name")
+            or ""
+        )
+    return _safe_str(getattr(track, "name", ""))
+
+
+def _infinite_play_track_artist(track):
+    if isinstance(track, dict):
+        artist = track.get("artist")
+        if isinstance(artist, dict):
+            return _safe_str(artist.get("name"))
+        return _safe_str(artist)
+    return _tidal_track_artist_name(track)
+
+
+def _infinite_play_track_album_id(track):
+    if isinstance(track, dict):
+        return str(track.get("album_id") or "").strip()
 
     album_obj = getattr(track, "album", None)
-    album_id = str(getattr(album_obj, "id", "") or "").strip() if album_obj else ""
+    return (
+        str(getattr(album_obj, "id", "") or "").strip()
+        if album_obj
+        else ""
+    )
+
+
+def _infinite_play_track_album_name(track):
+    if isinstance(track, dict):
+        album = track.get("album")
+        if isinstance(album, dict):
+            return _safe_str(
+                album.get("title")
+                or album.get("name")
+                or ""
+            )
+        return _safe_str(album)
+
+    album_obj = getattr(track, "album", None)
+    return (
+        _safe_str(getattr(album_obj, "name", ""))
+        if album_obj
+        else ""
+    )
+
+
+def _infinite_play_track_cover(track):
+    if isinstance(track, dict):
+        cover = (
+            track.get("cover")
+            or track.get("artwork_url")
+            or ""
+        )
+        if cover:
+            return _safe_str(cover)
+
+        artwork = track.get("artwork")
+        if isinstance(artwork, dict):
+            return _safe_str(artwork.get("url"))
+        return ""
+
+    return _tidal_track_cover_url(track)
+
+
+def _valid_qobuz_infinite_play_seed(seed_id, meta):
+    meta = meta or {}
+
+    if str(meta.get("source") or "").strip().lower() != "qobuz":
+        return False
+
+    native_id = _qobuz_queue_native_track_id(
+        seed_id,
+        meta,
+    )
+    if not native_id:
+        return False
+
+    provider_track_id = str(
+        meta.get("provider_track_id") or ""
+    ).strip()
+
+    return (
+        provider_track_id == native_id
+        and str(seed_id) == "qobuz:" + native_id
+    )
+
+
+def _valid_qobuz_infinite_play_track(track):
+    if not isinstance(track, dict):
+        return False
+
+    if str(track.get("source") or "").strip().lower() != "qobuz":
+        return False
+
+    provider_track_id = str(
+        track.get("provider_track_id") or ""
+    ).strip()
+    canonical_id = str(track.get("id") or "").strip()
+
+    return bool(
+        provider_track_id
+        and provider_track_id.isascii()
+        and provider_track_id.isdigit()
+        and int(provider_track_id) > 0
+        and canonical_id == "qobuz:" + provider_track_id
+    )
+
+
+def _infinite_play_track_info(track):
+    """Return stable provider-neutral diversity metadata without network I/O."""
+    track_id = _infinite_play_track_id(track)
+    title = _normalise_infinite_play_title(
+        _infinite_play_track_title(track)
+    )
+    artist = _normalise_infinite_play_artist(
+        _infinite_play_track_artist(track)
+    )
+
+    album_id = _infinite_play_track_album_id(track)
     album_name = _normalise_infinite_play_album(
-        getattr(album_obj, "name", "") if album_obj else ""
+        _infinite_play_track_album_name(track)
     )
     album_key = album_id or album_name
 
@@ -7178,7 +11938,7 @@ def _infinite_play_track_info(track):
 
     return {
         "track": track,
-        "id": tid,
+        "id": track_id,
         "title": title,
         "artist": artist,
         "album": album_key,
@@ -7186,22 +11946,17 @@ def _infinite_play_track_info(track):
     }
 
 
+
 def _infinite_play_history_entry_from_track(track):
-    """Create a compact persisted history entry from an existing TIDAL object."""
-    album_obj = getattr(track, "album", None)
+    """Create one compact persisted provider-neutral history entry."""
     return {
-        "id": str(getattr(track, "id", "") or "").strip(),
-        "title": _safe_str(getattr(track, "name", "")),
-        "artist": _tidal_track_artist_name(track),
-        "album_id": (
-            str(getattr(album_obj, "id", "") or "").strip()
-            if album_obj else ""
-        ),
-        "album": (
-            _safe_str(getattr(album_obj, "name", ""))
-            if album_obj else ""
-        ),
+        "id": _infinite_play_track_id(track),
+        "title": _infinite_play_track_title(track),
+        "artist": _infinite_play_track_artist(track),
+        "album_id": _infinite_play_track_album_id(track),
+        "album": _infinite_play_track_album_name(track),
     }
+
 
 
 def _record_infinite_play_history_tracks(tracks):
@@ -7528,110 +12283,594 @@ def _best_tidal_artist_for_name(backend, artist_name):
     return matches[0]
 
 
-def _recommended_tracks_for_seed(seed_id, limit=12, mode=None):
+
+def _best_qobuz_artist_for_name(backend, artist_name):
+    page = backend.search_artists(
+        artist_name,
+        limit=10,
+        offset=0,
+    )
+
+    if not isinstance(page, dict):
+        return None
+
+    matches = page.get("items")
+    if not isinstance(matches, list) or not matches:
+        return None
+
+    wanted = str(artist_name or "").strip().casefold()
+
+    for match in matches:
+        if (
+            isinstance(match, dict)
+            and _safe_str(match.get("name")).strip().casefold()
+            == wanted
+        ):
+            return match
+
+    for match in matches:
+        if isinstance(match, dict):
+            return match
+
+    return None
+
+
+def _automix_tidal_track_ids(
+    backend,
+    artist_names,
+    n_tracks,
+):
+    """Resolve existing Auto-Mix semantics through TIDAL."""
+    track_ids = []
+
+    for artist_name in artist_names:
+        try:
+            matches = backend.search_artist(
+                artist_name
+            )
+
+            if not matches:
+                continue
+
+            best = None
+
+            for match in matches:
+                if (
+                    _safe_str(
+                        getattr(match, "name", "")
+                    ).lower()
+                    == artist_name.lower()
+                ):
+                    best = match
+                    break
+
+            if best is None:
+                best = matches[0]
+
+            top_tracks = (
+                backend.get_artist_top_tracks(
+                    best,
+                    limit=n_tracks,
+                )
+            )
+
+            for track in top_tracks[:n_tracks]:
+                track_id = str(
+                    getattr(track, "id", "")
+                ).strip()
+
+                if (
+                    track_id
+                    and track_id not in track_ids
+                ):
+                    track_ids.append(track_id)
+
+        except Exception as exc:
+            logger.warning(
+                "automix TIDAL track fetch failed for %s: %s",
+                artist_name,
+                exc,
+            )
+
+    return track_ids
+
+
+def _automix_qobuz_tracks(
+    backend,
+    artist_names,
+    n_tracks,
+):
+    """Resolve canonical native Qobuz tracks for Auto-Mix."""
+    tracks = []
+    seen_provider_ids = set()
+
+    for artist_name in artist_names:
+        try:
+            provider_artist = (
+                _best_qobuz_artist_for_name(
+                    backend,
+                    artist_name,
+                )
+            )
+
+            if not isinstance(provider_artist, dict):
+                continue
+
+            artist_id = str(
+                provider_artist.get("artist_id")
+                or ""
+            ).strip()
+
+            if not artist_id:
+                continue
+
+            artist_page = backend.get_artist_page(
+                artist_id
+            )
+
+            if not isinstance(artist_page, dict):
+                continue
+
+            top_tracks = (
+                artist_page.get("top_tracks")
+                or []
+            )
+
+            if not isinstance(top_tracks, list):
+                continue
+
+            accepted_for_artist = 0
+
+            for track in top_tracks:
+                if accepted_for_artist >= n_tracks:
+                    break
+
+                if not isinstance(track, dict):
+                    continue
+
+                if track.get("streamable") is False:
+                    continue
+
+                source = str(
+                    track.get("source")
+                    or ""
+                ).strip().lower()
+
+                provider_track_id = str(
+                    track.get("provider_track_id")
+                    or ""
+                ).strip()
+
+                canonical_id = str(
+                    track.get("id")
+                    or ""
+                ).strip()
+
+                if (
+                    source != "qobuz"
+                    or not provider_track_id
+                    or not provider_track_id.isdigit()
+                    or canonical_id
+                    != "qobuz:" + provider_track_id
+                ):
+                    continue
+
+                if (
+                    provider_track_id
+                    in seen_provider_ids
+                ):
+                    continue
+
+                normalized = dict(track)
+
+                normalized["source"] = "qobuz"
+                normalized["provider_track_id"] = (
+                    provider_track_id
+                )
+                normalized["id"] = (
+                    "qobuz:" + provider_track_id
+                )
+
+                seen_provider_ids.add(
+                    provider_track_id
+                )
+
+                tracks.append(normalized)
+                accepted_for_artist += 1
+
+        except Exception as exc:
+            logger.warning(
+                "automix Qobuz track fetch failed for %s: %s",
+                artist_name,
+                exc,
+            )
+
+    return tracks
+
+
+def _automix_create_tidal_playlist(
+    backend,
+    playlist_name,
+    track_ids,
+):
+    """Preserve the locked Q9B TIDAL creation behavior."""
+    user = backend.session.user
+
+    playlist = user.create_playlist(
+        playlist_name,
+        "Created by SROVA Auto-Mix",
+    )
+
+    # Preserve the original Q9B invalidation timing exactly.
+    cache_invalidate("myplaylists")
+
+    ids = [
+        int(track_id)
+        for track_id in track_ids
+        if track_id
+    ]
+
+    if ids:
+        playlist.add(ids)
+
+    return len(ids)
+
+
+def _automix_create_qobuz_playlist(
+    backend,
+    playlist_name,
+    tracks,
+):
+    """Create and positively confirm one native Qobuz Auto-Mix playlist."""
+    created = backend.create_playlist(
+        playlist_name,
+        "Created by SROVA Auto-Mix",
+        is_public=False,
+    )
+
+    if (
+        not isinstance(created, dict)
+        or created.get("ok") is not True
+    ):
+        raise RuntimeError(
+            "Qobuz Auto-Mix playlist creation failed."
+        )
+
+    playlist_id = str(
+        created.get("id")
+        or (
+            created.get("playlist")
+            or {}
+        ).get("playlist_id")
+        or ""
+    ).strip()
+
+    if not playlist_id:
+        raise RuntimeError(
+            "Qobuz Auto-Mix playlist creation returned no playlist ID."
+        )
+
+    added = backend.add_tracks_to_playlist(
+        playlist_id,
+        tracks,
+    )
+
+    if (
+        not isinstance(added, dict)
+        or added.get("ok") is not True
+        or added.get("confirmed") is not True
+    ):
+        raise RuntimeError(
+            "Qobuz Auto-Mix playlist update could not be confirmed."
+        )
+
+    return len(tracks)
+
+
+
+def _recommended_tracks_for_seed(
+    seed_id,
+    limit=12,
+    mode=None,
+    provider=None,
+):
     try:
-        backend = APP_INSTANCE.backend
         if not seed_id:
-            logger.warning("Infinite Play: no seed track available")
-            return []
-        if not backend or not getattr(backend, "session", None):
-            logger.info("Infinite Play: TIDAL is not logged in or session is unavailable")
+            logger.warning(
+                "Infinite Play: no seed track available"
+            )
             return []
 
-        mode = _normalise_tidal_infinite_play_mode(mode or _tidal_infinite_play_mode())
+        provider = (
+            _normalise_infinite_play_provider(provider)
+            if provider
+            else _effective_infinite_play_provider()
+        )
+
+        if provider not in ("tidal", "qobuz"):
+            logger.info(
+                "Infinite Play: no authenticated catalog provider available"
+            )
+            return []
+
+        if provider == "tidal":
+            backend = APP_INSTANCE.backend
+            if not backend or not getattr(
+                backend,
+                "session",
+                None,
+            ):
+                logger.info(
+                    "Infinite Play: TIDAL is not logged in "
+                    "or session is unavailable"
+                )
+                return []
+        else:
+            backend = getattr(
+                APP_INSTANCE,
+                "qobuz_backend",
+                None,
+            )
+            if (
+                backend is None
+                or not isinstance(backend.status(), dict)
+                or backend.status().get("usable") is not True
+            ):
+                logger.info(
+                    "Infinite Play: Qobuz is not authenticated "
+                    "or backend is unavailable"
+                )
+                return []
+
+        mode = _normalise_tidal_infinite_play_mode(
+            mode or _tidal_infinite_play_mode()
+        )
+
         seed_artist = _seed_artist_name_for_track(seed_id)
         if not seed_artist:
-            logger.warning("Infinite Play: no seed artist for track %s", seed_id)
+            logger.warning(
+                "Infinite Play: no seed artist for track %s",
+                seed_id,
+            )
             return []
 
         def _track_id(track):
-            return str(getattr(track, "id", "") or "").strip()
+            return _infinite_play_track_id(track)
 
-        def _fetch_artist_tracks(artist_names, fetch_mode, target_limit):
+        def _fetch_artist_tracks(
+            artist_names,
+            fetch_mode,
+            target_limit,
+        ):
             tracks = []
             seen_track_ids = set()
-            per_artist = target_limit if fetch_mode == "same_artist" else 3
+
+            per_artist = (
+                target_limit
+                if fetch_mode == "same_artist"
+                else 3
+            )
             if fetch_mode == "surprise_me":
                 per_artist = 2
 
-            fetch_cap = max(target_limit * 2, target_limit)
+            fetch_cap = max(
+                target_limit * 2,
+                target_limit,
+            )
+
             if fetch_mode == "same_artist":
-                # Same Artist is the safety net. Fetch deeper so obscure/new artists
-                # can still keep Infinite Play alive without Last.fm depth.
-                fetch_cap = max(target_limit * 2, 25)
+                fetch_cap = max(
+                    target_limit * 2,
+                    25,
+                )
 
             for artist_name in artist_names:
                 if len(tracks) >= fetch_cap:
                     break
-                try:
-                    tidal_artist = _best_tidal_artist_for_name(backend, artist_name)
-                    if not tidal_artist:
-                        continue
 
+                try:
                     artist_fetch_limit = max(
                         per_artist,
-                        target_limit if fetch_mode == "same_artist" else per_artist
+                        (
+                            target_limit
+                            if fetch_mode == "same_artist"
+                            else per_artist
+                        ),
                     )
+
                     if fetch_mode == "same_artist":
                         artist_fetch_limit = fetch_cap
 
-                    top_tracks = backend.get_artist_top_tracks(tidal_artist, limit=artist_fetch_limit)
-                    artist_added = 0
-                    for track in top_tracks:
-                        tid = _track_id(track)
-                        if not tid or tid in seen_track_ids:
+                    if provider == "tidal":
+                        provider_artist = (
+                            _best_tidal_artist_for_name(
+                                backend,
+                                artist_name,
+                            )
+                        )
+                        if not provider_artist:
                             continue
-                        seen_track_ids.add(tid)
+
+                        top_tracks = (
+                            backend.get_artist_top_tracks(
+                                provider_artist,
+                                limit=artist_fetch_limit,
+                            )
+                        )
+                    else:
+                        provider_artist = (
+                            _best_qobuz_artist_for_name(
+                                backend,
+                                artist_name,
+                            )
+                        )
+                        if not provider_artist:
+                            continue
+
+                        artist_id = str(
+                            provider_artist.get(
+                                "artist_id"
+                            )
+                            or ""
+                        ).strip()
+                        if not artist_id:
+                            continue
+
+                        artist_page = (
+                            backend.get_artist_page(
+                                artist_id
+                            )
+                        )
+                        if not isinstance(
+                            artist_page,
+                            dict,
+                        ):
+                            continue
+
+                        top_tracks = (
+                            artist_page.get(
+                                "top_tracks"
+                            )
+                            or []
+                        )
+
+                        if not isinstance(
+                            top_tracks,
+                            list,
+                        ):
+                            continue
+
+                        top_tracks = top_tracks[
+                            :artist_fetch_limit
+                        ]
+
+                    artist_added = 0
+
+                    for track in top_tracks:
+                        if (
+                            provider == "qobuz"
+                            and not _valid_qobuz_infinite_play_track(
+                                track
+                            )
+                        ):
+                            continue
+
+                        if (
+                            provider == "qobuz"
+                            and isinstance(track, dict)
+                            and track.get("streamable")
+                            is False
+                        ):
+                            continue
+
+                        track_id = _track_id(track)
+                        if (
+                            not track_id
+                            or track_id in seen_track_ids
+                        ):
+                            continue
+
+                        seen_track_ids.add(track_id)
                         tracks.append(track)
                         artist_added += 1
 
-                        if fetch_mode != "same_artist" and artist_added >= per_artist:
+                        if (
+                            fetch_mode != "same_artist"
+                            and artist_added >= per_artist
+                        ):
                             break
+
                         if len(tracks) >= fetch_cap:
                             break
+
                 except Exception as e:
-                    logger.warning("Infinite Play TIDAL track fetch failed for %s: %s", artist_name, e)
+                    logger.warning(
+                        "Infinite Play %s track fetch failed "
+                        "for %s: %s",
+                        provider.upper(),
+                        artist_name,
+                        e,
+                    )
 
             return tracks
 
         artist_names = []
         fallback_added = 0
-        minimum_needed = min(10, max(1, int(limit or 10)))
+        minimum_needed = min(
+            10,
+            max(1, int(limit or 10)),
+        )
 
         if mode == "same_artist":
             artist_names = [seed_artist]
         else:
             if _lastfm_api_key_for_recommendations():
-                artist_names = _infinite_play_artist_pool(seed_artist, mode)
+                artist_names = _infinite_play_artist_pool(
+                    seed_artist,
+                    mode,
+                )
             else:
-                logger.info("Infinite Play: Last.fm is not configured; using same-artist fallback")
+                logger.info(
+                    "Infinite Play: Last.fm is not configured; "
+                    "using same-artist fallback"
+                )
 
         if not artist_names:
             logger.info(
-                "Infinite Play: no Last.fm artist pool for %s in mode=%s; using same-artist fallback",
+                "Infinite Play: no Last.fm artist pool for %s "
+                "in mode=%s; using same-artist fallback",
                 seed_artist,
                 mode,
             )
 
-        tracks = _fetch_artist_tracks(artist_names, mode, limit) if artist_names else []
+        tracks = (
+            _fetch_artist_tracks(
+                artist_names,
+                mode,
+                limit,
+            )
+            if artist_names
+            else []
+        )
 
-        # Safety net: Similar Artists and Surprise Me must not stall when Last.fm
-        # has too little data. Fall back to Same Artist and let append logic fill
-        # with shuffled/recycled same-artist tracks if the catalogue is tiny.
-        if mode != "same_artist" and len(tracks) < minimum_needed:
+        # Preserve the existing safety fallback for both providers.
+        if (
+            mode != "same_artist"
+            and len(tracks) < minimum_needed
+        ):
             before = len(tracks)
-            fallback_tracks = _fetch_artist_tracks([seed_artist], "same_artist", max(limit, 25))
-            seen = set(_track_id(t) for t in tracks if _track_id(t))
+
+            fallback_tracks = _fetch_artist_tracks(
+                [seed_artist],
+                "same_artist",
+                max(limit, 25),
+            )
+
+            seen = {
+                _track_id(track)
+                for track in tracks
+                if _track_id(track)
+            }
+
             for track in fallback_tracks:
-                tid = _track_id(track)
-                if not tid or tid in seen:
+                track_id = _track_id(track)
+
+                if (
+                    not track_id
+                    or track_id in seen
+                ):
                     continue
-                seen.add(tid)
+
+                seen.add(track_id)
                 tracks.append(track)
 
             fallback_added = len(tracks) - before
+
             logger.info(
-                "Infinite Play: fallback same_artist mode=%s seed_artist=%s primary_candidates=%d fallback_added=%d",
+                "Infinite Play: fallback same_artist "
+                "provider=%s mode=%s seed_artist=%s "
+                "primary_candidates=%d fallback_added=%d",
+                provider,
                 mode,
                 seed_artist,
                 before,
@@ -7642,54 +12881,224 @@ def _recommended_tracks_for_seed(seed_id, limit=12, mode=None):
             random.shuffle(tracks)
 
         logger.info(
-            "Infinite Play: mode=%s seed_artist=%s candidates=%d fallback_same_artist=%d",
+            "Infinite Play: provider=%s mode=%s "
+            "seed_artist=%s candidates=%d "
+            "fallback_same_artist=%d",
+            provider,
             mode,
             seed_artist,
             len(tracks),
             fallback_added,
         )
+
         return tracks
+
     except Exception as e:
-        logger.warning("Infinite Play recommendation lookup failed: %s", e)
+        logger.warning(
+            "Infinite Play recommendation lookup failed: %s",
+            e,
+        )
         return []
 
 
-def _append_infinite_play_recommendations(seed_id=None, limit=10, autoplay=False, mode=None):
+
+
+def _infinite_play_queue_meta(track, provider):
+    provider = _normalise_infinite_play_provider(
+        provider
+    )
+
+    if provider == "qobuz":
+        if not _valid_qobuz_infinite_play_track(
+            track
+        ):
+            return None
+
+        meta = dict(track)
+
+        meta["source"] = "qobuz"
+        meta["id"] = _infinite_play_track_id(
+            track
+        )
+        meta["provider_track_id"] = str(
+            track.get("provider_track_id")
+            or ""
+        ).strip()
+        meta["title"] = _infinite_play_track_title(
+            track
+        )
+        meta["artist"] = _infinite_play_track_artist(
+            track
+        )
+        meta["album"] = _infinite_play_track_album_name(
+            track
+        )
+        meta["album_id"] = _infinite_play_track_album_id(
+            track
+        )
+        meta["cover"] = _infinite_play_track_cover(
+            track
+        )
+        meta["duration"] = int(
+            track.get("duration")
+            or 0
+        )
+
+        return meta
+
+    track_id = _infinite_play_track_id(track)
+
+    return {
+        "id": track_id,
+        "title": _infinite_play_track_title(track),
+        "artist": _infinite_play_track_artist(track),
+        "album": _infinite_play_track_album_name(track),
+        "album_id": _infinite_play_track_album_id(track),
+        "cover": _infinite_play_track_cover(track),
+        "duration": int(
+            getattr(track, "duration", 0)
+            or 0
+        ),
+        "quality": _quality_badge(track),
+    }
+
+
+def _append_infinite_play_recommendations(
+    seed_id=None,
+    limit=10,
+    autoplay=False,
+    mode=None,
+    provider=None,
+):
     global PLAY_QUEUE, ORIGINAL_QUEUE, PLAY_QUEUE_META_CACHE
+
     try:
         if not seed_id:
             with _QUEUE_LOCK:
-                seed_id = PLAY_QUEUE[-1] if PLAY_QUEUE else None
-        if not seed_id:
-            logger.warning("Infinite Play: no recommendation seed available")
-            return {"ok": False, "error": "no seed track available", "added": 0}
-        seed_id = str(seed_id)
-        if seed_id.startswith("local:"):
-            logger.info("Infinite Play: local seed ignored")
-            return {"ok": False, "error": "seed is not a TIDAL track", "added": 0}
+                seed_id = (
+                    PLAY_QUEUE[-1]
+                    if PLAY_QUEUE
+                    else None
+                )
 
-        mode = _normalise_tidal_infinite_play_mode(mode or _tidal_infinite_play_mode())
-        new_tracks = _recommended_tracks_for_seed(seed_id, limit=max(limit * 2, 12), mode=mode)
+        if not seed_id:
+            logger.warning(
+                "Infinite Play: no recommendation seed available"
+            )
+            return {
+                "ok": False,
+                "error": "no seed track available",
+                "added": 0,
+            }
+
+        provider = (
+            _normalise_infinite_play_provider(provider)
+            if provider
+            else _effective_infinite_play_provider()
+        )
+
+        if provider not in ("tidal", "qobuz"):
+            return {
+                "ok": False,
+                "error": "no Infinite Play provider available",
+                "added": 0,
+            }
+
+        seed_id = str(seed_id)
+        seed_meta = (
+            PLAY_QUEUE_META_CACHE.get(
+                seed_id,
+                {},
+            )
+            or {}
+        )
+        seed_source = _queue_item_source(
+            seed_id,
+            seed_meta,
+        )
+
+        if seed_source != provider:
+            logger.info(
+                "Infinite Play: seed provider mismatch "
+                "source=%s effective=%s",
+                seed_source,
+                provider,
+            )
+            return {
+                "ok": False,
+                "error": (
+                    "seed provider does not match "
+                    "Infinite Play provider"
+                ),
+                "added": 0,
+            }
+
+        if (
+            provider == "qobuz"
+            and not _valid_qobuz_infinite_play_seed(
+                seed_id,
+                seed_meta,
+            )
+        ):
+            logger.info(
+                "Infinite Play: malformed Qobuz seed rejected: %s",
+                seed_id,
+            )
+            return {
+                "ok": False,
+                "error": "invalid Qobuz seed identity",
+                "added": 0,
+            }
+
+        mode = _normalise_tidal_infinite_play_mode(
+            mode or _tidal_infinite_play_mode()
+        )
+
+        new_tracks = _recommended_tracks_for_seed(
+            seed_id,
+            limit=max(limit * 2, 12),
+            mode=mode,
+            provider=provider,
+        )
+
         if not new_tracks:
-            return {"ok": False, "error": "no recommended tracks found", "added": 0}
+            return {
+                "ok": False,
+                "error": "no recommended tracks found",
+                "added": 0,
+            }
 
         with _QUEUE_LOCK:
-            existing = set(str(tid) for tid in PLAY_QUEUE)
-            seed_meta = dict(PLAY_QUEUE_META_CACHE.get(seed_id, {}) or {})
+            existing = {
+                str(track_id)
+                for track_id in PLAY_QUEUE
+            }
+
+            seed_meta = dict(
+                PLAY_QUEUE_META_CACHE.get(
+                    seed_id,
+                    {},
+                )
+                or {}
+            )
 
             filtered = _select_infinite_play_diverse_tracks(
                 new_tracks,
                 limit=limit,
                 mode=mode,
-                recent_history=list(INFINITE_PLAY_HISTORY),
+                recent_history=list(
+                    INFINITE_PLAY_HISTORY
+                ),
                 existing_ids=existing,
                 previous_entry=seed_meta,
             )
 
             if not filtered:
                 logger.warning(
-                    "Infinite Play: diversity selector found no usable tracks "
-                    "mode=%s candidates=%d history=%d",
+                    "Infinite Play: diversity selector found "
+                    "no usable tracks provider=%s mode=%s "
+                    "candidates=%d history=%d",
+                    provider,
                     mode,
                     len(new_tracks),
                     len(INFINITE_PLAY_HISTORY),
@@ -7704,44 +13113,42 @@ def _append_infinite_play_recommendations(seed_id=None, limit=10, autoplay=False
             added = 0
             added_tracks = []
 
-            for t in filtered[:limit]:
-                tid = str(getattr(t, "id", "") or "").strip()
-                if not tid:
+            for track in filtered[:limit]:
+                meta = _infinite_play_queue_meta(
+                    track,
+                    provider,
+                )
+
+                if not meta:
                     continue
 
-                album_obj = getattr(t, "album", None)
-                album_id = (
-                    str(getattr(album_obj, "id", "") or "").strip()
-                    if album_obj else ""
-                )
-                album_name = (
-                    _safe_str(getattr(album_obj, "name", ""))
-                    if album_obj else ""
-                )
+                track_id = str(
+                    meta.get("id")
+                    or ""
+                ).strip()
 
-                meta = {
-                    "id":       tid,
-                    "title":    _safe_str(getattr(t, "name", "")),
-                    "artist":   _tidal_track_artist_name(t),
-                    "album":    album_name,
-                    "album_id": album_id,
-                    "cover":    _tidal_track_cover_url(t),
-                    "duration": int(getattr(t, "duration", 0) or 0),
-                    "quality":  _quality_badge(t)
-                }
+                if not track_id:
+                    continue
 
-                PLAY_QUEUE.append(tid)
-                ORIGINAL_QUEUE.append(tid)
-                PLAY_QUEUE_META_CACHE[tid] = meta
-                added_tracks.append(t)
+                PLAY_QUEUE.append(track_id)
+                ORIGINAL_QUEUE.append(track_id)
+                PLAY_QUEUE_META_CACHE[
+                    track_id
+                ] = meta
+
+                added_tracks.append(track)
                 added += 1
 
-            _record_infinite_play_history_tracks(added_tracks)
+            _record_infinite_play_history_tracks(
+                added_tracks
+            )
             next_idx = insert_start
 
             logger.info(
-                "Infinite Play diversity: mode=%s selected=%d candidates=%d "
+                "Infinite Play diversity: provider=%s "
+                "mode=%s selected=%d candidates=%d "
                 "history=%d",
+                provider,
                 mode,
                 added,
                 len(new_tracks),
@@ -7749,69 +13156,208 @@ def _append_infinite_play_recommendations(seed_id=None, limit=10, autoplay=False
             )
 
         if added <= 0:
-            logger.warning("Infinite Play: recommendations had no usable track ids")
-            return {"ok": False, "error": "no usable recommended tracks", "added": 0}
+            logger.warning(
+                "Infinite Play: recommendations had "
+                "no usable track ids"
+            )
+            return {
+                "ok": False,
+                "error": "no usable recommended tracks",
+                "added": 0,
+            }
 
         save_queue()
-        logger.info("Infinite Play: appended %d recommended tracks with mode=%s", added, mode)
+
+        logger.info(
+            "Infinite Play: appended %d recommended "
+            "tracks provider=%s mode=%s",
+            added,
+            provider,
+            mode,
+        )
+
         if autoplay:
-            GLib.idle_add(lambda: play_queue_index(next_idx))
-        return {"ok": True, "added": added, "mode": mode, "queue_length": len(PLAY_QUEUE)}
+            GLib.idle_add(
+                lambda: play_queue_index(
+                    next_idx
+                )
+            )
+
+        return {
+            "ok": True,
+            "added": added,
+            "mode": mode,
+            "provider": provider,
+            "queue_length": len(PLAY_QUEUE),
+        }
+
     except Exception as e:
-        logger.warning("Infinite Play append failed: %s", e)
-        return {"ok": False, "error": str(e), "added": 0}
+        logger.warning(
+            "Infinite Play append failed: %s",
+            e,
+        )
+        return {
+            "ok": False,
+            "error": str(e),
+            "added": 0,
+        }
 
 
-def _coordinated_infinite_play_refill(seed_id=None, limit=10, autoplay=False, mode=None):
-    """Serialize Infinite Play generation across proactive refill, EOS and clients."""
-    mode = _normalise_tidal_infinite_play_mode(mode or _tidal_infinite_play_mode())
+
+def _coordinated_infinite_play_refill(
+    seed_id=None,
+    limit=10,
+    autoplay=False,
+    mode=None,
+):
+    """Serialize provider-aware generation across proactive refill and EOS."""
+    mode = _normalise_tidal_infinite_play_mode(
+        mode or _tidal_infinite_play_mode()
+    )
 
     with _INFINITE_PLAY_GENERATION_LOCK:
         if not _tidal_infinite_play_enabled():
-            logger.info("Infinite Play generation skipped: disabled")
-            return {"ok": False, "error": "Infinite Play is disabled", "added": 0}
+            logger.info(
+                "Infinite Play generation skipped: disabled"
+            )
+            return {
+                "ok": False,
+                "error": "Infinite Play is disabled",
+                "added": 0,
+            }
 
         if RADIO_MODE:
-            logger.info("Infinite Play generation skipped: radio mode active")
-            return {"ok": False, "error": "radio mode active", "added": 0}
+            logger.info(
+                "Infinite Play generation skipped: radio mode active"
+            )
+            return {
+                "ok": False,
+                "error": "radio mode active",
+                "added": 0,
+            }
+
+        effective_provider = (
+            _effective_infinite_play_provider()
+        )
+
+        if effective_provider not in (
+            "tidal",
+            "qobuz",
+        ):
+            logger.info(
+                "Infinite Play generation skipped: "
+                "no provider available"
+            )
+            return {
+                "ok": False,
+                "error": "no Infinite Play provider available",
+                "added": 0,
+            }
 
         with _QUEUE_LOCK:
-            if not PLAY_QUEUE or not (0 <= QUEUE_INDEX < len(PLAY_QUEUE)):
-                return {"ok": False, "error": "no active queue", "added": 0}
+            if (
+                not PLAY_QUEUE
+                or not (
+                    0 <= QUEUE_INDEX < len(PLAY_QUEUE)
+                )
+            ):
+                return {
+                    "ok": False,
+                    "error": "no active queue",
+                    "added": 0,
+                }
 
             active_index = int(QUEUE_INDEX)
-            active_id = str(PLAY_QUEUE[active_index])
-            active_meta = PLAY_QUEUE_META_CACHE.get(active_id, {}) or {}
-            active_source = str(active_meta.get("source") or "").lower()
+            active_id = str(
+                PLAY_QUEUE[active_index]
+            )
+            active_meta = (
+                PLAY_QUEUE_META_CACHE.get(
+                    active_id,
+                    {},
+                )
+                or {}
+            )
+            active_source = _queue_item_source(
+                active_id,
+                active_meta,
+            )
 
-            if active_id.startswith("local:") or active_source == "local":
-                logger.info("Infinite Play generation skipped: active queue item is local")
-                return {"ok": False, "error": "active track is not TIDAL", "added": 0}
+            if active_source != effective_provider:
+                logger.info(
+                    "Infinite Play generation skipped: "
+                    "active source=%s effective provider=%s",
+                    active_source,
+                    effective_provider,
+                )
+                return {
+                    "ok": False,
+                    "error": (
+                        "active track provider does not "
+                        "match Infinite Play provider"
+                    ),
+                    "added": 0,
+                }
+
+            if (
+                effective_provider == "qobuz"
+                and not _valid_qobuz_infinite_play_seed(
+                    active_id,
+                    active_meta,
+                )
+            ):
+                logger.info(
+                    "Infinite Play generation skipped: "
+                    "invalid Qobuz active identity=%s",
+                    active_id,
+                )
+                return {
+                    "ok": False,
+                    "error": "invalid Qobuz seed identity",
+                    "added": 0,
+                }
 
             next_index = active_index + 1
+
             if next_index < len(PLAY_QUEUE):
                 queue_length = len(PLAY_QUEUE)
+
                 logger.info(
-                    "Infinite Play: generation already satisfied current_index=%s queue_length=%s",
+                    "Infinite Play: generation already "
+                    "satisfied current_index=%s "
+                    "queue_length=%s",
                     active_index,
                     queue_length,
                 )
+
                 if autoplay:
-                    GLib.idle_add(lambda idx=next_index: play_queue_index(idx))
+                    GLib.idle_add(
+                        lambda idx=next_index: (
+                            play_queue_index(idx)
+                        )
+                    )
+
                 return {
                     "ok": True,
                     "added": 0,
                     "already_filled": True,
                     "mode": mode,
+                    "provider": effective_provider,
                     "queue_length": queue_length,
                 }
 
-            if seed_id and str(seed_id) != active_id:
+            if (
+                seed_id
+                and str(seed_id) != active_id
+            ):
                 logger.info(
-                    "Infinite Play generation seed mismatch: requested=%s active=%s",
+                    "Infinite Play generation seed mismatch: "
+                    "requested=%s active=%s",
                     seed_id,
                     active_id,
                 )
+
+            # Active queue tail is authoritative.
             seed_id = active_id
 
         return _append_infinite_play_recommendations(
@@ -7819,7 +13365,9 @@ def _coordinated_infinite_play_refill(seed_id=None, limit=10, autoplay=False, mo
             limit=limit,
             autoplay=autoplay,
             mode=mode,
+            provider=effective_provider,
         )
+
 
 
 def _autofill_queue():
@@ -7842,14 +13390,68 @@ def _autofill_queue():
 def install_eos_hook():
     player   = APP_INSTANCE.player
     original = player._on_eos_callback
+
     def eos_callback(*args, **kwargs):
         if _radio_eos_should_ignore():
             logger.info("Radio EOS ignored: live stream")
             return
+
         if original:
             original(*args, **kwargs)
+
+        if _qobuz_playback_is_active():
+            queued_qobuz_id = _qobuz_active_queue_id()
+            qobuz_eos_target = ""
+            qobuz_eos_replacement_request = None
+
+            if (
+                queued_qobuz_id
+                and "_qobuz_next_replacement_target_queue_id" in globals()
+                and "_prepare_qobuz_replacement_pending" in globals()
+            ):
+                qobuz_eos_target = _qobuz_next_replacement_target_queue_id()
+                if qobuz_eos_target:
+                    qobuz_eos_replacement_request = (
+                        _prepare_qobuz_replacement_pending(
+                            qobuz_eos_target,
+                            "qobuz-queue-eos",
+                        )
+                    )
+
+            try:
+                player.stop()
+            except Exception as exc:
+                logger.debug(
+                    "Qobuz EOS transport settle stop failed safely: %s",
+                    exc,
+                )
+
+            if queued_qobuz_id:
+                if qobuz_eos_replacement_request is not None:
+                    _invalidate_qobuz_playback(
+                        "qobuz-queue-eos",
+                        preserve_replacement=True,
+                    )
+                else:
+                    # Compatibility path for the established isolated Q5
+                    # harness and for a genuine no-target queue end.
+                    _invalidate_qobuz_playback("qobuz-queue-eos")
+                logger.info(
+                    "Queued Qobuz EOS advancing shared queue: %s",
+                    queued_qobuz_id,
+                )
+                play_next_track()
+                return
+
+            logger.info(
+                "Direct Qobuz proof EOS observed; transport settled and "
+                "shared queue advance skipped"
+            )
+            return
+
         logger.info("SROVA EOS callback advancing queue")
         play_next_track()
+
     player._on_eos_callback = eos_callback
 
 
@@ -7988,10 +13590,31 @@ def _queue_auto_advance_key(source, current_id, queue_index, title):
 
 
 def _queue_item_source(current_id, meta):
-    meta_source = str((meta or {}).get("source") or "").lower()
-    if str(current_id or "").startswith(("local:", "local-test:")) or meta_source == "local":
+    """Classify shared queue identity while preserving historical TIDAL IDs."""
+    track_id = str(current_id or "").strip()
+    meta_source = str((meta or {}).get("source") or "").strip().lower()
+
+    # Canonical queue ID identity is authoritative.
+    if track_id.startswith("radio:station:"):
+        return "radio"
+
+    if track_id.startswith(("local:", "local-test:")):
         return "local"
-    return "tidal"
+
+    if track_id.startswith("qobuz:"):
+        return "qobuz"
+
+    # Locked Q5 compatibility rule: every historical unprefixed cloud ID
+    # remains TIDAL even if stale or malformed metadata claims otherwise.
+    if ":" not in track_id:
+        return "tidal"
+
+    # Retain backward-safe metadata fallback for older explicitly-prefixed
+    # non-Qobuz queue forms. Qobuz itself always requires qobuz:<native-id>.
+    if meta_source in ("radio", "local", "tidal"):
+        return meta_source
+
+    return "unknown"
 
 
 def _active_queue_auto_advance_snapshot():
@@ -8020,7 +13643,7 @@ def _active_queue_auto_advance_snapshot():
 
 def _arm_queue_auto_advance(source, current_id, queue_index, title):
     global QUEUE_AUTO_ADVANCE_ARMED_KEY, QUEUE_AUTO_ADVANCE_DISARMED_BY_USER
-    if str(source or "").lower() not in ("local", "tidal"):
+    if str(source or "").lower() not in ("local", "tidal", "qobuz"):
         return
     QUEUE_AUTO_ADVANCE_ARMED_KEY = _queue_auto_advance_key(source, current_id, queue_index, title)
     QUEUE_AUTO_ADVANCE_DISARMED_BY_USER = False
@@ -8049,7 +13672,7 @@ def _maybe_schedule_queue_overrun_advance(playback_context, position, duration):
         if _radio_eos_should_ignore(playback_context):
             return
         source = str(playback_context.get("source") or "").lower()
-        if source not in ("local", "tidal"):
+        if source not in ("local", "tidal", "qobuz"):
             return
         player = APP_INSTANCE.player if APP_INSTANCE is not None else None
         if player is None:
@@ -8374,6 +13997,394 @@ def _build_track_list(tracks, show_artist=False):
     return data
 
 
+_STREAMING_PLAYLIST_MAX_TRACKS = 10000
+_TIDAL_COMPLETE_PLAYLIST_PAGE_SIZE = 100
+_QOBUZ_COMPLETE_PLAYLIST_PAGE_SIZE = 100
+
+
+def _playlist_declared_track_count(playlist_obj):
+    """Return a trustworthy non-negative provider count where exposed."""
+    if playlist_obj is None:
+        return None
+
+    for attr in (
+        "num_tracks",
+        "numberOfTracks",
+        "number_of_tracks",
+        "number_of_items",
+    ):
+        try:
+            value = getattr(playlist_obj, attr, None)
+        except Exception:
+            continue
+
+        if value is None or isinstance(value, bool):
+            continue
+
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            continue
+
+        if count >= 0:
+            return count
+
+    return None
+
+
+def _complete_streaming_playlist_payload(
+    provider,
+    playlist_id,
+    *,
+    tidal_backend=None,
+    qobuz_backend=None,
+):
+    """Resolve one logical streaming playlist independently of UI pagination.
+
+    The returned track inventory is complete for the provider snapshot used
+    during this request.  It never derives playback inventory from rendered
+    browser rows and does not mutate the shared queue.
+    """
+    provider = str(provider or "").strip().lower()
+    playlist_id = str(playlist_id or "").strip()
+
+    if provider not in ("tidal", "qobuz"):
+        raise ValueError("Provider must be tidal or qobuz.")
+
+    if (
+        not playlist_id
+        or len(playlist_id) > 512
+        or any(
+            ord(char) < 32 or ord(char) == 127
+            for char in playlist_id
+        )
+    ):
+        raise ValueError("Playlist ID is invalid.")
+
+    if provider == "tidal":
+        if tidal_backend is None:
+            raise RuntimeError("TIDAL playlist service is unavailable.")
+
+        playlist_obj = None
+        session = getattr(tidal_backend, "session", None)
+
+        if session is not None and hasattr(session, "playlist"):
+            try:
+                playlist_obj = session.playlist(playlist_id)
+            except Exception as exc:
+                raise RuntimeError(
+                    "TIDAL playlist could not be resolved."
+                ) from exc
+
+        declared_total = _playlist_declared_track_count(
+            playlist_obj
+        )
+
+        playlist_name = ""
+        if playlist_obj is not None:
+            try:
+                playlist_name = _safe_str(
+                    getattr(playlist_obj, "name", "")
+                    or getattr(playlist_obj, "title", "")
+                    or ""
+                )
+            except Exception:
+                playlist_name = ""
+
+        playlist_editable = False
+        if (
+            playlist_obj is not None
+            and hasattr(
+                tidal_backend,
+                "_is_owned_user_playlist",
+            )
+        ):
+            try:
+                playlist_editable = bool(
+                    tidal_backend._is_owned_user_playlist(
+                        playlist_obj
+                    )
+                )
+            except Exception:
+                playlist_editable = False
+
+        page_target = (
+            playlist_obj
+            if playlist_obj is not None
+            else playlist_id
+        )
+
+        raw_tracks = []
+        offset = 0
+
+        while True:
+            if len(raw_tracks) >= _STREAMING_PLAYLIST_MAX_TRACKS:
+                raise RuntimeError(
+                    "TIDAL playlist exceeds the supported track limit."
+                )
+
+            page = tidal_backend.get_playlist_tracks_page(
+                page_target,
+                limit=_TIDAL_COMPLETE_PLAYLIST_PAGE_SIZE,
+                offset=offset,
+            )
+
+            if page is None:
+                page = []
+
+            if not isinstance(page, list):
+                try:
+                    page = list(page)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "TIDAL playlist page is invalid."
+                    ) from exc
+
+            if len(page) > _TIDAL_COMPLETE_PLAYLIST_PAGE_SIZE:
+                raise RuntimeError(
+                    "TIDAL playlist page exceeded its requested limit."
+                )
+
+            if not page:
+                if (
+                    declared_total is not None
+                    and len(raw_tracks) < declared_total
+                ):
+                    raise RuntimeError(
+                        "TIDAL playlist pagination ended before "
+                        "the declared track count."
+                    )
+                break
+
+            if (
+                len(raw_tracks) + len(page)
+                > _STREAMING_PLAYLIST_MAX_TRACKS
+            ):
+                raise RuntimeError(
+                    "TIDAL playlist exceeds the supported track limit."
+                )
+
+            raw_tracks.extend(page)
+            offset += len(page)
+
+            if declared_total is not None:
+                if len(raw_tracks) > declared_total:
+                    raise RuntimeError(
+                        "TIDAL playlist returned more tracks "
+                        "than its declared track count."
+                    )
+
+                if len(raw_tracks) == declared_total:
+                    break
+
+                # A provider may cap a response below the requested page
+                # size.  When it has declared that more tracks exist, keep
+                # resolving from the logical offset instead of treating the
+                # short response as end-of-playlist.
+                continue
+
+            if len(page) < _TIDAL_COMPLETE_PLAYLIST_PAGE_SIZE:
+                break
+
+        tracks = _build_track_list(
+            raw_tracks,
+            show_artist=True,
+        )
+
+        for track in tracks:
+            track["source"] = "tidal"
+            track["provider_track_id"] = str(
+                track.get("id", "")
+            )
+
+        return {
+            "ok": True,
+            "provider": "tidal",
+            "source": "tidal",
+            "playlist_id": playlist_id,
+            "playlist_name": playlist_name,
+            "playlist_editable": playlist_editable,
+            "declared_total": declared_total,
+            "total": len(tracks),
+            "complete": True,
+            "tracks": tracks,
+        }
+
+    if qobuz_backend is None:
+        raise RuntimeError("Qobuz playlist service is unavailable.")
+
+    resolved_tracks = []
+    provider_total = None
+    offset = 0
+    first_detail = None
+
+    while True:
+        detail = qobuz_backend.get_playlist(
+            playlist_id,
+            limit=_QOBUZ_COMPLETE_PLAYLIST_PAGE_SIZE,
+            offset=offset,
+        )
+
+        if not isinstance(detail, dict):
+            raise RuntimeError(
+                "Qobuz playlist detail response is invalid."
+            )
+
+        if first_detail is None:
+            first_detail = detail
+
+        track_page = detail.get("tracks")
+
+        # Retain compatibility with the normalized bounded-page shape if
+        # a future internal caller supplies that envelope directly.
+        if not isinstance(track_page, dict):
+            if (
+                isinstance(detail.get("items"), list)
+                and isinstance(detail.get("total"), int)
+                and not isinstance(detail.get("total"), bool)
+            ):
+                track_page = detail
+            else:
+                raise RuntimeError(
+                    "Qobuz playlist track page is missing."
+                )
+
+        items = track_page.get("items")
+        total = track_page.get("total")
+
+        if not isinstance(items, list):
+            raise RuntimeError(
+                "Qobuz playlist track items are invalid."
+            )
+
+        if (
+            isinstance(total, bool)
+            or not isinstance(total, int)
+            or total < 0
+        ):
+            raise RuntimeError(
+                "Qobuz playlist track total is invalid."
+            )
+
+        if len(items) > _QOBUZ_COMPLETE_PLAYLIST_PAGE_SIZE:
+            raise RuntimeError(
+                "Qobuz playlist page exceeded its requested limit."
+            )
+
+        if provider_total is None:
+            provider_total = total
+
+            if provider_total > _STREAMING_PLAYLIST_MAX_TRACKS:
+                raise RuntimeError(
+                    "Qobuz playlist exceeds the supported track limit."
+                )
+        elif total != provider_total:
+            raise RuntimeError(
+                "Qobuz playlist changed during pagination."
+            )
+
+        if not items:
+            if len(resolved_tracks) < provider_total:
+                raise RuntimeError(
+                    "Qobuz playlist pagination ended before "
+                    "the provider total."
+                )
+            break
+
+        if (
+            len(resolved_tracks) + len(items)
+            > _STREAMING_PLAYLIST_MAX_TRACKS
+        ):
+            raise RuntimeError(
+                "Qobuz playlist exceeds the supported track limit."
+            )
+
+        resolved_tracks.extend(items)
+        offset += len(items)
+
+        if len(resolved_tracks) > provider_total:
+            raise RuntimeError(
+                "Qobuz playlist returned more tracks "
+                "than its provider total."
+            )
+
+        if len(resolved_tracks) == provider_total:
+            break
+
+    if provider_total is None:
+        provider_total = 0
+
+    if len(resolved_tracks) != provider_total:
+        raise RuntimeError(
+            "Qobuz playlist did not resolve completely."
+        )
+
+    for track in resolved_tracks:
+        if not isinstance(track, dict):
+            raise RuntimeError(
+                "Qobuz playlist track identity is invalid."
+            )
+
+        provider_track_id = str(
+            track.get("provider_track_id") or ""
+        ).strip()
+
+        canonical_id = str(
+            track.get("id") or ""
+        ).strip()
+
+        if (
+            str(track.get("source") or "").lower()
+            != "qobuz"
+            or not provider_track_id
+            or canonical_id
+            != "qobuz:" + provider_track_id
+        ):
+            raise RuntimeError(
+                "Qobuz playlist track identity is invalid."
+            )
+
+    first_detail = (
+        first_detail
+        if isinstance(first_detail, dict)
+        else {}
+    )
+
+    playlist_name = str(
+        first_detail.get("name")
+        or first_detail.get("title")
+        or ""
+    ).strip()
+
+    playlist_editable = False
+
+    if hasattr(
+        qobuz_backend,
+        "_playlist_owned_by_current_user",
+    ):
+        try:
+            playlist_editable = bool(
+                qobuz_backend._playlist_owned_by_current_user(
+                    first_detail
+                )
+            )
+        except Exception:
+            playlist_editable = False
+
+    return {
+        "ok": True,
+        "provider": "qobuz",
+        "source": "qobuz",
+        "playlist_id": playlist_id,
+        "playlist_name": playlist_name,
+        "playlist_editable": playlist_editable,
+        "declared_total": provider_total,
+        "total": len(resolved_tracks),
+        "complete": True,
+        "tracks": resolved_tracks,
+    }
+
+
 def _rebuild_queue_from_cache(cached_data):
     """No-op kept for call-site compatibility. Queue is populated via POST only.
     Browsing a cached album/playlist no longer disrupts playback."""
@@ -8416,11 +14427,43 @@ def _tidal_pause_payload():
     # RADIO_MODE active for resume; local keeps CURRENT_CONTEXT for status.
     _schedule_idle_release(5)
     cancel_scrobble()
+
+    pause_source = str(playback_context.get("source") or "").lower()
+
     if RADIO_MODE:
         _RADIO_SCROBBLE_CURRENT_KEY = None
+
+    # P4: custom Internet Radio uses the existing pause/DAC-release lifecycle,
+    # but its single active queue entry is terminal from the Play Queue once
+    # the user presses the Radio Stop control. Do not touch finite-track queues.
+    removed_radio_queue_id = ""
+    if pause_source == "radio" and RADIO_MODE:
+        with _QUEUE_LOCK:
+            if PLAY_QUEUE and 0 <= QUEUE_INDEX < len(PLAY_QUEUE):
+                candidate_id = str(PLAY_QUEUE[QUEUE_INDEX])
+                candidate_meta = PLAY_QUEUE_META_CACHE.get(candidate_id, {}) or {}
+                if _queue_item_source(candidate_id, candidate_meta) == "radio":
+                    removed_radio_queue_id = candidate_id
+                    _queue_remove_active_index_locked(QUEUE_INDEX)
+                    if not any(
+                        str(tid) == removed_radio_queue_id
+                        for tid in PLAY_QUEUE
+                    ):
+                        PLAY_QUEUE_META_CACHE.pop(
+                            removed_radio_queue_id,
+                            None,
+                        )
+
+        if removed_radio_queue_id:
+            save_queue()
+            logger.info(
+                "P4 Radio Stop removed active Internet Radio queue entry: %s",
+                removed_radio_queue_id,
+            )
+
     payload = {"result": "paused"}
-    if _is_local_playback_context():
-        payload["source"] = "local"
+    if pause_source in ("local", "qobuz"):
+        payload["source"] = pause_source
     payload["position"] = PAUSED_PLAYBACK_POSITION
     return payload
 
@@ -8453,6 +14496,105 @@ def _tidal_resume_payload():
         payload["result"] = "idle"
         return payload
     _cancel_idle_release()
+
+    if str(playback_context.get("source") or "").lower() == "qobuz":
+        queued_qobuz_id = _qobuz_active_queue_id()
+        qobuz_reload_index = None
+
+        if queued_qobuz_id:
+            with _QUEUE_LOCK:
+                qobuz_reload_index = (
+                    QUEUE_INDEX
+                    if PLAY_QUEUE
+                    and 0 <= QUEUE_INDEX < len(PLAY_QUEUE)
+                    and str(PLAY_QUEUE[QUEUE_INDEX]) == queued_qobuz_id
+                    and str(current_track_id or "") == queued_qobuz_id
+                    else None
+                )
+
+            if qobuz_reload_index is None:
+                _disarm_queue_auto_advance(
+                    "qobuz-resume-queue-identity-mismatch"
+                )
+                logger.warning(
+                    "Queued Qobuz resume rejected stale queue identity: "
+                    "active_queue_id=%s current_track_id=%s",
+                    queued_qobuz_id,
+                    current_track_id,
+                )
+                return {
+                    "result": "idle",
+                    "source": "qobuz",
+                    "position": resume_position,
+                    "error": "qobuz_queue_identity_mismatch",
+                }
+
+        if qobuz_reload_index is not None and was_released:
+            PAUSED_PIPELINE_RELEASED = False
+            logger.info(
+                "Qobuz released-DAC resume restarts current queue item: "
+                "index=%s saved_position=%.3fs",
+                qobuz_reload_index,
+                float(resume_position or 0),
+            )
+            GLib.idle_add(
+                lambda idx=qobuz_reload_index:
+                    play_queue_index(idx, _resume_position=0.0)
+            )
+            return {
+                "result": "playing",
+                "source": "qobuz",
+                "position": 0,
+                "restarted": True,
+                "reason": "qobuz_released_resume_restart_from_zero",
+            }
+
+        try:
+            clock_pending_fn = globals().get(
+                "_qobuz_hardware_clock_is_pending"
+            )
+            hardware_clock_was_pending = bool(
+                clock_pending_fn()
+                if callable(clock_pending_fn)
+                else False
+            )
+
+            player.play()
+            PAUSED_PIPELINE_RELEASED = False
+
+            if not hardware_clock_was_pending:
+                _set_playback_clock_position(resume_position)
+
+            # Only Q5 queue-origin Qobuz participates in queue fallback and
+            # source-neutral scrobbling. If initial hardware start is still
+            # pending, its generation-bound commit owns clock/scrobble start.
+            if queued_qobuz_id:
+                _arm_active_queue_auto_advance()
+                if not hardware_clock_was_pending:
+                    try:
+                        start_current_scrobble(
+                            build_current_scrobble_track("qobuz")
+                        )
+                    except Exception as se:
+                        logger.debug(
+                            "schedule Qobuz resume scrobble failed: %s",
+                            se,
+                        )
+
+            return {
+                "result": "playing",
+                "source": "qobuz",
+                "position": resume_position,
+            }
+        except Exception as e:
+            logger.warning("Qobuz resume failed: %s", e)
+            return {
+                "result": "idle",
+                "source": "qobuz",
+                "position": resume_position,
+                "error": str(e),
+            }
+
     if _is_local_playback_context():
         try:
             context = playback_context.get("context") or {}
@@ -8671,6 +14813,7 @@ def _tidal_resume_payload():
 
 def _tidal_next_payload():
     _invalidate_tidal_stream_resolution("user-next")
+    _cancel_qobuz_for_queue_transition("user-next")
     try:
         _require_audio_output_for_playback("next track")
     except AudioOutputUnavailable as e:
@@ -8685,6 +14828,7 @@ def _tidal_next_payload():
 def _tidal_prev_payload():
     global RADIO_MODE, CURRENT_RADIO, CURRENT_RADIO_METADATA
     _invalidate_tidal_stream_resolution("user-previous")
+    _cancel_qobuz_for_queue_transition("user-previous")
     try:
         _require_audio_output_for_playback("previous track")
     except AudioOutputUnavailable as e:
@@ -8754,7 +14898,7 @@ def _tidal_seek_payload(position):
             "current_track_id": current_track_id,
             "queue_index": QUEUE_INDEX,
         }
-    if source not in ("local", "tidal") or not playback_context.get("current_track_valid"):
+    if source not in ("local", "tidal", "qobuz") or not playback_context.get("current_track_valid"):
         return {
             "ok": False,
             "error": "no_seekable_track",
@@ -8831,7 +14975,7 @@ def _tidal_seek_payload(position):
     mmap_seek_state_machine = bool(
         was_playing
         and ALSA_DRIVER == "alsa_mmap"
-        and source in ("local", "tidal")
+        and source in ("local", "tidal", "qobuz")
     )
     try:
         if mmap_seek_state_machine:
@@ -8843,7 +14987,10 @@ def _tidal_seek_payload(position):
             # These helpers preserve paused-position state, queue
             # auto-advance, DAC idle-release handling, TIDAL stream-resolution
             # invalidation, scrobbling, and playback-clock state.
-            _tidal_pause_payload()
+            if source == "qobuz":
+                player.pause()
+            else:
+                _tidal_pause_payload()
             time.sleep(0.35)
 
             try:
@@ -8862,7 +15009,10 @@ def _tidal_seek_payload(position):
                     target,
                 )
                 try:
-                    _tidal_resume_payload()
+                    if source == "qobuz":
+                        player.play()
+                    else:
+                        _tidal_resume_payload()
                 except Exception as re:
                     logger.warning(
                         "ALSA mmap seek pause-failure recovery failed: %s",
@@ -8887,17 +15037,23 @@ def _tidal_seek_payload(position):
         result = player.seek(target)
 
         if mmap_seek_state_machine:
-            # Match a normal user seek performed while paused: Resume must see
-            # the new cursor rather than the position captured by Pause.
+            # Match a normal user seek performed while paused. Qobuz has no
+            # provider queue/resolution reload path in Q4, so resume the same
+            # already-loaded loopback pipeline directly.
             PAUSED_PLAYBACK_POSITION = target
             PAUSED_PLAYBACK_TRACK_ID = str(current_track_id or "")
             _disarm_queue_auto_advance("seek-while-paused")
 
             time.sleep(0.35)
-            resume_payload = _tidal_resume_payload() or {}
-            resumed = (
-                str(resume_payload.get("result") or "").lower() == "playing"
-            )
+            if source == "qobuz":
+                player.play()
+                resumed = True
+            else:
+                resume_payload = _tidal_resume_payload() or {}
+                resumed = (
+                    str(resume_payload.get("result") or "").lower()
+                    == "playing"
+                )
         elif was_playing:
             try:
                 player.play()
@@ -8924,7 +15080,17 @@ def _tidal_seek_payload(position):
             PAUSED_PLAYBACK_POSITION = target
             PAUSED_PLAYBACK_TRACK_ID = str(current_track_id or "")
 
-        if was_playing and response_playing and source in ("local", "tidal"):
+        if (
+            was_playing
+            and response_playing
+            and (
+                source in ("local", "tidal")
+                or (
+                    source == "qobuz"
+                    and bool(_qobuz_active_queue_id())
+                )
+            )
+        ):
             _arm_active_queue_auto_advance()
         elif not response_playing:
             _disarm_queue_auto_advance("seek-while-paused")
@@ -8961,11 +15127,15 @@ def _tidal_seek_payload(position):
         if mmap_seek_state_machine:
             try:
                 time.sleep(0.35)
-                recovery_payload = _tidal_resume_payload() or {}
-                recovery_playing = (
-                    str(recovery_payload.get("result") or "").lower()
-                    == "playing"
-                )
+                if source == "qobuz":
+                    player.play()
+                    recovery_playing = True
+                else:
+                    recovery_payload = _tidal_resume_payload() or {}
+                    recovery_playing = (
+                        str(recovery_payload.get("result") or "").lower()
+                        == "playing"
+                    )
                 logger.info(
                     "ALSA mmap failed seek restored SROVA playback state "
                     "position=%.1f playing=%s",
@@ -9186,10 +15356,10 @@ def _offline_online_source_payload():
 def _is_local_track_payload(track):
     if not isinstance(track, dict):
         return False
-    return (
-        str(track.get("source") or "").lower() == "local" or
-        str(track.get("id") or "").startswith("local:")
-    )
+    return _queue_item_source(
+        track.get("id"),
+        track,
+    ) == "local"
 
 
 def _all_tracks_are_local(tracks):
@@ -9278,9 +15448,10 @@ def _queue_prune_after_first_radio_locked(reason="radio-terminal"):
     first_radio_idx = None
     for idx, tid in enumerate(PLAY_QUEUE):
         meta = PLAY_QUEUE_META_CACHE.get(str(tid), {}) or {}
-        if str(tid).startswith("radio:station:") or str(meta.get("source") or "").lower() == "radio":
+        if _queue_item_source(tid, meta) == "radio":
             first_radio_idx = idx
             break
+
     if first_radio_idx is None:
         return 0
 
@@ -9299,12 +15470,14 @@ def _queue_prune_after_first_radio_locked(reason="radio-terminal"):
 
     if removed:
         logger.info(
-            "Radio terminal queue prune after %s: removed=%d radio_index=%d queue_length=%d",
+            "Radio terminal queue prune after %s: "
+            "removed=%d radio_index=%d queue_length=%d",
             reason,
             len(removed),
             first_radio_idx,
             len(PLAY_QUEUE),
         )
+
     return len(removed)
 
 
@@ -9315,18 +15488,812 @@ def _queue_current_item_is_radio():
                 return False
             tid = str(PLAY_QUEUE[QUEUE_INDEX])
             meta = PLAY_QUEUE_META_CACHE.get(tid, {}) or {}
-            return tid.startswith("radio:station:") or str(meta.get("source") or "").lower() == "radio"
+            return _queue_item_source(tid, meta) == "radio"
     except Exception as e:
         logger.debug("Radio current-queue check failed: %s", e)
         return False
 
 
+
+# -- Q7C Qobuz normalized HTTP adapter -------------------------------
+# One production, read-only gateway from the web UI to the normalized
+# Q6 QobuzBackend API. This is deliberately an explicit allowlist:
+# no arbitrary backend dispatch, raw provider proxy, media delivery,
+# key/decryption access, or catalog mutation is exposed.
+_QOBUZ_CATALOG_HTTP_OPS = frozenset({
+    "album",
+    "album_suggest",
+    "artist",
+    "artist_page",
+    "artist_releases",
+    "artist_story",
+    "discover_albums",
+    "discover_index",
+    "discover_playlists",
+    "featured_albums",
+    "genres",
+    "library_albums",
+    "library_artists",
+    "library_tracks",
+    "playlist",
+    "playlist_tags",
+    "playlists",
+    "radio_album",
+    "radio_artist",
+    "radio_track",
+    "release_watch",
+    "search_albums",
+    "search_artists",
+    "search_catalog",
+    "search_playlists",
+    "search_tracks",
+    "similar_artists",
+    "track",
+})
+
+
+def _qobuz_catalog_http_first(
+    query,
+    name,
+    *,
+    required=False,
+):
+    values = query.get(name) or []
+    value = (
+        str(values[0]).strip()
+        if values
+        else ""
+    )
+
+    if required and not value:
+        raise ValueError(
+            "Missing Qobuz catalog parameter: "
+            + str(name)
+            + "."
+        )
+
+    return value or None
+
+
+def _qobuz_catalog_http_optional_int(
+    query,
+    name,
+):
+    value = _qobuz_catalog_http_first(
+        query,
+        name,
+    )
+
+    if value is None:
+        return None
+
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "Qobuz catalog parameter "
+            + str(name)
+            + " must be an integer."
+        )
+
+    if parsed < 0:
+        raise ValueError(
+            "Qobuz catalog parameter "
+            + str(name)
+            + " must not be negative."
+        )
+
+    return parsed
+
+
+def _qobuz_catalog_http_page(query):
+    return (
+        _qobuz_catalog_http_optional_int(
+            query,
+            "limit",
+        ),
+        _qobuz_catalog_http_optional_int(
+            query,
+            "offset",
+        ),
+    )
+
+
+def _qobuz_catalog_http_genre_ids(query):
+    raw_values = []
+
+    for name in ("genre_ids", "genre_id"):
+        raw_values.extend(
+            query.get(name) or []
+        )
+
+    values = []
+
+    for raw in raw_values:
+        for part in str(raw).split(","):
+            value = part.strip()
+            if value:
+                values.append(value)
+
+    return values or None
+
+
+def _qobuz_catalog_http_dispatch(
+    backend,
+    query,
+):
+    op = _qobuz_catalog_http_first(
+        query,
+        "op",
+        required=True,
+    )
+
+    if op not in _QOBUZ_CATALOG_HTTP_OPS:
+        raise ValueError(
+            "Unsupported Qobuz catalog operation."
+        )
+
+    if op == "track":
+        return backend.get_track(
+            _qobuz_catalog_http_first(
+                query,
+                "track_id",
+                required=True,
+            )
+        )
+
+    if op == "album":
+        return backend.get_album(
+            _qobuz_catalog_http_first(
+                query,
+                "album_id",
+                required=True,
+            )
+        )
+
+    if op == "artist":
+        return backend.get_artist(
+            _qobuz_catalog_http_first(
+                query,
+                "artist_id",
+                required=True,
+            )
+        )
+
+    if op == "library_albums":
+        limit, offset = _qobuz_catalog_http_page(query)
+        return backend.get_library_albums(
+            limit=limit,
+            offset=offset,
+        )
+
+    if op == "library_tracks":
+        limit, offset = _qobuz_catalog_http_page(query)
+        return backend.get_library_tracks(
+            limit=limit,
+            offset=offset,
+        )
+
+    if op == "library_artists":
+        limit, offset = _qobuz_catalog_http_page(query)
+        return backend.get_library_artists(
+            limit=limit,
+            offset=offset,
+        )
+
+    if op == "genres":
+        return backend.get_genres(
+            parent_id=_qobuz_catalog_http_first(
+                query,
+                "parent_id",
+            )
+        )
+
+    if op == "discover_index":
+        return backend.get_discover_index(
+            genre_ids=(
+                _qobuz_catalog_http_genre_ids(
+                    query
+                )
+            )
+        )
+
+    if op == "discover_albums":
+        limit, offset = _qobuz_catalog_http_page(query)
+        return backend.get_discover_albums(
+            _qobuz_catalog_http_first(
+                query,
+                "endpoint",
+                required=True,
+            ),
+            genre_ids=(
+                _qobuz_catalog_http_genre_ids(
+                    query
+                )
+            ),
+            limit=limit,
+            offset=offset,
+        )
+
+    if op == "discover_playlists":
+        limit, offset = _qobuz_catalog_http_page(query)
+        return backend.get_discover_playlists(
+            tag=_qobuz_catalog_http_first(
+                query,
+                "tag",
+            ),
+            genre_ids=(
+                _qobuz_catalog_http_genre_ids(
+                    query
+                )
+            ),
+            limit=limit,
+            offset=offset,
+        )
+
+    if op == "release_watch":
+        limit, offset = _qobuz_catalog_http_page(query)
+        return backend.get_release_watch(
+            (
+                _qobuz_catalog_http_first(
+                    query,
+                    "release_type",
+                )
+                or "artists"
+            ),
+            limit=limit,
+            offset=offset,
+        )
+
+    if op == "featured_albums":
+        limit, offset = _qobuz_catalog_http_page(query)
+        return backend.get_featured_albums(
+            _qobuz_catalog_http_first(
+                query,
+                "featured_type",
+                required=True,
+            ),
+            limit=limit,
+            offset=offset,
+            genre_id=_qobuz_catalog_http_first(
+                query,
+                "genre_id",
+            ),
+        )
+
+    if op == "playlist_tags":
+        return backend.get_playlist_tags()
+
+    if op == "artist_page":
+        return backend.get_artist_page(
+            _qobuz_catalog_http_first(
+                query,
+                "artist_id",
+                required=True,
+            )
+        )
+
+    if op == "artist_releases":
+        limit, offset = _qobuz_catalog_http_page(query)
+        return backend.get_artist_releases_grid(
+            _qobuz_catalog_http_first(
+                query,
+                "artist_id",
+                required=True,
+            ),
+            _qobuz_catalog_http_first(
+                query,
+                "release_type",
+                required=True,
+            ),
+            limit=limit,
+            offset=offset,
+            sort=_qobuz_catalog_http_first(
+                query,
+                "sort",
+            ),
+        )
+
+    if op == "artist_story":
+        limit, offset = _qobuz_catalog_http_page(query)
+        return backend.get_artist_story(
+            _qobuz_catalog_http_first(
+                query,
+                "artist_id",
+                required=True,
+            ),
+            limit=limit,
+            offset=offset,
+        )
+
+    if op == "similar_artists":
+        limit, offset = _qobuz_catalog_http_page(query)
+        return backend.get_similar_artists(
+            _qobuz_catalog_http_first(
+                query,
+                "artist_id",
+                required=True,
+            ),
+            limit=limit,
+            offset=offset,
+        )
+
+    if op == "album_suggest":
+        return backend.get_album_suggest(
+            _qobuz_catalog_http_first(
+                query,
+                "album_id",
+                required=True,
+            )
+        )
+
+    if op == "playlists":
+        return backend.get_user_playlists()
+
+    if op == "playlist":
+        limit, offset = _qobuz_catalog_http_page(query)
+        return backend.get_playlist(
+            _qobuz_catalog_http_first(
+                query,
+                "playlist_id",
+                required=True,
+            ),
+            limit=limit,
+            offset=offset,
+        )
+
+    if op == "search_albums":
+        limit, offset = _qobuz_catalog_http_page(query)
+        return backend.search_albums(
+            _qobuz_catalog_http_first(
+                query,
+                "q",
+                required=True,
+            ),
+            limit=limit,
+            offset=offset,
+            search_type=_qobuz_catalog_http_first(
+                query,
+                "search_type",
+            ),
+        )
+
+    if op == "search_tracks":
+        limit, offset = _qobuz_catalog_http_page(query)
+        return backend.search_tracks(
+            _qobuz_catalog_http_first(
+                query,
+                "q",
+                required=True,
+            ),
+            limit=limit,
+            offset=offset,
+            search_type=_qobuz_catalog_http_first(
+                query,
+                "search_type",
+            ),
+        )
+
+    if op == "search_artists":
+        limit, offset = _qobuz_catalog_http_page(query)
+        return backend.search_artists(
+            _qobuz_catalog_http_first(
+                query,
+                "q",
+                required=True,
+            ),
+            limit=limit,
+            offset=offset,
+            search_type=_qobuz_catalog_http_first(
+                query,
+                "search_type",
+            ),
+        )
+
+    if op == "search_playlists":
+        limit, offset = _qobuz_catalog_http_page(query)
+        return backend.search_playlists(
+            _qobuz_catalog_http_first(
+                query,
+                "q",
+                required=True,
+            ),
+            limit=limit,
+            offset=offset,
+        )
+
+    if op == "search_catalog":
+        limit, offset = _qobuz_catalog_http_page(query)
+        return backend.search_catalog(
+            _qobuz_catalog_http_first(
+                query,
+                "q",
+                required=True,
+            ),
+            limit=limit,
+            offset=offset,
+        )
+
+    if op == "radio_artist":
+        return backend.get_radio_artist(
+            _qobuz_catalog_http_first(
+                query,
+                "artist_id",
+                required=True,
+            )
+        )
+
+    if op == "radio_track":
+        return backend.get_radio_track(
+            _qobuz_catalog_http_first(
+                query,
+                "track_id",
+                required=True,
+            )
+        )
+
+    if op == "radio_album":
+        return backend.get_radio_album(
+            _qobuz_catalog_http_first(
+                query,
+                "album_id",
+                required=True,
+            )
+        )
+
+    raise AssertionError(
+        "Qobuz HTTP operation allowlist is incomplete."
+    )
+
+
+# -- Q7C Qobuz normalized HTTP adapter end ---------------------------
+
+_QOBUZ_MANUAL_CALLBACK_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+)
+
+
+def _qobuz_manual_callback_origin():
+    """Return one server-owned reachable private-LAN origin or empty."""
+    candidates = []
+
+    try:
+        candidates.append(
+            _load_srova_env_lan_address()
+        )
+    except Exception:
+        pass
+
+    try:
+        candidates.append(
+            _get_lan_ip()
+        )
+    except Exception:
+        pass
+
+    seen = set()
+
+    for candidate in candidates:
+        token = str(
+            candidate or ""
+        ).strip()
+
+        if (
+            not token
+            or token in seen
+        ):
+            continue
+
+        seen.add(token)
+
+        try:
+            address = ipaddress.ip_address(
+                token
+            )
+        except ValueError:
+            continue
+
+        if (
+            address.version != 4
+            or not any(
+                address in network
+                for network
+                in _QOBUZ_MANUAL_CALLBACK_NETWORKS
+            )
+        ):
+            continue
+
+        try:
+            with socket.socket(
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+            ) as probe:
+                probe.bind(
+                    (
+                        address.compressed,
+                        0,
+                    )
+                )
+        except OSError:
+            continue
+
+        return (
+            "http://"
+            + address.compressed
+            + ":"
+            + str(int(HTTP_PORT))
+        )
+
+    return ""
+
+
+_SPOTIFY_ARTIFACT_SOURCE_KEYS = frozenset({
+    "installed",
+    "valid",
+    "version",
+    "build_timestamp",
+    "build_date",
+    "build_identifier",
+    "platform",
+    "architecture",
+    "sha256",
+    "expires_at",
+    "expired",
+    "seconds_remaining",
+    "error_code",
+})
+_SPOTIFY_ARTIFACT_ERROR_CODES = frozenset({
+    "not_installed",
+    "valid",
+    "expired",
+    "invalid_file",
+    "invalid_elf",
+    "version_failed",
+    "invalid_version",
+    "architecture_mismatch",
+})
+_SPOTIFY_ARTIFACT_UPDATE_ERROR_CODES = frozenset({
+    "unsupported_architecture",
+    "unsafe_install_directory",
+    "download_failed",
+    "unexpected_response",
+    "download_too_large",
+    "invalid_archive",
+    "invalid_candidate",
+    "candidate_expired",
+    "downgrade_rejected",
+    "same_build_conflict",
+    "commit_failed",
+})
+_SPOTIFY_ARTIFACT_UPDATE_STATUS_CODES = frozenset({
+    "not_installed",
+    "current",
+    "update_available",
+    "check_failed",
+})
+
+
+def _spotify_artifact_status_payload(snapshot):
+    """Return only the controlled public subset of an artifact snapshot."""
+
+    if (
+        not isinstance(snapshot, dict)
+        or not _SPOTIFY_ARTIFACT_SOURCE_KEYS.issubset(snapshot)
+    ):
+        raise ValueError("invalid Spotify artifact status contract")
+
+    if type(snapshot["installed"]) is not bool:
+        raise ValueError("invalid Spotify artifact status contract")
+    if type(snapshot["valid"]) is not bool:
+        raise ValueError("invalid Spotify artifact status contract")
+    if snapshot["expired"] is not None and type(snapshot["expired"]) is not bool:
+        raise ValueError("invalid Spotify artifact status contract")
+
+    for key in ("build_timestamp", "seconds_remaining"):
+        value = snapshot[key]
+        if value is not None and (type(value) is not int or value < 0):
+            raise ValueError("invalid Spotify artifact status contract")
+
+    for key in (
+        "version",
+        "build_date",
+        "build_identifier",
+        "platform",
+        "architecture",
+        "sha256",
+        "expires_at",
+    ):
+        value = snapshot[key]
+        if value is None:
+            continue
+        if (
+            not isinstance(value, str)
+            or not value.isascii()
+            or len(value) > 128
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        ):
+            raise ValueError("invalid Spotify artifact status contract")
+
+    error_code = snapshot["error_code"]
+    if error_code not in _SPOTIFY_ARTIFACT_ERROR_CODES:
+        raise ValueError("invalid Spotify artifact status contract")
+
+    return {
+        "installed": snapshot["installed"],
+        "valid": snapshot["valid"],
+        "version": snapshot["version"],
+        "build_timestamp": snapshot["build_timestamp"],
+        "build_date": snapshot["build_date"],
+        "platform": snapshot["platform"],
+        "architecture": snapshot["architecture"],
+        "expires_at": snapshot["expires_at"],
+        "expired": snapshot["expired"],
+        "seconds_remaining": snapshot["seconds_remaining"],
+        "error_code": error_code,
+    }
+
+
+def _spotify_artifact_update_payload(result):
+    """Return only the controlled public subset of an installer result."""
+
+    if getattr(result, "success", None) is True:
+        changed = getattr(result, "changed", None)
+        action = getattr(result, "action", None)
+        if (changed, action) not in {
+            (True, "installed"),
+            (True, "updated"),
+            (False, "unchanged"),
+        }:
+            raise ValueError("invalid Spotify artifact update contract")
+        return {
+            "ok": True,
+            "changed": changed,
+            "action": action,
+        }
+
+    if getattr(result, "success", None) is False:
+        error_code = getattr(result, "error_code", None)
+        if error_code in _SPOTIFY_ARTIFACT_UPDATE_ERROR_CODES:
+            return {
+                "ok": False,
+                "error": "spotify_soloist_install_update_failed",
+                "error_code": error_code,
+            }
+
+    raise ValueError("invalid Spotify artifact update contract")
+
+
+def _spotify_artifact_update_status_payload(result):
+    """Return the exact sanitized Soloist update-awareness contract."""
+
+    ok = getattr(result, "ok", None)
+    installed = getattr(result, "installed", None)
+    update_available = getattr(result, "update_available", None)
+    error_code = getattr(result, "error_code", None)
+    if (
+        type(ok) is not bool
+        or type(installed) is not bool
+        or type(update_available) is not bool
+        or error_code not in _SPOTIFY_ARTIFACT_UPDATE_STATUS_CODES
+    ):
+        raise ValueError("invalid Spotify artifact update status contract")
+    valid_state = (
+        (ok, installed, update_available, error_code)
+        in {
+            (True, False, False, "not_installed"),
+            (True, True, False, "current"),
+            (True, True, True, "update_available"),
+            (False, True, False, "check_failed"),
+        }
+    )
+    if not valid_state:
+        raise ValueError("invalid Spotify artifact update status contract")
+    return {
+        "ok": ok,
+        "installed": installed,
+        "update_available": update_available,
+        "error_code": error_code,
+    }
+
+
+def _spotify_artifact_update_cache_identity(snapshot):
+    _spotify_artifact_status_payload(snapshot)
+    return tuple(
+        snapshot[key]
+        for key in (
+            "installed",
+            "valid",
+            "build_timestamp",
+            "architecture",
+            "sha256",
+            "expired",
+            "error_code",
+        )
+    )
+
+
+def _invalidate_spotify_artifact_update_status_cache():
+    global _SPOTIFY_ARTIFACT_UPDATE_STATUS_CACHE
+    with _SPOTIFY_ARTIFACT_UPDATE_STATUS_LOCK:
+        _SPOTIFY_ARTIFACT_UPDATE_STATUS_CACHE = None
+
+
+def _spotify_artifact_update_status(managed):
+    """Read or refresh the serialized, installed-identity-bound cache."""
+
+    global _SPOTIFY_ARTIFACT_UPDATE_STATUS_CACHE
+    authority = getattr(managed, "artifact_authority", None)
+    installer = getattr(managed, "installer", None)
+    if authority is None or installer is None:
+        raise RuntimeError("Spotify artifact update authority unavailable")
+
+    with _SPOTIFY_ARTIFACT_UPDATE_STATUS_LOCK:
+        snapshot = authority.status_snapshot()
+        identity = _spotify_artifact_update_cache_identity(snapshot)
+        now = time.monotonic()
+        cached = _SPOTIFY_ARTIFACT_UPDATE_STATUS_CACHE
+        if (
+            isinstance(cached, dict)
+            and cached.get("identity") == identity
+            and now < cached.get("expires_at", 0.0)
+        ):
+            return dict(cached["payload"])
+
+        if snapshot["installed"] is not True:
+            payload = {
+                "ok": True,
+                "installed": False,
+                "update_available": False,
+                "error_code": "not_installed",
+            }
+        else:
+            payload = _spotify_artifact_update_status_payload(
+                installer.check_for_update()
+            )
+        _SPOTIFY_ARTIFACT_UPDATE_STATUS_CACHE = {
+            "identity": identity,
+            "expires_at": now + _SPOTIFY_ARTIFACT_UPDATE_STATUS_TTL_SECONDS,
+            "payload": dict(payload),
+        }
+        return payload
+
+
 class ControlHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
+        # Spotify requests may contain invalid user-supplied query material.
+        # Suppress these routes by parsed path so rejected attempts cannot
+        # place that material in normal HTTP logs.
+        try:
+            if urlparse(self.path).path in {
+                "/api/spotify/config",
+                "/api/spotify/device-name",
+                "/api/spotify/enable",
+                "/api/spotify/disable",
+                "/api/spotify/deactivate",
+                "/api/spotify/artifact/update",
+            }:
+                return
+        except Exception:
+            pass
+
+        # Qobuz callback query contains a one-time authorization code.
+        try:
+            if urlparse(
+                self.path
+            ).path.startswith(
+                "/qobuz/login/callback/"
+            ):
+                return
+        except Exception:
+            pass
+
         msg = format % args
         if ('"/status '     in msg) or ('"/tidal/play/' in msg) or \
-           ('"/tidal/login/poll' in msg):
+           ('"/tidal/login/poll' in msg) or ('"/qobuz/login/poll' in msg):
             return
         logger.info("HTTP %s - %s", self.address_string(), msg)
 
@@ -9341,6 +16308,124 @@ class ControlHandler(BaseHTTPRequestHandler):
             self.send_header("Expires", "0")
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_qobuz_auth_handoff_page(
+        self,
+        success,
+    ):
+        stylesheet = (
+            "/ui_web/srova.css?"
+            "v=20260914_v2_0_q10d_auth_ux_css2"
+        )
+
+        wordmark = (
+            "/ui_web/assets/"
+            "srova-wordmark.svg?v=20260512a"
+        )
+
+        if success:
+            body = (
+                "<!doctype html>"
+                "<html><head>"
+                "<meta charset=\"utf-8\">"
+                "<meta name=\"viewport\" "
+                "content=\"width=device-width,initial-scale=1\">"
+                "<meta name=\"referrer\" content=\"no-referrer\">"
+                "<title>Qobuz sign-in complete | SROVA</title>"
+                f"<link rel=\"stylesheet\" href=\"{stylesheet}\">"
+                "</head>"
+                "<body class=\"qobuzHandoffBody\">"
+                "<main class=\"qobuzHandoffCard\">"
+                f"<img class=\"qobuzHandoffWordmark\" "
+                f"src=\"{wordmark}\" alt=\"SROVA\">"
+                "<div class=\"qobuzHandoffProvider\">QOBUZ</div>"
+                "<h1>Sign-in complete</h1>"
+                "<p>Copy the full URL shown in your "
+                "browser's address bar.</p>"
+                "<p>Paste it into the open SROVA popup "
+                "to finish signing in.</p>"
+                "<div class=\"qobuzHandoffNote\">"
+                "Keep this page open until you have copied the URL."
+                "</div>"
+                "</main>"
+                "</body></html>"
+            )
+        else:
+            body = (
+                "<!doctype html>"
+                "<html><head>"
+                "<meta charset=\"utf-8\">"
+                "<meta name=\"viewport\" "
+                "content=\"width=device-width,initial-scale=1\">"
+                "<meta name=\"referrer\" content=\"no-referrer\">"
+                "<title>Qobuz sign-in | SROVA</title>"
+                f"<link rel=\"stylesheet\" href=\"{stylesheet}\">"
+                "</head>"
+                "<body class=\"qobuzHandoffBody\">"
+                "<main class=\"qobuzHandoffCard qobuzHandoffError\">"
+                f"<img class=\"qobuzHandoffWordmark\" "
+                f"src=\"{wordmark}\" alt=\"SROVA\">"
+                "<div class=\"qobuzHandoffProvider\">QOBUZ</div>"
+                "<h1>Sign-in couldn't be completed</h1>"
+                "<p>Return to SROVA and start the Qobuz "
+                "sign-in again.</p>"
+                "</main>"
+                "</body></html>"
+            )
+
+        encoded = body.encode(
+            "utf-8"
+        )
+
+        self.send_response(
+            200 if success else 400
+        )
+
+        self.send_header(
+            "Content-Type",
+            "text/html; charset=utf-8",
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(encoded)),
+        )
+
+        self.send_header(
+            "Cache-Control",
+            "no-store",
+        )
+
+        self.send_header(
+            "Pragma",
+            "no-cache",
+        )
+
+        self.send_header(
+            "Referrer-Policy",
+            "no-referrer",
+        )
+
+        self.send_header(
+            "X-Content-Type-Options",
+            "nosniff",
+        )
+
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; "
+            "style-src 'self'; "
+            "img-src 'self'; "
+            "base-uri 'none'; "
+            "form-action 'none'; "
+            "frame-ancestors 'none'",
+        )
+
+        self.end_headers()
+
+        self.wfile.write(
+            encoded
+        )
 
     def do_GET(self):
 
@@ -9376,6 +16461,157 @@ class ControlHandler(BaseHTTPRequestHandler):
 
 
 
+        # -- Q10D manual Qobuz browser callback ------------------------
+        if static_path.startswith(
+            "/qobuz/login/callback/"
+        ):
+            backend = getattr(
+                APP_INSTANCE,
+                "qobuz_backend",
+                None,
+            )
+
+            valid = False
+
+            if backend is not None:
+                try:
+                    valid = bool(
+                        backend.manual_callback_request_valid(
+                            self.path
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Qobuz manual callback validation "
+                        "failed safely (%s)",
+                        type(exc).__name__,
+                    )
+
+            if valid:
+                logger.info(
+                    "Qobuz manual callback page served"
+                )
+            else:
+                logger.info(
+                    "Qobuz manual callback page rejected"
+                )
+
+            self._send_qobuz_auth_handoff_page(
+                valid
+            )
+            return
+
+        # -- Managed Spotify artifact update awareness ------------------
+        if static_path == "/api/spotify/artifact/update-status":
+            if self.path != static_path:
+                self._send_json(
+                    {"ok": False, "error": "invalid_request"},
+                    no_store=True,
+                )
+                return
+            try:
+                managed = getattr(APP_INSTANCE, "spotify_managed", None)
+                response = _spotify_artifact_update_status(managed)
+            except Exception as exc:
+                logger.error(
+                    "Spotify artifact update status failed safely (%s)",
+                    type(exc).__name__,
+                )
+                response = {
+                    "ok": False,
+                    "installed": False,
+                    "update_available": False,
+                    "error_code": "check_failed",
+                }
+            self._send_json(response, no_store=True)
+            return
+
+        # -- Managed Spotify artifact status -----------------------------
+        if self.path == "/api/spotify/artifact/status":
+            managed = getattr(
+                APP_INSTANCE,
+                "spotify_managed",
+                None,
+            )
+            authority = getattr(
+                managed,
+                "artifact_authority",
+                None,
+            )
+            if authority is None:
+                logger.error("Spotify artifact authority is unavailable")
+                self.send_error(503)
+                return
+            try:
+                snapshot = authority.status_snapshot()
+                response = _spotify_artifact_status_payload(snapshot)
+            except Exception as exc:
+                logger.error(
+                    "Spotify artifact status failed safely (%s)",
+                    type(exc).__name__,
+                )
+                self.send_error(503)
+                return
+            self._send_json(response, no_store=True)
+            return
+
+        # -- Public Spotify Connect device name --------------------------
+        if self.path == "/api/spotify/device-name":
+            try:
+                response = _spotify_device_name_snapshot()
+            except Exception:
+                logger.error("Spotify device name status failed safely")
+                response = {
+                    "ok": False,
+                    "error": "spotify_device_name_unavailable",
+                }
+            self._send_json(response, no_store=True)
+            return
+
+        # -- Optional Spotify coordinator status -------------------------
+        if self.path == "/api/spotify/status":
+            coordinator = getattr(
+                APP_INSTANCE,
+                "spotify_coordinator",
+                None,
+            )
+            secret_store = getattr(
+                APP_INSTANCE,
+                "spotify_secret_store",
+                None,
+            )
+            if coordinator is None or secret_store is None:
+                logger.error("Spotify status authority is unavailable")
+                self.send_error(503)
+                return
+            try:
+                snapshot = coordinator.status_snapshot()
+                key_configured = secret_store.key_configured()
+            except Exception as exc:
+                logger.error(
+                    "Spotify status failed safely (%s)",
+                    type(exc).__name__,
+                )
+                self.send_error(503)
+                return
+            if not isinstance(snapshot, dict) or set(snapshot) != {
+                "state",
+                "spotify_owner",
+                "native_blocked",
+            }:
+                logger.error("Spotify coordinator returned an invalid status contract")
+                self.send_error(503)
+                return
+            if not isinstance(key_configured, bool):
+                logger.error("Spotify secret store returned an invalid status contract")
+                self.send_error(503)
+                return
+            response = dict(snapshot)
+            response["key_configured"] = key_configured
+            response["enabled"] = _spotify_enabled_intent()
+            self._send_json(response, no_store=True)
+            return
+
         # -- Audio output / DAC preference -------------------------------
         if self.path == "/api/audio/output":
             self._send_json(_audio_output_settings_state(), no_store=True)
@@ -9389,6 +16625,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 if device.get("recommended") or not recommended_only
             ]
             with _AUDIO_OUTPUT_LOCK:
+                output_selected = _AUDIO_OUTPUT_SELECTED
                 current_driver = ALSA_DRIVER
                 current_device = ALSA_DEVICE
                 current_name = ALSA_DAC_NAME
@@ -9398,18 +16635,27 @@ class ControlHandler(BaseHTTPRequestHandler):
                     if device.get("device") == current_device
                 ),
                 None,
-            )
+            ) if output_selected else None
+            if (
+                current_info is not None
+                and not _discovered_audio_device_matches_saved_identity(
+                    current_info,
+                    current_name,
+                )
+            ):
+                current_info = None
             self._send_json({
                 "devices": devices,
                 "recommended_only": recommended_only,
                 "warning_version": _OTHER_AUDIO_OUTPUT_WARNING_VERSION,
                 "current": {
+                    "output_selected": output_selected,
                     "driver": current_driver,
                     "device": current_device,
                     "dac_name": (
                         current_info.get("name")
                         if current_info else
-                        (current_name or current_device)
+                        ((current_name or current_device) if output_selected else "")
                     ),
                     "available": bool(current_info),
                     "recommended": bool(
@@ -9545,10 +16791,93 @@ class ControlHandler(BaseHTTPRequestHandler):
             self._send_json(_local_library_artist_payload(artist=artist, limit=limit))
             return
 
+        # -- Provider-neutral complete streaming playlist ---------------
+        if static_path == "/api/playlists/complete":
+            query = parse_qs(
+                urlparse(self.path).query
+            )
+
+            provider = str(
+                (query.get("provider") or [""])[0]
+            ).strip().lower()
+
+            playlist_id = str(
+                (
+                    query.get("playlist_id")
+                    or query.get("id")
+                    or [""]
+                )[0]
+            ).strip()
+
+            try:
+                payload = _complete_streaming_playlist_payload(
+                    provider,
+                    playlist_id,
+                    tidal_backend=(
+                        getattr(
+                            APP_INSTANCE,
+                            "backend",
+                            None,
+                        )
+                        if provider == "tidal"
+                        else None
+                    ),
+                    qobuz_backend=(
+                        getattr(
+                            APP_INSTANCE,
+                            "qobuz_backend",
+                            None,
+                        )
+                        if provider == "qobuz"
+                        else None
+                    ),
+                )
+
+                self._send_json(
+                    payload,
+                    no_store=True,
+                )
+
+            except ValueError as exc:
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": str(exc),
+                }, no_store=True)
+
+            except Exception as exc:
+                logger.warning(
+                    "Complete playlist resolution failed: "
+                    "provider=%s playlist=%s type=%s",
+                    provider,
+                    playlist_id,
+                    type(exc).__name__,
+                )
+
+                self._send_json({
+                    "ok": False,
+                    "error": "playlist_unavailable",
+                    "provider": (
+                        provider
+                        if provider in ("tidal", "qobuz")
+                        else ""
+                    ),
+                    "playlist_id": playlist_id,
+                    "message": (
+                        "Playlist could not be loaded completely."
+                    ),
+                }, no_store=True)
+
+            return
+
         # -- Status --------------------------------------------------------
         if static_path == "/status":
-            player   = APP_INSTANCE.player
-            raw_position = int(_player_position_seconds(player))
+            _maybe_commit_qobuz_hardware_clock_ready()
+            qobuz_clock_pending = _qobuz_hardware_clock_is_pending()
+
+            player = APP_INSTANCE.player
+            raw_transport_position = int(_player_position_seconds(player))
+            raw_position = raw_transport_position
             position = raw_position
             audio_state = _audio_output_state()
             bit_perfect_state = _bit_perfect_state(audio_state)
@@ -9557,15 +16886,39 @@ class ControlHandler(BaseHTTPRequestHandler):
             current_track_id = playback_context.get("current_track_id")
             context_for_status = playback_context.get("context") or {}
             duration_for_status = int(context_for_status.get("duration") or 0)
-            _maybe_schedule_queue_overrun_advance(playback_context, raw_position, duration_for_status)
-            if playback_context.get("current_track_valid") and not player.is_playing():
+
+            status_playing = bool(player.is_playing())
+
+            if playback_source == "qobuz":
+                if qobuz_clock_pending:
+                    status_playing = False
+                    raw_position = 0
+                elif status_playing and PLAYBACK_START_TIME:
+                    raw_position = int(max(
+                        0.0,
+                        time.time() - PLAYBACK_START_TIME,
+                    ))
+
+            _maybe_schedule_queue_overrun_advance(
+                playback_context,
+                raw_position,
+                duration_for_status,
+            )
+
+            if playback_source == "qobuz" and qobuz_clock_pending:
+                position = 0
+            elif playback_context.get("current_track_valid") and not status_playing:
                 position = int(_playback_display_position(
                     _resume_position_for_track(current_track_id),
                     playback_context,
                     position_is_raw=False,
                 ))
             else:
-                position = int(_playback_display_position(raw_position, playback_context, position_is_raw=True))
+                position = int(_playback_display_position(
+                    raw_position,
+                    playback_context,
+                    position_is_raw=True,
+                ))
             status_context_type = context_for_status.get("context_type")
             status_context_id = context_for_status.get("context_id")
             status_context_title = context_for_status.get("context_title")
@@ -9579,9 +16932,10 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "sample_rate":      CURRENT_STREAM_INFO["sample_rate"],
                 "bit_depth":        CURRENT_STREAM_INFO["bit_depth"],
                 "codec":            CURRENT_STREAM_INFO["codec"],
-                "playing":          player.is_playing(),
+                "playing":          status_playing,
                 "playback_state":   playback_context.get("playback_state"),
                 "current_track_valid": bool(playback_context.get("current_track_valid")),
+                "qobuz_replacement_pending": _qobuz_replacement_is_pending(),
                 "position":         position,
                 "queue_index":      QUEUE_INDEX,
                 "queue_length":     len(PLAY_QUEUE),
@@ -9608,7 +16962,9 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "radio_station":    CURRENT_RADIO,
                 "radio_metadata":   CURRENT_RADIO_METADATA,
                 "tidal_infinite_play_enabled": _tidal_infinite_play_enabled(),
-                "tidal_infinite_play_mode": _tidal_infinite_play_mode()
+                "tidal_infinite_play_mode": _tidal_infinite_play_mode(),
+                "infinite_play_provider": _infinite_play_saved_provider(),
+                "infinite_play_effective_provider": _effective_infinite_play_provider()
             }
             radio_artwork = _get_current_radio_artwork()
             status_payload.update({
@@ -9644,6 +17000,270 @@ class ControlHandler(BaseHTTPRequestHandler):
 
         if static_path == "/tidal/status":
             self._send_json(_tidal_status_payload(), no_store=True)
+            return
+
+        # -- Qobuz authentication -----------------------------------------
+        # Qobuz owns its lock, attempt, callback listener, and persistence.
+        # Nothing here reuses or mutates the TIDAL OAuth globals above.
+        if static_path == "/qobuz/status":
+            backend = getattr(APP_INSTANCE, "qobuz_backend", None)
+            if backend is None:
+                self._send_json({
+                    "provider_id": "qobuz",
+                    "display_name": "Qobuz",
+                    "available": False,
+                    "authenticated": False,
+                    "usable": False,
+                    "auth_state": "unavailable",
+                    "login_pending": False,
+                    "error": "Qobuz authentication is unavailable.",
+                    "initialization_error": "Qobuz backend is unavailable.",
+                    "user": None,
+                    "capabilities": [],
+                }, no_store=True)
+            else:
+                self._send_json(backend.status(), no_store=True)
+            return
+
+        # -- Q10I native Qobuz Favorites state ---------------------------
+        if static_path == "/qobuz/favorites/ids":
+            backend = getattr(
+                APP_INSTANCE,
+                "qobuz_backend",
+                None,
+            )
+
+            if backend is None:
+                self._send_json({
+                    "ok": False,
+                    "error": "qobuz_unavailable",
+                    "message": "Qobuz Favorites are unavailable.",
+                }, no_store=True)
+                return
+
+            try:
+                self._send_json(
+                    backend.get_favorite_ids(),
+                    no_store=True,
+                )
+            except Exception as exc:
+                safe_payload = getattr(
+                    exc,
+                    "safe_payload",
+                    None,
+                )
+
+                if callable(
+                    safe_payload
+                ):
+                    try:
+                        error_payload = (
+                            safe_payload()
+                        )
+                    except Exception:
+                        error_payload = None
+
+                    if isinstance(
+                        error_payload,
+                        dict,
+                    ):
+                        self._send_json(
+                            error_payload,
+                            no_store=True,
+                        )
+                        return
+
+                logger.warning(
+                    "Qobuz favorites/ids failed safely (%s)",
+                    type(exc).__name__,
+                )
+
+                self._send_json({
+                    "ok": False,
+                    "error": "qobuz_favorites_unavailable",
+                    "message": (
+                        "Qobuz favorite state could not "
+                        "be loaded."
+                    ),
+                }, no_store=True)
+
+            return
+
+
+        # -- Q7C normalized Qobuz catalog gateway ----------------------
+        if static_path == "/qobuz/catalog":
+            backend = getattr(
+                APP_INSTANCE,
+                "qobuz_backend",
+                None,
+            )
+
+            if backend is None:
+                self._send_json({
+                    "ok": False,
+                    "error": "qobuz_unavailable",
+                    "message": "Qobuz catalog is unavailable.",
+                }, no_store=True)
+                return
+
+            query = parse_qs(
+                urlparse(self.path).query
+            )
+
+            try:
+                result = _qobuz_catalog_http_dispatch(
+                    backend,
+                    query,
+                )
+                self._send_json(
+                    result,
+                    no_store=True,
+                )
+            except ValueError as exc:
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": str(exc),
+                }, no_store=True)
+            except Exception as exc:
+                safe_payload = getattr(
+                    exc,
+                    "safe_payload",
+                    None,
+                )
+
+                if callable(safe_payload):
+                    try:
+                        payload = safe_payload()
+                    except Exception:
+                        payload = None
+
+                    if isinstance(payload, dict):
+                        self._send_json(
+                            payload,
+                            no_store=True,
+                        )
+                        return
+
+                logger.warning(
+                    "Qobuz catalog HTTP adapter failed safely (%s)",
+                    type(exc).__name__,
+                )
+                self._send_json({
+                    "ok": False,
+                    "error": "qobuz_catalog_unavailable",
+                    "message": (
+                        "Qobuz catalog request could not "
+                        "be completed."
+                    ),
+                }, no_store=True)
+            return
+
+        if static_path == "/qobuz/test-status":
+            self._send_json(
+                _qobuz_test_status_payload(),
+                no_store=True,
+            )
+            return
+
+        if static_path == "/qobuz/login/start":
+            backend = getattr(APP_INSTANCE, "qobuz_backend", None)
+            if backend is None:
+                self._send_json({
+                    "logged_in": False,
+                    "pending": False,
+                    "auth_state": "unavailable",
+                    "error": "Qobuz authentication is unavailable.",
+                }, no_store=True)
+                return
+            try:
+                backend.set_manual_callback_origin(
+                    _qobuz_manual_callback_origin()
+                )
+
+                self._send_json(
+                    backend.start_login(),
+                    no_store=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Qobuz login start failed safely (%s)",
+                    type(exc).__name__,
+                )
+                self._send_json({
+                    "logged_in": False,
+                    "pending": False,
+                    "auth_state": "error",
+                    "error": "Qobuz sign-in could not be started.",
+                }, no_store=True)
+            return
+
+        if static_path == "/qobuz/login/poll":
+            backend = getattr(APP_INSTANCE, "qobuz_backend", None)
+            if backend is None:
+                self._send_json({
+                    "logged_in": False,
+                    "pending": False,
+                    "auth_state": "unavailable",
+                    "error": "Qobuz authentication is unavailable.",
+                }, no_store=True)
+                return
+            query = parse_qs(urlparse(self.path).query)
+            attempt_id = str((query.get("attempt_id") or [""])[0])
+            try:
+                self._send_json(
+                    backend.poll_login(attempt_id=attempt_id or None),
+                    no_store=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Qobuz login poll failed safely (%s)",
+                    type(exc).__name__,
+                )
+                self._send_json({
+                    "logged_in": False,
+                    "pending": False,
+                    "auth_state": "error",
+                    "error": "Qobuz sign-in status is unavailable.",
+                }, no_store=True)
+            return
+
+        if static_path == "/qobuz/logout":
+            backend = getattr(APP_INSTANCE, "qobuz_backend", None)
+            if backend is None:
+                self._send_json({
+                    "logged_out": True,
+                    "auth_state": "unavailable",
+                }, no_store=True)
+                return
+            try:
+                was_qobuz_active = _qobuz_playback_is_active()
+                _clear_qobuz_warm_segment_one_cache("qobuz-logout")
+                _invalidate_qobuz_playback("qobuz-logout")
+                if was_qobuz_active:
+                    try:
+                        APP_INSTANCE.player.stop()
+                    except Exception as stop_exc:
+                        logger.debug(
+                            "Qobuz logout player.stop() failed safely: %s",
+                            stop_exc,
+                        )
+                    _reset_idle_playback_context()
+                backend.logout()
+                self._send_json({
+                    "logged_out": True,
+                    "auth_state": "signed_out",
+                }, no_store=True)
+            except Exception as exc:
+                logger.warning(
+                    "Qobuz logout failed safely (%s)",
+                    type(exc).__name__,
+                )
+                self._send_json({
+                    "logged_out": False,
+                    "auth_state": "error",
+                    "error": "Qobuz logout could not be completed.",
+                }, no_store=True)
             return
 
         # -- Login: start OAuth flow ---------------------------------------
@@ -9744,6 +17364,26 @@ class ControlHandler(BaseHTTPRequestHandler):
                         pass
 
                     headers  = {"Authorization": "Bearer " + access_token}
+
+                    session_user = getattr(
+                        getattr(
+                            backend,
+                            "session",
+                            None,
+                        ),
+                        "user",
+                        None,
+                    )
+
+                    current_user_id = str(
+                        getattr(
+                            session_user,
+                            "id",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+
                     limit    = 50
                     seen_ids = set()
                     cursor   = None   # Tidal v2 uses cursor-based pagination
@@ -9802,6 +17442,23 @@ class ControlHandler(BaseHTTPRequestHandler):
                                                pl.get("lastModifiedAt") or "")
                             created_at   = str(pl.get("createdAt") or
                                                pl.get("created") or "")
+
+                            creator = pl.get("creator")
+                            if not isinstance(creator, dict):
+                                creator = {}
+
+                            creator_id = str(
+                                creator.get("id")
+                                or ""
+                            ).strip()
+
+                            playlist_editable = bool(
+                                current_user_id
+                                and creator_id
+                                and current_user_id
+                                == creator_id
+                            )
+
                             result.append({
                                 "id":           pid,
                                 "name":         name,
@@ -9809,7 +17466,9 @@ class ControlHandler(BaseHTTPRequestHandler):
                                 "sub_title":    sub,
                                 "image_url":    img_url,
                                 "last_updated": last_updated,
-                                "created_at":   created_at
+                                "created_at":   created_at,
+                                "creator_id":   creator_id,
+                                "playlist_editable": playlist_editable
                             })
 
                         total = (data.get("totalNumberOfItems") or
@@ -9967,6 +17626,25 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "groups":          result_groups,
                 "total_to_delete": total_to_delete
             })
+            return
+
+        # -- Q10C: Qobuz duplicate whole-playlist scan -----------------
+        if self.path == "/qobuz/playlists/find_duplicates":
+            try:
+                result = _qobuz_playlist_duplicate_scan()
+                self._send_json(result, no_store=True)
+            except Exception as exc:
+                logger.warning(
+                    "Qobuz playlist duplicate scan failed safely: %s",
+                    exc,
+                )
+                self._send_json({
+                    "error": "qobuz_scan_failed",
+                    "message": (
+                        "Could not scan Qobuz playlists. "
+                        "Refresh playlists and try again."
+                    ),
+                }, no_store=True)
             return
 
         # -- My Albums (liked albums, most recent first) -------------------
@@ -10373,6 +18051,13 @@ class ControlHandler(BaseHTTPRequestHandler):
 
             threading.Thread(target=_bg_featured, daemon=True).start()
             return
+        if static_path == "/now-playing-albums":
+            self._send_json(
+                _resolve_now_playing_album_destinations(),
+                no_store=True,
+            )
+            return
+
         if static_path == "/tidal/now-playing-album":
             self._send_json(_resolve_now_playing_tidal_album(), no_store=True)
             return
@@ -10383,7 +18068,7 @@ class ControlHandler(BaseHTTPRequestHandler):
             query  = params.get("q", [""])[0].strip()
             limit_per_type = _bounded_int((params.get("limit") or [6])[0], default=6, minimum=1, maximum=100)
             if not query:
-                self._send_json({"artists": [], "albums": [], "tracks": []})
+                self._send_json({"ok": True, "artists": [], "albums": [], "tracks": []})
                 return
 
             cache_key = "search:" + query.lower() + ":" + str(limit_per_type)
@@ -10395,7 +18080,7 @@ class ControlHandler(BaseHTTPRequestHandler):
 
             logger.info("Cache MISS: search '%s' limit=%s", query, limit_per_type)
             backend = APP_INSTANCE.backend
-            out     = {"artists": [], "albums": [], "tracks": []}
+            out     = {"ok": True, "artists": [], "albums": [], "tracks": []}
             try:
                 if hasattr(backend, "session"):
                     if hasattr(backend.session, "check_login") and not backend.session.check_login():
@@ -10436,17 +18121,34 @@ class ControlHandler(BaseHTTPRequestHandler):
                         artist_name = _safe_str(t.artist.name if t.artist else "")
                     except Exception:
                         pass
+
+                    album_name = ""
+                    try:
+                        album_obj = getattr(t, "album", None)
+                        album_name = _safe_str(
+                            getattr(album_obj, "name", "")
+                            if album_obj else ""
+                        )
+                    except Exception:
+                        pass
+
                     out["tracks"].append({
                         "id":        getattr(t, "id",       None),
                         "name":      _safe_str(getattr(t, "name", "")),
                         "duration":  getattr(t, "duration", 0),
                         "artist":    artist_name,
+                        "album":     album_name,
                         "image_url": _safe_artwork(backend, t, 320)
                     })
             except Exception as e:
                 logger.warning("Search failed: %s", e)
+                out["ok"] = False
 
-            cache_set(cache_key, out, TTL_SEARCH)
+            # Provider failure is not a legitimate zero-result search.
+            # Failed provider results must never enter the search cache.
+            if out.get("ok"):
+                cache_set(cache_key, out, TTL_SEARCH)
+
             self._send_json(out)
             return
 
@@ -10566,6 +18268,77 @@ class ControlHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 logger.warning("Artist discography fetch failed: %s", e)
                 self._send_json({"error": str(e)})
+            return
+
+        # -- Provider-native TIDAL contextual Radio -------------------------
+        #
+        # These are finite provider-track lists. They deliberately do not
+        # enter RADIO_MODE and therefore remain outside custom Internet Radio
+        # transport, progress, queue and metadata semantics.
+        if self.path.startswith("/tidal/radio/artist/"):
+            artist_id = self.path.split("/")[-1]
+            backend = APP_INSTANCE.backend
+
+            try:
+                tracks = backend.get_artist_radio_tracks(
+                    artist_id,
+                    limit=100,
+                )
+                data = _build_track_list(
+                    tracks,
+                    show_artist=True,
+                )
+                self._send_json({
+                    "ok": True,
+                    "source": "tidal",
+                    "type": "radio-artist",
+                    "tracks": data,
+                })
+            except Exception as e:
+                logger.warning(
+                    "TIDAL Artist Radio fetch failed: %s",
+                    e,
+                )
+                self._send_json({
+                    "ok": False,
+                    "source": "tidal",
+                    "type": "radio-artist",
+                    "tracks": [],
+                    "error": str(e),
+                })
+            return
+
+        if self.path.startswith("/tidal/radio/track/"):
+            track_id = self.path.split("/")[-1]
+            backend = APP_INSTANCE.backend
+
+            try:
+                tracks = backend.get_track_radio_tracks(
+                    track_id,
+                    limit=100,
+                )
+                data = _build_track_list(
+                    tracks,
+                    show_artist=True,
+                )
+                self._send_json({
+                    "ok": True,
+                    "source": "tidal",
+                    "type": "radio-track",
+                    "tracks": data,
+                })
+            except Exception as e:
+                logger.warning(
+                    "TIDAL Track Radio fetch failed: %s",
+                    e,
+                )
+                self._send_json({
+                    "ok": False,
+                    "source": "tidal",
+                    "type": "radio-track",
+                    "tracks": [],
+                    "error": str(e),
+                })
             return
 
         # -- Artist top tracks ---------------------------------------------
@@ -10738,6 +18511,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 QUEUE_INDEX = idx
             save_queue()
             _invalidate_tidal_stream_resolution("queue-jump")
+            _cancel_qobuz_for_queue_transition("queue-jump")
             GLib.idle_add(lambda: play_queue_index(idx))
             self._send_json({"result": "ok"})
             return
@@ -10777,6 +18551,7 @@ class ControlHandler(BaseHTTPRequestHandler):
         # -- Queue: clear all and stop -------------------------------------
         if self.path == "/tidal/queue/clear":
             _invalidate_tidal_stream_resolution("queue-clear")
+            _invalidate_qobuz_playback("queue-clear")
             _disarm_queue_auto_advance("queue-clear")
             try:
                 APP_INSTANCE.player.stop()
@@ -10799,6 +18574,7 @@ class ControlHandler(BaseHTTPRequestHandler):
         # automatic idle-release does not fire (especially on Pi 5 with alsa_mmap).
         if self.path == "/tidal/dac/release":
             _invalidate_tidal_stream_resolution("dac-release")
+            _invalidate_qobuz_playback("dac-release")
             _disarm_queue_auto_advance("dac-release")
             try:
                 APP_INSTANCE.player.stop()
@@ -10834,6 +18610,16 @@ class ControlHandler(BaseHTTPRequestHandler):
         # Use on Pi 5 cold boot when the automatic ALSA probe did not result in a
         # working bit-perfect output. Does NOT start playback -- press Play after.
         if self.path == "/tidal/dac/exclusive":
+            if not _native_audio_allowed(
+                "output_claim",
+                source="manual-exclusive",
+            ):
+                error = AudioOutputUnavailable(
+                    _SPOTIFY_NATIVE_PLAYBACK_BLOCKED,
+                    error_code=_SPOTIFY_NATIVE_PLAYBACK_BLOCKED,
+                )
+                self._send_json(error.to_payload(), no_store=True)
+                return
             _cancel_idle_release()
             def _grab():
                 configure_audio()
@@ -10846,6 +18632,7 @@ class ControlHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/tidal/play/"):
             track_id = str(self.path.split("/")[-1])
             _invalidate_tidal_stream_resolution("direct-tidal-selection")
+            _invalidate_qobuz_playback("direct-tidal-selection")
             if not _online_state_payload(force=True).get("online"):
                 self._send_json(_offline_online_source_payload(), no_store=True)
                 return
@@ -10879,14 +18666,29 @@ class ControlHandler(BaseHTTPRequestHandler):
 
         # -- Session state (for multi-device sync) ------------------------
         if static_path == "/session":
-            player   = APP_INSTANCE.player
+            _maybe_commit_qobuz_hardware_clock_ready()
+            qobuz_clock_pending = _qobuz_hardware_clock_is_pending()
+
+            player = APP_INSTANCE.player
             playback_context = _status_playback_context(player)
             context_for_session = playback_context.get("context") or {}
+
+            session_playing = bool(player.is_playing())
+            if (
+                playback_context.get("source") == "qobuz"
+                and qobuz_clock_pending
+            ):
+                session_playing = False
             # Calculate position from wall-clock time -- reliable across sleep/wake
             position = 0
             try:
                 is_session_cue, cue_start_for_session, _cue_duration, cue_track_index_for_session, cue_track_id_for_session = _playback_context_cue_details(playback_context)
-                if player.is_playing() and playback_context.get("current_track_valid"):
+                if (
+                    playback_context.get("source") == "qobuz"
+                    and qobuz_clock_pending
+                ):
+                    position = 0
+                elif session_playing and playback_context.get("current_track_valid"):
                     if is_session_cue:
                         raw_session_position = int(_player_position_seconds(player))
                         position = int(_playback_display_position(raw_session_position, playback_context, position_is_raw=True))
@@ -10906,9 +18708,10 @@ class ControlHandler(BaseHTTPRequestHandler):
                 position = 0
             radio_artwork = _get_current_radio_artwork()
             self._send_json({
-                "playing":       player.is_playing(),
+                "playing":       session_playing,
                 "playback_state": playback_context.get("playback_state"),
                 "current_track_valid": bool(playback_context.get("current_track_valid")),
+                "qobuz_replacement_pending": _qobuz_replacement_is_pending(),
                 "position":      position,
                 "track_id":      playback_context.get("current_track_id"),
                 "source":        playback_context.get("source"),
@@ -11118,6 +18921,51 @@ class ControlHandler(BaseHTTPRequestHandler):
             self._send_json(_local_library_lyrics_payload(track_id))
             return
 
+        if static_path.startswith("/qobuz/lyrics/"):
+            prefix = "/qobuz/lyrics/"
+            track_id = unquote(
+                static_path[len(prefix):]
+            ).strip()
+
+            if track_id.startswith("qobuz:"):
+                track_id = track_id[len("qobuz:"):]
+
+            backend = (
+                getattr(
+                    APP_INSTANCE,
+                    "qobuz_backend",
+                    None,
+                )
+                if APP_INSTANCE is not None
+                else None
+            )
+
+            if backend is None:
+                self._send_json(
+                    {"error": "provider_error"}
+                )
+                return
+
+            try:
+                payload = backend.get_lyrics(track_id)
+
+                if not payload:
+                    self._send_json(
+                        {"error": "no_lyrics"}
+                    )
+                    return
+
+                self._send_json(payload)
+            except Exception as exc:
+                logger.warning(
+                    "Qobuz lyrics fetch failed: %s",
+                    type(exc).__name__,
+                )
+                self._send_json(
+                    {"error": "provider_error"}
+                )
+            return
+
         if self.path.startswith("/tidal/lyrics/"):
             track_id = self.path.split("/")[-1]
             backend  = APP_INSTANCE.backend
@@ -11167,6 +19015,47 @@ class ControlHandler(BaseHTTPRequestHandler):
             self._send_json(data)
             return
 
+        # -- Provider Radio visibility settings -------------------------------
+        if static_path == "/api/settings/provider-radio":
+            self._send_json(
+                _provider_radio_visibility_settings(),
+                no_store=True,
+            )
+            return
+
+        # -- Playlist Maintenance settings -------------------------------
+        if static_path == "/api/settings/playlist-maintenance":
+            state = _playlist_maintenance_settings_state()
+            response = {"ok": True}
+            response.update(state)
+            self._send_json(response, no_store=True)
+            return
+
+        # -- Auto-Mix settings -----------------------------------------------
+        if static_path == "/api/settings/automix":
+            state = _automix_settings_state()
+            response = {"ok": True}
+            response.update(state)
+            self._send_json(
+                response,
+                no_store=True,
+            )
+            return
+
+        # -- Infinite Play settings ------------------------------------------
+        if static_path in (
+            "/api/settings/infinite-play",
+            "/api/settings/tidal-infinite-play",
+        ):
+            state = _infinite_play_settings_state()
+            response = {"ok": True}
+            response.update(state)
+            self._send_json(
+                response,
+                no_store=True,
+            )
+            return
+
         # -- Scrobble: status ------------------------------------------------
         if static_path == "/scrobble/status":
             self._send_json({
@@ -11176,7 +19065,13 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "lbz_username":     _SCROBBLE_CREDS.get("lbz_username",     ""),
                 "tidal_username":   _tidal_account_display_name(),
                 "tidal_infinite_play_enabled": _tidal_infinite_play_enabled(),
-                "tidal_infinite_play_mode": _tidal_infinite_play_mode()
+                "tidal_infinite_play_mode": _tidal_infinite_play_mode(),
+                "infinite_play_provider": _infinite_play_saved_provider(),
+                "infinite_play_effective_provider": _effective_infinite_play_provider(),
+                "automix_provider": _automix_saved_provider(),
+                "automix_effective_provider": _effective_automix_provider(),
+                "playlist_maintenance_provider": _playlist_maintenance_saved_provider(),
+                "playlist_maintenance_effective_provider": _effective_playlist_maintenance_provider()
             }, no_store=True)
             return
 
@@ -11238,6 +19133,229 @@ class ControlHandler(BaseHTTPRequestHandler):
 
         global APP_INSTANCE, PLAY_QUEUE, QUEUE_INDEX, ORIGINAL_QUEUE, PLAY_QUEUE_PENDING_AFTER_CONTEXT
         global SHUFFLE_ON, PLAY_QUEUE_META_CACHE, RADIO_MODE, CURRENT_RADIO, CURRENT_RADIO_METADATA
+
+        # -- Managed Spotify artifact install/update ----------------------
+        spotify_artifact_update_path = urlparse(self.path).path
+        if spotify_artifact_update_path == "/api/spotify/artifact/update":
+            if self.path != spotify_artifact_update_path:
+                self._send_json(
+                    {"ok": False, "error": "invalid_request"},
+                    no_store=True,
+                )
+                return
+
+            content_length = self.headers.get("Content-Length")
+            if content_length is not None:
+                try:
+                    content_length = int(content_length)
+                except (TypeError, ValueError):
+                    content_length = -1
+                if content_length != 0:
+                    self._send_json(
+                        {"ok": False, "error": "invalid_request"},
+                        no_store=True,
+                    )
+                    return
+
+            try:
+                managed = getattr(APP_INSTANCE, "spotify_managed", None)
+                installer = getattr(managed, "installer", None)
+                if installer is None:
+                    raise RuntimeError("managed installer unavailable")
+                result = installer.install_or_update()
+                response = _spotify_artifact_update_payload(result)
+                if response.get("ok") is True:
+                    _invalidate_spotify_artifact_update_status_cache()
+            except Exception:
+                logger.error("Spotify Soloist install/update failed safely")
+                response = {
+                    "ok": False,
+                    "error": "spotify_soloist_install_update_failed",
+                }
+            self._send_json(response, no_store=True)
+            return
+
+        # -- Spotify endpoint production control --------------------------
+        spotify_control_path = urlparse(self.path).path
+        if spotify_control_path in {
+            "/api/spotify/enable",
+            "/api/spotify/disable",
+            "/api/spotify/deactivate",
+        }:
+            if self.path != spotify_control_path:
+                self.send_error(404)
+                return
+
+            if spotify_control_path == "/api/spotify/enable":
+                if not _spotify_selected_dac_available():
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "error": "spotify_dac_unavailable",
+                        },
+                        no_store=True,
+                    )
+                    return
+
+                lifecycle = None
+                try:
+                    pcm_free = _spotify_rearm_pcm_is_free()
+                    if pcm_free is not True:
+                        intent_changed = _set_spotify_enabled_intent(True)
+                        response = _spotify_endpoint_control_payload(
+                            intent_changed
+                        )
+                    else:
+                        lifecycle = _spotify_orchestrator_for_current_output()
+                        runtime_changed = bool(lifecycle.enable())
+                        intent_changed = _set_spotify_enabled_intent(True)
+                        response = _spotify_endpoint_control_payload(
+                            runtime_changed or intent_changed
+                        )
+                except Exception:
+                    if lifecycle is not None and not _spotify_enabled_intent():
+                        try:
+                            lifecycle.disable()
+                        except Exception:
+                            pass
+                    logger.error("Spotify endpoint enable failed safely")
+                    response = {
+                        "ok": False,
+                        "error": "spotify_endpoint_enable_failed",
+                    }
+                self._send_json(response, no_store=True)
+                return
+
+            if spotify_control_path == "/api/spotify/deactivate":
+                try:
+                    if not _spotify_enabled_intent():
+                        raise RuntimeError(
+                            "Spotify endpoint is not enabled"
+                        )
+
+                    lifecycle = _existing_spotify_endpoint_lifecycle()
+                    if lifecycle is None:
+                        raise RuntimeError(
+                            "Spotify endpoint lifecycle is unavailable"
+                        )
+
+                    runtime_changed = bool(lifecycle.deactivate())
+                    response = _spotify_endpoint_control_payload(
+                        runtime_changed
+                    )
+                except Exception:
+                    logger.error(
+                        "Spotify endpoint deactivate failed safely"
+                    )
+                    response = {
+                        "ok": False,
+                        "error": "spotify_endpoint_deactivate_failed",
+                    }
+
+                self._send_json(response, no_store=True)
+                return
+
+            try:
+                intent_changed = _set_spotify_enabled_intent(False)
+                lifecycle = _existing_spotify_endpoint_lifecycle()
+                runtime_changed = (
+                    False
+                    if lifecycle is None
+                    else bool(lifecycle.disable())
+                )
+                response = _spotify_endpoint_control_payload(
+                    runtime_changed or intent_changed
+                )
+            except Exception:
+                logger.error("Spotify endpoint disable failed safely")
+                response = {
+                    "ok": False,
+                    "error": "spotify_endpoint_disable_failed",
+                }
+            self._send_json(response, no_store=True)
+            return
+
+        # -- Public Spotify Connect device name --------------------------
+        spotify_device_name_path = urlparse(self.path).path
+        if spotify_device_name_path == "/api/spotify/device-name":
+            if self.path != spotify_device_name_path:
+                self._send_json(
+                    {"ok": False, "error": "invalid_request"},
+                    no_store=True,
+                )
+                return
+
+            content_type = str(
+                self.headers.get("Content-Type", "") or ""
+            ).split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                self._send_json(
+                    {"ok": False, "error": "invalid_request"},
+                    no_store=True,
+                )
+                return
+
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                length = 0
+            if length <= 0 or length > _SPOTIFY_DEVICE_NAME_REQUEST_MAX_BYTES:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": (
+                            "request_too_large"
+                            if length > _SPOTIFY_DEVICE_NAME_REQUEST_MAX_BYTES
+                            else "invalid_request"
+                        ),
+                    },
+                    no_store=True,
+                )
+                return
+
+            try:
+                body = self.rfile.read(length)
+                if len(body) != length:
+                    raise ValueError("short request body")
+                device_name_payload = json.loads(body.decode("utf-8"))
+            except Exception:
+                self._send_json(
+                    {"ok": False, "error": "invalid_request"},
+                    no_store=True,
+                )
+                return
+
+            if (
+                not isinstance(device_name_payload, dict)
+                or set(device_name_payload) != {"device_name"}
+            ):
+                self._send_json(
+                    {"ok": False, "error": "invalid_request"},
+                    no_store=True,
+                )
+                return
+
+            try:
+                response = _set_spotify_device_name(
+                    device_name_payload.get("device_name")
+                )
+            except ValueError:
+                response = {
+                    "ok": False,
+                    "error": "invalid_device_name",
+                }
+            except _SpotifyDeviceNameMutationError as exc:
+                response = {
+                    "ok": False,
+                    "error": exc.error_code,
+                }
+            except Exception:
+                response = {
+                    "ok": False,
+                    "error": "spotify_device_name_update_failed",
+                }
+            self._send_json(response, no_store=True)
+            return
 
         # -- Radio routes (no request body) ----------------------------------
         if self.path.startswith("/api/radio/play/"):
@@ -11330,12 +19448,348 @@ class ControlHandler(BaseHTTPRequestHandler):
             self._send_json(_local_library_cleanup_stale_payload())
             return
 
+        # -- Spotify private configuration -------------------------------
+        # This route owns its body parsing so credential material is bounded
+        # before entering the generic POST parser below.
+        spotify_config_path = urlparse(self.path).path
+        if spotify_config_path == "/api/spotify/config":
+            if self.path != spotify_config_path:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "invalid_request",
+                    },
+                    no_store=True,
+                )
+                return
+
+            content_type = str(
+                self.headers.get("Content-Type", "")
+                or ""
+            ).split(";", 1)[0].strip().lower()
+
+            if content_type != "application/json":
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "invalid_request",
+                    },
+                    no_store=True,
+                )
+                return
+
+            try:
+                length = int(
+                    self.headers.get("Content-Length", 0)
+                )
+            except (TypeError, ValueError):
+                length = 0
+
+            if length <= 0 or length > 16384:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": (
+                            "request_too_large"
+                            if length > 16384
+                            else "invalid_request"
+                        ),
+                    },
+                    no_store=True,
+                )
+                return
+
+            try:
+                body = self.rfile.read(length)
+                if len(body) != length:
+                    raise ValueError("short request body")
+
+                spotify_payload = json.loads(
+                    body.decode("utf-8")
+                )
+            except Exception:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "invalid_request",
+                    },
+                    no_store=True,
+                )
+                return
+
+            if (
+                not isinstance(spotify_payload, dict)
+                or set(spotify_payload) != {"api_key"}
+            ):
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "invalid_request",
+                    },
+                    no_store=True,
+                )
+                return
+
+            secret_store = getattr(
+                APP_INSTANCE,
+                "spotify_secret_store",
+                None,
+            )
+
+            if secret_store is None:
+                logger.error(
+                    "Spotify secret store is unavailable"
+                )
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "spotify_config_unavailable",
+                    },
+                    no_store=True,
+                )
+                return
+
+            try:
+                secret_store.set_api_key(
+                    spotify_payload.get("api_key")
+                )
+                key_configured = (
+                    secret_store.key_configured()
+                )
+            except ValueError:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "invalid_api_key",
+                    },
+                    no_store=True,
+                )
+                return
+            except Exception as exc:
+                logger.error(
+                    "Spotify configuration update failed safely (%s)",
+                    type(exc).__name__,
+                )
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "spotify_config_unavailable",
+                    },
+                    no_store=True,
+                )
+                return
+
+            if key_configured is not True:
+                logger.error(
+                    "Spotify API key persistence could not be confirmed"
+                )
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "spotify_config_unavailable",
+                    },
+                    no_store=True,
+                )
+                return
+
+            self._send_json(
+                {
+                    "ok": True,
+                    "key_configured": True,
+                },
+                no_store=True,
+            )
+            return
+
         length = int(self.headers.get("Content-Length", 0))
         try:
             body    = self.rfile.read(length)
             payload = json.loads(body)
         except Exception:
             self.send_error(400)
+            return
+
+        # -- Q10I native Qobuz Favorite set-state -----------------------
+        # Body:
+        # {
+        #   type: "track" | "album" | "artist",
+        #   id: "<native-qobuz-id>",
+        #   is_favorite: true | false
+        # }
+        if self.path == "/qobuz/favorite/set":
+            if not isinstance(
+                payload,
+                dict,
+            ):
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz favorite request is invalid.",
+                }, no_store=True)
+                return
+
+            favorite_type = (
+                payload.get("type")
+            )
+            item_id = payload.get("id")
+            is_favorite = payload.get(
+                "is_favorite"
+            )
+
+            if (
+                not isinstance(
+                    favorite_type,
+                    str,
+                )
+                or isinstance(
+                    item_id,
+                    bool,
+                )
+                or not isinstance(
+                    item_id,
+                    (str, int),
+                )
+                or not isinstance(
+                    is_favorite,
+                    bool,
+                )
+            ):
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz favorite request is invalid.",
+                }, no_store=True)
+                return
+
+            backend = getattr(
+                APP_INSTANCE,
+                "qobuz_backend",
+                None,
+            )
+
+            if backend is None:
+                self._send_json({
+                    "ok": False,
+                    "error": "qobuz_unavailable",
+                    "message": "Qobuz Favorites are unavailable.",
+                }, no_store=True)
+                return
+
+            try:
+                result = (
+                    backend.set_favorite(
+                        favorite_type,
+                        item_id,
+                        is_favorite,
+                    )
+                )
+
+                self._send_json(
+                    result,
+                    no_store=True,
+                )
+            except Exception as exc:
+                safe_payload = getattr(
+                    exc,
+                    "safe_payload",
+                    None,
+                )
+
+                if callable(
+                    safe_payload
+                ):
+                    try:
+                        error_payload = (
+                            safe_payload()
+                        )
+                    except Exception:
+                        error_payload = None
+
+                    if isinstance(
+                        error_payload,
+                        dict,
+                    ):
+                        self._send_json(
+                            error_payload,
+                            no_store=True,
+                        )
+                        return
+
+                logger.warning(
+                    "Qobuz favorite/set failed safely (%s)",
+                    type(exc).__name__,
+                )
+
+                self._send_json({
+                    "ok": False,
+                    "error": "qobuz_favorite_update_failed",
+                    "message": (
+                        "Qobuz favorite could not "
+                        "be updated."
+                    ),
+                }, no_store=True)
+
+            return
+
+
+        # -- Qobuz headless authentication completion -----------------------
+        if self.path == "/qobuz/login/complete":
+            backend = getattr(
+                APP_INSTANCE,
+                "qobuz_backend",
+                None,
+            )
+
+            if backend is None:
+                self._send_json({
+                    "accepted": False,
+                    "logged_in": False,
+                    "pending": False,
+                    "auth_state": "unavailable",
+                    "error": (
+                        "Qobuz authentication is unavailable."
+                    ),
+                }, no_store=True)
+                return
+
+            if not isinstance(payload, dict):
+                self._send_json({
+                    "accepted": False,
+                    "logged_in": False,
+                    "pending": False,
+                    "auth_state": "error",
+                    "error": (
+                        "Qobuz sign-in completion request is invalid."
+                    ),
+                }, no_store=True)
+                return
+
+            try:
+                result = backend.complete_login(
+                    attempt_id=payload.get("attempt_id"),
+                    callback_url=payload.get("callback_url"),
+                )
+
+                self._send_json(
+                    result,
+                    no_store=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Qobuz login completion failed safely (%s)",
+                    type(exc).__name__,
+                )
+
+                self._send_json({
+                    "accepted": False,
+                    "logged_in": False,
+                    "pending": False,
+                    "auth_state": "error",
+                    "error": (
+                        "Qobuz sign-in could not be completed."
+                    ),
+                }, no_store=True)
+
             return
 
         # -- Queue: reorder one upcoming track -----------------------------
@@ -11440,21 +19894,176 @@ class ControlHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(e)})
             return
 
-        if self.path == "/api/settings/tidal-infinite-play":
-            enabled = bool(payload.get("enabled")) if "enabled" in payload else None
-            mode = payload.get("mode") if "mode" in payload else None
-            state = _set_tidal_infinite_play_settings(enabled=enabled, mode=mode)
-            logger.info(
-                "TIDAL Infinite Play setting: %s mode=%s",
-                "enabled" if state["enabled"] else "disabled",
-                state["mode"],
+        if self.path == "/api/settings/provider-radio":
+            try:
+                state = _set_provider_radio_visibility_settings(
+                    show_tidal_radio=(
+                        payload.get("show_tidal_radio")
+                        if "show_tidal_radio" in payload
+                        else None
+                    ),
+                    show_qobuz_radio=(
+                        payload.get("show_qobuz_radio")
+                        if "show_qobuz_radio" in payload
+                        else None
+                    ),
+                )
+                response = {"ok": True}
+                response.update(state)
+                self._send_json(response, no_store=True)
+            except ValueError as e:
+                self._send_json(
+                    {"ok": False, "error": str(e)},
+                    no_store=True,
+                )
+            return
+
+        if self.path == "/api/settings/playlist-maintenance":
+            provider = (
+                payload.get("provider")
+                if "provider" in payload
+                else None
             )
-            self._send_json({"ok": True, "enabled": state["enabled"], "mode": state["mode"]}, no_store=True)
+
+            try:
+                state = _set_playlist_maintenance_settings(
+                    provider=provider,
+                )
+            except ValueError as exc:
+                self._send_json({
+                    "ok": False,
+                    "error": str(exc),
+                }, no_store=True)
+                return
+
+            logger.info(
+                "Playlist Maintenance setting: "
+                "saved_provider=%s effective_provider=%s",
+                state["provider"],
+                state["effective_provider"],
+            )
+
+            response = {"ok": True}
+            response.update(state)
+            self._send_json(response, no_store=True)
+            return
+
+        if self.path == "/api/settings/automix":
+            provider = (
+                payload.get("provider")
+                if "provider" in payload
+                else None
+            )
+
+            try:
+                state = _set_automix_settings(
+                    provider=provider,
+                )
+
+            except ValueError as exc:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                    },
+                    no_store=True,
+                )
+                return
+
+            logger.info(
+                "Auto-Mix setting: "
+                "saved_provider=%s "
+                "effective_provider=%s",
+                state["provider"],
+                state["effective_provider"],
+            )
+
+            response = {"ok": True}
+            response.update(state)
+
+            self._send_json(
+                response,
+                no_store=True,
+            )
+            return
+
+        if self.path in (
+            "/api/settings/infinite-play",
+            "/api/settings/tidal-infinite-play",
+        ):
+            enabled = (
+                bool(payload.get("enabled"))
+                if "enabled" in payload
+                else None
+            )
+            mode = (
+                payload.get("mode")
+                if "mode" in payload
+                else None
+            )
+            provider = (
+                payload.get("provider")
+                if "provider" in payload
+                else None
+            )
+
+            try:
+                state = _set_tidal_infinite_play_settings(
+                    enabled=enabled,
+                    mode=mode,
+                    provider=provider,
+                )
+            except ValueError as exc:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                    },
+                    no_store=True,
+                )
+                return
+
+            logger.info(
+                "Infinite Play setting: %s mode=%s "
+                "saved_provider=%s effective_provider=%s",
+                (
+                    "enabled"
+                    if state["enabled"]
+                    else "disabled"
+                ),
+                state["mode"],
+                state["provider"],
+                state["effective_provider"],
+            )
+
+            response = {"ok": True}
+            response.update(state)
+            self._send_json(
+                response,
+                no_store=True,
+            )
             return
 
         # -- Local library indexed playback ---------------------------------
         if self.path == "/api/local/library/play":
             self._send_json(_local_library_play_payload(payload))
+            return
+
+        # -- Temporary Qobuz Q4 playback proof -------------------------------
+        # Internal development routes only. No opaque media URI or provider
+        # delivery/key material is returned to the HTTP client.
+        if self.path == "/qobuz/test-play":
+            self._send_json(
+                _qobuz_test_play_payload(payload),
+                no_store=True,
+            )
+            return
+
+        if self.path == "/qobuz/test-stop":
+            self._send_json(
+                _qobuz_test_stop_payload(),
+                no_store=True,
+            )
             return
 
         # -- Temporary local playback proof ---------------------------------
@@ -11466,6 +20075,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 file_uri = _local_test_file_uri(real_path)
                 _require_audio_output_for_playback("local test playback")
                 _invalidate_tidal_stream_resolution("local-test-playback")
+                _invalidate_qobuz_playback("local-test-playback")
                 GLib.idle_add(lambda: play_local_test_file(real_path, file_uri))
                 self._send_json({
                     "ok": True,
@@ -11507,7 +20117,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 CURRENT_RADIO = None
                 _set_player_live_radio_mode(enabled=False)
             if local_library_rebuild_running() and any(
-                str((t or {}).get("source") or "").lower() == "local" or str((t or {}).get("id") or "").startswith("local:")
+                _is_local_track_payload(t)
                 for t in tracks if isinstance(t, dict)
             ):
                 self._send_json(_local_library_maintenance_busy_payload({"source": "local"}))
@@ -11516,7 +20126,28 @@ class ControlHandler(BaseHTTPRequestHandler):
             ctx_type  = str(payload.get("context_type",  "") or "").strip()
             ctx_id    = str(payload.get("context_id",    "") or "").strip()
             ctx_title = str(payload.get("context_title", "") or "").strip()
+
+            qobuz_replace_target = ""
+            if tracks:
+                target_payload_index = max(0, min(start_idx, len(tracks) - 1))
+                target_payload = tracks[target_payload_index]
+                if isinstance(target_payload, dict):
+                    target_payload_id = str(target_payload.get("id") or "").strip()
+                    if _queue_item_source(target_payload_id, target_payload) == "qobuz":
+                        qobuz_replace_target = target_payload_id
+            qobuz_replace_request = _prepare_qobuz_replacement_pending(
+                qobuz_replace_target,
+                "queue-replace",
+            )
+
             _invalidate_tidal_stream_resolution("queue-replace")
+            if qobuz_replace_request is None:
+                _invalidate_qobuz_playback("queue-replace")
+            else:
+                _invalidate_qobuz_playback(
+                    "queue-replace",
+                    preserve_replacement=qobuz_replace_request is not None,
+                )
             with _QUEUE_LOCK:
                 PLAY_QUEUE.clear()
                 ORIGINAL_QUEUE.clear()
@@ -11556,7 +20187,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 self._send_json(_offline_online_source_payload(), no_store=True)
                 return
             if local_library_rebuild_running() and any(
-                str((t or {}).get("source") or "").lower() == "local" or str((t or {}).get("id") or "").startswith("local:")
+                _is_local_track_payload(t)
                 for t in tracks if isinstance(t, dict)
             ):
                 self._send_json(_local_library_maintenance_busy_payload({"source": "local"}))
@@ -11585,7 +20216,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 self._send_json(_offline_online_source_payload(), no_store=True)
                 return
             if local_library_rebuild_running() and any(
-                str((t or {}).get("source") or "").lower() == "local" or str((t or {}).get("id") or "").startswith("local:")
+                _is_local_track_payload(t)
                 for t in tracks if isinstance(t, dict)
             ):
                 self._send_json(_local_library_maintenance_busy_payload({"source": "local"}))
@@ -11616,40 +20247,175 @@ class ControlHandler(BaseHTTPRequestHandler):
             self._send_json({"result": "ok", "queue_length": len(PLAY_QUEUE)})
             return
 
-        if self.path == "/api/tidal/infinite-play/refill":
+        if self.path in (
+            "/api/infinite-play/refill",
+            "/api/tidal/infinite-play/refill",
+        ):
             if not _tidal_infinite_play_enabled():
-                self._send_json({"ok": False, "error": "Infinite Play is disabled"}, no_store=True)
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "Infinite Play is disabled",
+                    },
+                    no_store=True,
+                )
                 return
+
             if RADIO_MODE:
-                logger.info("Infinite Play refill skipped: radio mode active")
-                self._send_json({"ok": False, "error": "radio mode active"}, no_store=True)
+                logger.info(
+                    "Infinite Play refill skipped: radio mode active"
+                )
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "radio mode active",
+                    },
+                    no_store=True,
+                )
                 return
+
+            effective_provider = (
+                _effective_infinite_play_provider()
+            )
+
+            if effective_provider not in (
+                "tidal",
+                "qobuz",
+            ):
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "no Infinite Play provider available",
+                    },
+                    no_store=True,
+                )
+                return
+
             try:
-                limit = int(payload.get("limit", 10) or 10)
+                limit = int(
+                    payload.get("limit", 10)
+                    or 10
+                )
             except Exception:
                 limit = 10
-            limit = max(1, min(limit, 25))
-            mode = _normalise_tidal_infinite_play_mode(payload.get("mode") or _tidal_infinite_play_mode())
-            seed_id = str(payload.get("seed_id", payload.get("seed_track_id", "")) or "").strip()
+
+            limit = max(
+                1,
+                min(limit, 25),
+            )
+
+            mode = _normalise_tidal_infinite_play_mode(
+                payload.get("mode")
+                or _tidal_infinite_play_mode()
+            )
+
+            seed_id = str(
+                payload.get(
+                    "seed_id",
+                    payload.get(
+                        "seed_track_id",
+                        "",
+                    ),
+                )
+                or ""
+            ).strip()
+
             with _QUEUE_LOCK:
-                if not PLAY_QUEUE or not (0 <= QUEUE_INDEX < len(PLAY_QUEUE)):
-                    self._send_json({"ok": False, "error": "no active queue"}, no_store=True)
+                if (
+                    not PLAY_QUEUE
+                    or not (
+                        0 <= QUEUE_INDEX < len(PLAY_QUEUE)
+                    )
+                ):
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "error": "no active queue",
+                        },
+                        no_store=True,
+                    )
                     return
-                active_id = str(PLAY_QUEUE[QUEUE_INDEX])
-                active_meta = PLAY_QUEUE_META_CACHE.get(active_id, {}) or {}
-                active_source = str(active_meta.get("source") or "").lower()
-                if active_id.startswith("local:") or active_source == "local":
-                    logger.info("Infinite Play refill skipped: active queue item is local")
-                    self._send_json({"ok": False, "error": "active track is not TIDAL"}, no_store=True)
+
+                active_id = str(
+                    PLAY_QUEUE[QUEUE_INDEX]
+                )
+                active_meta = (
+                    PLAY_QUEUE_META_CACHE.get(
+                        active_id,
+                        {},
+                    )
+                    or {}
+                )
+                active_source = _queue_item_source(
+                    active_id,
+                    active_meta,
+                )
+
+                if active_source != effective_provider:
+                    logger.info(
+                        "Infinite Play refill skipped: "
+                        "active source=%s effective provider=%s",
+                        active_source,
+                        effective_provider,
+                    )
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "error": (
+                                "active track provider does not "
+                                "match Infinite Play provider"
+                            ),
+                        },
+                        no_store=True,
+                    )
                     return
+
+                if (
+                    effective_provider == "qobuz"
+                    and not _valid_qobuz_infinite_play_seed(
+                        active_id,
+                        active_meta,
+                    )
+                ):
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "error": "invalid Qobuz seed identity",
+                        },
+                        no_store=True,
+                    )
+                    return
+
                 if QUEUE_INDEX < len(PLAY_QUEUE) - 1:
-                    self._send_json({"ok": False, "error": "queue is not at tail"}, no_store=True)
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "error": "queue is not at tail",
+                        },
+                        no_store=True,
+                    )
                     return
+
                 if seed_id and seed_id != active_id:
-                    logger.info("Infinite Play refill seed mismatch: requested=%s active=%s", seed_id, active_id)
+                    logger.info(
+                        "Infinite Play refill seed mismatch: "
+                        "requested=%s active=%s",
+                        seed_id,
+                        active_id,
+                    )
+
                 seed_id = active_id
-            result = _coordinated_infinite_play_refill(seed_id=seed_id, limit=limit, autoplay=False, mode=mode)
-            self._send_json(result, no_store=True)
+
+            result = _coordinated_infinite_play_refill(
+                seed_id=seed_id,
+                limit=limit,
+                autoplay=False,
+                mode=mode,
+            )
+            self._send_json(
+                result,
+                no_store=True,
+            )
             return
 
         # -- Queue: save current queue as a new Tidal playlist ---------------
@@ -11671,6 +20437,679 @@ class ControlHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 logger.warning("create_playlist failed: %s", e)
                 self._send_json({"error": str(e)})
+            return
+
+        # -- Playlist: create empty Qobuz playlist --------------------------
+        # Body: {name: "My Playlist", description: "...", is_public: false}
+        if self.path == "/qobuz/playlist/create":
+            if not isinstance(payload, dict):
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz playlist request is invalid.",
+                }, no_store=True)
+                return
+
+            raw_name = payload.get("name", "")
+            description = payload.get("description", "")
+            is_public = payload.get("is_public", False)
+
+            if not isinstance(raw_name, str):
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz playlist name is invalid.",
+                }, no_store=True)
+                return
+
+            if not isinstance(description, str):
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz playlist description is invalid.",
+                }, no_store=True)
+                return
+
+            if not isinstance(is_public, bool):
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz playlist privacy is invalid.",
+                }, no_store=True)
+                return
+
+            backend = getattr(
+                APP_INSTANCE,
+                "qobuz_backend",
+                None,
+            )
+
+            if backend is None:
+                self._send_json({
+                    "ok": False,
+                    "error": "qobuz_unavailable",
+                    "message": "Qobuz playlist creation is unavailable.",
+                }, no_store=True)
+                return
+
+            try:
+                result = backend.create_playlist(
+                    raw_name,
+                    description,
+                    is_public=is_public,
+                )
+
+                self._send_json(
+                    result,
+                    no_store=True,
+                )
+            except Exception as exc:
+                safe_payload = getattr(
+                    exc,
+                    "safe_payload",
+                    None,
+                )
+
+                if callable(safe_payload):
+                    try:
+                        error_payload = safe_payload()
+                    except Exception:
+                        error_payload = None
+
+                    if isinstance(
+                        error_payload,
+                        dict,
+                    ):
+                        self._send_json(
+                            error_payload,
+                            no_store=True,
+                        )
+                        return
+
+                logger.warning(
+                    "Qobuz playlist/create failed safely (%s)",
+                    type(exc).__name__,
+                )
+
+                self._send_json({
+                    "ok": False,
+                    "error": "qobuz_playlist_create_failed",
+                    "message": "Qobuz playlist could not be created.",
+                }, no_store=True)
+
+            return
+
+
+        # -- Playlist: add native Qobuz tracks to one owned playlist ---------
+        # Body: {
+        #   playlist_id: "...",
+        #   tracks: [{source:"qobuz", id:"qobuz:<id>", provider_track_id:"<id>"}]
+        # }
+        if self.path == "/qobuz/playlist/add_tracks":
+            if not isinstance(payload, dict):
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz playlist add request is invalid.",
+                }, no_store=True)
+                return
+
+            raw_playlist_id = payload.get(
+                "playlist_id"
+            )
+
+            tracks = payload.get(
+                "tracks"
+            )
+
+            if (
+                isinstance(
+                    raw_playlist_id,
+                    bool,
+                )
+                or not isinstance(
+                    raw_playlist_id,
+                    (str, int),
+                )
+                or not isinstance(
+                    tracks,
+                    list,
+                )
+                or not tracks
+            ):
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz playlist add request is invalid.",
+                }, no_store=True)
+                return
+
+            playlist_id = str(
+                raw_playlist_id
+            ).strip()
+
+            if not playlist_id:
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz playlist ID is invalid.",
+                }, no_store=True)
+                return
+
+            backend = getattr(
+                APP_INSTANCE,
+                "qobuz_backend",
+                None,
+            )
+
+            if backend is None:
+                self._send_json({
+                    "ok": False,
+                    "error": "qobuz_unavailable",
+                    "message": "Qobuz Add to Playlist is unavailable.",
+                }, no_store=True)
+                return
+
+            try:
+                result = (
+                    backend.add_tracks_to_playlist(
+                        playlist_id,
+                        tracks,
+                    )
+                )
+
+                if (
+                    not isinstance(
+                        result,
+                        dict,
+                    )
+                    or result.get("ok")
+                    is not True
+                    or result.get(
+                        "confirmed"
+                    )
+                    is not True
+                ):
+                    self._send_json({
+                        "ok": False,
+                        "error": "qobuz_playlist_add_failed",
+                        "message": "Qobuz playlist update could not be confirmed.",
+                    }, no_store=True)
+                    return
+
+                self._send_json(
+                    result,
+                    no_store=True,
+                )
+
+            except Exception as exc:
+                safe_payload = getattr(
+                    exc,
+                    "safe_payload",
+                    None,
+                )
+
+                if callable(safe_payload):
+                    try:
+                        error_payload = (
+                            safe_payload()
+                        )
+                    except Exception:
+                        error_payload = None
+
+                    if isinstance(
+                        error_payload,
+                        dict,
+                    ):
+                        self._send_json(
+                            error_payload,
+                            no_store=True,
+                        )
+                        return
+
+                logger.warning(
+                    "Qobuz playlist/add_tracks failed safely (%s)",
+                    type(exc).__name__,
+                )
+
+                self._send_json({
+                    "ok": False,
+                    "error": "qobuz_playlist_add_failed",
+                    "message": "Qobuz playlist could not be updated.",
+                }, no_store=True)
+
+            return
+
+
+        # -- Playlist: remove native Qobuz playlist occurrences -----------
+        # Body: {
+        #   playlist_id: "...",
+        #   tracks: [{
+        #     source:"qobuz",
+        #     id:"qobuz:<id>",
+        #     provider_track_id:"<id>",
+        #     playlist_track_id:"<occurrence-id>"
+        #   }]
+        # }
+        if self.path == "/qobuz/playlist/remove_tracks":
+            if not isinstance(
+                payload,
+                dict,
+            ):
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz playlist remove request is invalid.",
+                }, no_store=True)
+                return
+
+            raw_playlist_id = (
+                payload.get(
+                    "playlist_id"
+                )
+            )
+
+            tracks = payload.get(
+                "tracks"
+            )
+
+            if (
+                isinstance(
+                    raw_playlist_id,
+                    bool,
+                )
+                or not isinstance(
+                    raw_playlist_id,
+                    (str, int),
+                )
+                or not isinstance(
+                    tracks,
+                    list,
+                )
+                or not tracks
+            ):
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz playlist remove request is invalid.",
+                }, no_store=True)
+                return
+
+            playlist_id = str(
+                raw_playlist_id
+            ).strip()
+
+            if not playlist_id:
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz playlist ID is invalid.",
+                }, no_store=True)
+                return
+
+            backend = getattr(
+                APP_INSTANCE,
+                "qobuz_backend",
+                None,
+            )
+
+            if backend is None:
+                self._send_json({
+                    "ok": False,
+                    "error": "qobuz_unavailable",
+                    "message": "Qobuz Remove from Playlist is unavailable.",
+                }, no_store=True)
+                return
+
+            try:
+                result = (
+                    backend.remove_tracks_from_playlist(
+                        playlist_id,
+                        tracks,
+                    )
+                )
+
+                if (
+                    not isinstance(
+                        result,
+                        dict,
+                    )
+                    or result.get(
+                        "ok"
+                    ) is not True
+                    or result.get(
+                        "confirmed"
+                    ) is not True
+                ):
+                    self._send_json({
+                        "ok": False,
+                        "error": "qobuz_playlist_remove_failed",
+                        "message": "Qobuz playlist update could not be confirmed.",
+                    }, no_store=True)
+                    return
+
+                self._send_json(
+                    result,
+                    no_store=True,
+                )
+
+            except Exception as exc:
+                safe_payload = getattr(
+                    exc,
+                    "safe_payload",
+                    None,
+                )
+
+                if callable(
+                    safe_payload
+                ):
+                    try:
+                        error_payload = (
+                            safe_payload()
+                        )
+                    except Exception:
+                        error_payload = None
+
+                    if isinstance(
+                        error_payload,
+                        dict,
+                    ):
+                        self._send_json(
+                            error_payload,
+                            no_store=True,
+                        )
+                        return
+
+                logger.warning(
+                    "Qobuz playlist/remove_tracks failed safely (%s)",
+                    type(exc).__name__,
+                )
+
+                self._send_json({
+                    "ok": False,
+                    "error": "qobuz_playlist_remove_failed",
+                    "message": "Qobuz playlist could not be updated.",
+                }, no_store=True)
+
+            return
+
+
+        # -- Playlist: rename one owned Qobuz playlist ----------------------
+        # Body: {playlist_id: "...", name: "..."}
+        if self.path == "/qobuz/playlist/rename":
+            if not isinstance(
+                payload,
+                dict,
+            ):
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz playlist rename request is invalid.",
+                }, no_store=True)
+                return
+
+            raw_playlist_id = payload.get(
+                "playlist_id"
+            )
+
+            raw_name = payload.get(
+                "name"
+            )
+
+            if (
+                isinstance(
+                    raw_playlist_id,
+                    bool,
+                )
+                or not isinstance(
+                    raw_playlist_id,
+                    (str, int),
+                )
+            ):
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz playlist ID is invalid.",
+                }, no_store=True)
+                return
+
+            if not isinstance(
+                raw_name,
+                str,
+            ):
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz playlist name is invalid.",
+                }, no_store=True)
+                return
+
+            playlist_id = str(
+                raw_playlist_id
+            ).strip()
+
+            name = raw_name.strip()
+
+            if not playlist_id:
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz playlist ID is invalid.",
+                }, no_store=True)
+                return
+
+            if not name:
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz playlist name is invalid.",
+                }, no_store=True)
+                return
+
+            backend = getattr(
+                APP_INSTANCE,
+                "qobuz_backend",
+                None,
+            )
+
+            if backend is None:
+                self._send_json({
+                    "ok": False,
+                    "error": "qobuz_unavailable",
+                    "message": "Qobuz playlist rename is unavailable.",
+                }, no_store=True)
+                return
+
+            try:
+                result = backend.rename_playlist(
+                    playlist_id,
+                    name,
+                )
+
+                if (
+                    not isinstance(
+                        result,
+                        dict,
+                    )
+                    or result.get(
+                        "ok"
+                    ) is not True
+                    or result.get(
+                        "confirmed"
+                    ) is not True
+                ):
+                    self._send_json({
+                        "ok": False,
+                        "error": "qobuz_playlist_rename_failed",
+                        "message": "Qobuz playlist rename could not be confirmed.",
+                    }, no_store=True)
+                    return
+
+                self._send_json(
+                    result,
+                    no_store=True,
+                )
+
+            except Exception as exc:
+                safe_payload = getattr(
+                    exc,
+                    "safe_payload",
+                    None,
+                )
+
+                if callable(
+                    safe_payload
+                ):
+                    try:
+                        error_payload = (
+                            safe_payload()
+                        )
+                    except Exception:
+                        error_payload = None
+
+                    if isinstance(
+                        error_payload,
+                        dict,
+                    ):
+                        self._send_json(
+                            error_payload,
+                            no_store=True,
+                        )
+                        return
+
+                logger.warning(
+                    "Qobuz playlist/rename failed safely (%s)",
+                    type(exc).__name__,
+                )
+
+                self._send_json({
+                    "ok": False,
+                    "error": "qobuz_playlist_rename_failed",
+                    "message": "Qobuz playlist could not be renamed.",
+                }, no_store=True)
+
+            return
+
+
+        # -- Playlist: delete one owned Qobuz playlist ----------------------
+        # Body: {playlist_id: "..."}
+        if self.path == "/qobuz/playlist/delete":
+            if not isinstance(payload, dict):
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz playlist delete request is invalid.",
+                }, no_store=True)
+                return
+
+            raw_playlist_id = payload.get(
+                "playlist_id"
+            )
+
+            if (
+                isinstance(
+                    raw_playlist_id,
+                    bool,
+                )
+                or not isinstance(
+                    raw_playlist_id,
+                    (str, int),
+                )
+            ):
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz playlist ID is invalid.",
+                }, no_store=True)
+                return
+
+            playlist_id = str(
+                raw_playlist_id
+            ).strip()
+
+            if not playlist_id:
+                self._send_json({
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Qobuz playlist ID is invalid.",
+                }, no_store=True)
+                return
+
+            backend = getattr(
+                APP_INSTANCE,
+                "qobuz_backend",
+                None,
+            )
+
+            if backend is None:
+                self._send_json({
+                    "ok": False,
+                    "error": "qobuz_unavailable",
+                    "message": "Qobuz playlist deletion is unavailable.",
+                }, no_store=True)
+                return
+
+            try:
+                result = backend.delete_playlist(
+                    playlist_id
+                )
+
+                if (
+                    not isinstance(
+                        result,
+                        dict,
+                    )
+                    or result.get("ok")
+                    is not True
+                ):
+                    self._send_json({
+                        "ok": False,
+                        "error": "qobuz_playlist_delete_failed",
+                        "message": "Qobuz playlist could not be deleted.",
+                    }, no_store=True)
+                    return
+
+                self._send_json(
+                    result,
+                    no_store=True,
+                )
+
+            except Exception as exc:
+                safe_payload = getattr(
+                    exc,
+                    "safe_payload",
+                    None,
+                )
+
+                if callable(safe_payload):
+                    try:
+                        error_payload = (
+                            safe_payload()
+                        )
+                    except Exception:
+                        error_payload = None
+
+                    if isinstance(
+                        error_payload,
+                        dict,
+                    ):
+                        self._send_json(
+                            error_payload,
+                            no_store=True,
+                        )
+                        return
+
+                logger.warning(
+                    "Qobuz playlist/delete failed safely (%s)",
+                    type(exc).__name__,
+                )
+
+                self._send_json({
+                    "ok": False,
+                    "error": "qobuz_playlist_delete_failed",
+                    "message": "Qobuz playlist could not be deleted.",
+                }, no_store=True)
+
             return
 
         # -- Playlist: create empty TIDAL playlist ---------------------------
@@ -11868,10 +21307,18 @@ class ControlHandler(BaseHTTPRequestHandler):
                     self._send_json({"ok": False, "error": "TIDAL is not logged in"}, no_store=True)
                     return
                 result = backend.delete_cloud_playlist(playlist_id)
-                # tidalapi may return None from delete() on success. The helper
-                # includes playlist_id when resolution reached a playlist.
-                if not result or (not result.get("ok") and result.get("playlist_id") is None):
-                    self._send_json({"ok": False, "error": "TIDAL playlist delete failed"}, no_store=True)
+                if not result or result.get("ok") is not True:
+                    error = (
+                        (result or {}).get("error")
+                        or "TIDAL playlist delete failed"
+                    )
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "error": error,
+                        },
+                        no_store=True,
+                    )
                     return
                 cache_invalidate("myplaylists")
                 cache_invalidate("playlist:" + playlist_id)
@@ -11992,88 +21439,404 @@ class ControlHandler(BaseHTTPRequestHandler):
             self._send_json({"deleted": deleted, "failed": failed})
             return
 
+        # -- Q10C: delete owned Qobuz duplicate playlists --------------
+        if self.path == "/qobuz/playlists/delete_duplicates":
+            ids = payload.get("ids", [])
+
+            if (
+                not isinstance(ids, list)
+                or not ids
+                or len(ids) > 1000
+            ):
+                self._send_json({
+                    "deleted": [],
+                    "failed": [],
+                    "error": "invalid_playlist_ids",
+                }, no_store=True)
+                return
+
+            normalized_ids = []
+            seen_ids = set()
+
+            for raw_id in ids:
+                if isinstance(raw_id, bool):
+                    self._send_json({
+                        "deleted": [],
+                        "failed": [],
+                        "error": "invalid_playlist_ids",
+                    }, no_store=True)
+                    return
+
+                playlist_id = str(
+                    raw_id if raw_id is not None else ""
+                ).strip()
+
+                if (
+                    not playlist_id
+                    or not playlist_id.isascii()
+                    or not playlist_id.isdigit()
+                    or int(playlist_id) <= 0
+                ):
+                    self._send_json({
+                        "deleted": [],
+                        "failed": [],
+                        "error": "invalid_playlist_ids",
+                    }, no_store=True)
+                    return
+
+                if playlist_id in seen_ids:
+                    continue
+
+                seen_ids.add(playlist_id)
+                normalized_ids.append(playlist_id)
+
+            backend = getattr(
+                APP_INSTANCE,
+                "qobuz_backend",
+                None,
+            )
+
+            if backend is None:
+                self._send_json({
+                    "deleted": [],
+                    "failed": normalized_ids,
+                    "error": "qobuz_unavailable",
+                }, no_store=True)
+                return
+
+            try:
+                state = backend.status()
+            except Exception:
+                state = {}
+
+            if (
+                not isinstance(state, dict)
+                or state.get("usable") is not True
+            ):
+                self._send_json({
+                    "deleted": [],
+                    "failed": normalized_ids,
+                    "error": "qobuz_not_authenticated",
+                }, no_store=True)
+                return
+
+            deleted = []
+            failed = []
+
+            for playlist_id in normalized_ids:
+                try:
+                    result = backend.delete_playlist(
+                        playlist_id
+                    )
+
+                    if (
+                        isinstance(result, dict)
+                        and result.get("ok") is True
+                        and str(
+                            result.get("playlist_id") or ""
+                        ).strip() == playlist_id
+                    ):
+                        deleted.append(playlist_id)
+                        logger.info(
+                            "Deleted Qobuz duplicate playlist: %s",
+                            playlist_id,
+                        )
+                    else:
+                        failed.append(playlist_id)
+
+                except Exception as exc:
+                    failed.append(playlist_id)
+                    logger.warning(
+                        "Qobuz duplicate playlist delete failed safely "
+                        "%s: %s",
+                        playlist_id,
+                        exc,
+                    )
+
+                time.sleep(0.3)
+
+            self._send_json({
+                "deleted": deleted,
+                "failed": failed,
+            }, no_store=True)
+            return
+
         # -- Auto-Mix: create playlist from artist affinity ------------------
         # Body: {artist: "...", depth: "essential"|"balanced"|"deep"}
+        # Provider selection is server-authoritative.
         if self.path == "/api/automix/create":
-            artist = payload.get("artist", "").strip()
-            depth  = payload.get("depth", "balanced").lower()
-            if not artist:
-                self._send_json({"error": "artist required"})
-                return
-            api_key = _SCROBBLE_CREDS.get("lastfm_api_key") or LASTFM_API_KEY
-            backend = APP_INSTANCE.backend
+            artist = payload.get(
+                "artist",
+                "",
+            ).strip()
 
-            def _get_similar(artist_name, limit=20):
+            depth = payload.get(
+                "depth",
+                "balanced",
+            ).lower()
+
+            if not artist:
+                self._send_json({
+                    "error": "artist required"
+                })
+                return
+
+            api_key = (
+                _SCROBBLE_CREDS.get(
+                    "lastfm_api_key"
+                )
+                or LASTFM_API_KEY
+            )
+
+            if (
+                not _SCROBBLE_CREDS.get(
+                    "lastfm_connected",
+                    False,
+                )
+                or not api_key
+            ):
+                self._send_json({
+                    "error":
+                        "Last.fm connection is required for Auto-Mix"
+                })
+                return
+
+            provider = (
+                _effective_automix_provider()
+            )
+
+            if provider not in (
+                "tidal",
+                "qobuz",
+            ):
+                self._send_json({
+                    "error":
+                        "no Auto-Mix provider available"
+                })
+                return
+
+            def _get_similar(
+                artist_name,
+                limit=20,
+            ):
                 try:
-                    url = (LASTFM_API_URL +
-                           "?method=artist.getSimilar"
-                           "&artist=" + urllib.parse.quote(artist_name) +
-                           "&api_key=" + urllib.parse.quote(api_key) +
-                           "&autocorrect=1"
-                           "&format=json"
-                           "&limit=" + str(limit))
-                    data    = _meta_http_get(url)
-                    similar = (data.get("similarartists", {}).get("artist") or [])
-                    return [a["name"] for a in similar if a.get("name")][:limit]
-                except Exception as e:
-                    logger.warning("getSimilar failed for %s: %s", artist_name, e)
+                    url = (
+                        LASTFM_API_URL
+                        + "?method=artist.getSimilar"
+                        + "&artist="
+                        + urllib.parse.quote(
+                            artist_name
+                        )
+                        + "&api_key="
+                        + urllib.parse.quote(
+                            api_key
+                        )
+                        + "&autocorrect=1"
+                        + "&format=json"
+                        + "&limit="
+                        + str(limit)
+                    )
+
+                    data = _meta_http_get(
+                        url
+                    )
+
+                    similar = (
+                        data.get(
+                            "similarartists",
+                            {},
+                        ).get(
+                            "artist"
+                        )
+                        or []
+                    )
+
+                    return [
+                        item["name"]
+                        for item in similar
+                        if item.get("name")
+                    ][:limit]
+
+                except Exception as exc:
+                    logger.warning(
+                        "getSimilar failed for %s: %s",
+                        artist_name,
+                        exc,
+                    )
                     return []
 
             if depth == "essential":
-                n_tracks     = 2
-                artist_names = [artist] + _get_similar(artist, limit=10)
+                n_tracks = 2
+
+                artist_names = (
+                    [artist]
+                    + _get_similar(
+                        artist,
+                        limit=10,
+                    )
+                )
+
             elif depth == "deep":
-                n_tracks     = 3
-                first_degree = _get_similar(artist, limit=20)
-                all_names    = [artist] + first_degree
-                seen         = set(n.lower() for n in all_names)
-                for a in first_degree[:5]:
-                    for s in _get_similar(a, limit=5):
-                        if s.lower() not in seen:
-                            all_names.append(s)
-                            seen.add(s.lower())
+                n_tracks = 3
+
+                first_degree = (
+                    _get_similar(
+                        artist,
+                        limit=20,
+                    )
+                )
+
+                all_names = (
+                    [artist]
+                    + first_degree
+                )
+
+                seen = set(
+                    name.lower()
+                    for name in all_names
+                )
+
+                for first_artist in (
+                    first_degree[:5]
+                ):
+                    for similar_artist in (
+                        _get_similar(
+                            first_artist,
+                            limit=5,
+                        )
+                    ):
+                        if (
+                            similar_artist.lower()
+                            not in seen
+                        ):
+                            all_names.append(
+                                similar_artist
+                            )
+                            seen.add(
+                                similar_artist.lower()
+                            )
+
                 artist_names = all_names
+
             else:
-                n_tracks     = 3
-                artist_names = [artist] + _get_similar(artist, limit=20)
+                n_tracks = 3
 
-            track_ids = []
-            for a_name in artist_names:
-                try:
-                    matches = backend.search_artist(a_name)
-                    if not matches:
-                        continue
-                    best = None
-                    for m in matches:
-                        if _safe_str(getattr(m, "name", "")).lower() == a_name.lower():
-                            best = m
-                            break
-                    if best is None:
-                        best = matches[0]
-                    top = backend.get_artist_top_tracks(best, limit=n_tracks)
-                    for t in top[:n_tracks]:
-                        tid = str(getattr(t, "id", "")).strip()
-                        if tid and tid not in track_ids:
-                            track_ids.append(tid)
-                except Exception as e:
-                    logger.warning("automix track fetch failed for %s: %s", a_name, e)
+                artist_names = (
+                    [artist]
+                    + _get_similar(
+                        artist,
+                        limit=20,
+                    )
+                )
 
-            if not track_ids:
-                self._send_json({"error": "no tracks found"})
-                return
+            if provider == "tidal":
+                tidal_track_ids = (
+                    _automix_tidal_track_ids(
+                        APP_INSTANCE.backend,
+                        artist_names,
+                        n_tracks,
+                    )
+                )
+
+                if not tidal_track_ids:
+                    self._send_json({
+                        "error": "no tracks found"
+                    })
+                    return
+
+                qobuz_backend = None
+                qobuz_tracks = []
+
+            else:
+                qobuz_backend = getattr(
+                    APP_INSTANCE,
+                    "qobuz_backend",
+                    None,
+                )
+
+                if qobuz_backend is None:
+                    self._send_json({
+                        "error":
+                            "no Auto-Mix provider available"
+                    })
+                    return
+
+                qobuz_tracks = (
+                    _automix_qobuz_tracks(
+                        qobuz_backend,
+                        artist_names,
+                        n_tracks,
+                    )
+                )
+
+                if not qobuz_tracks:
+                    self._send_json({
+                        "error": "no tracks found"
+                    })
+                    return
+
+                tidal_track_ids = []
+
             try:
-                pl_name = payload.get("playlist_name", "").strip() or ("Auto-Mix: " + artist)
-                user    = backend.session.user
-                pl      = user.create_playlist(pl_name, "Created by SROVA Auto-Mix")
-                cache_invalidate("myplaylists")
-                ids     = [int(tid) for tid in track_ids if tid]
-                if ids:
-                    pl.add(ids)
-                logger.info("Auto-Mix created: %s (%d tracks)", pl_name, len(ids))
-                self._send_json({"playlist_name": pl_name, "track_count": len(ids)})
-            except Exception as e:
-                logger.warning("automix create_playlist failed: %s", e)
-                self._send_json({"error": str(e)})
+                pl_name = (
+                    payload.get(
+                        "playlist_name",
+                        "",
+                    ).strip()
+                    or (
+                        "Auto-Mix: "
+                        + artist
+                    )
+                )
+
+                if provider == "tidal":
+                    track_count = (
+                        _automix_create_tidal_playlist(
+                            APP_INSTANCE.backend,
+                            pl_name,
+                            tidal_track_ids,
+                        )
+                    )
+
+                else:
+                    track_count = (
+                        _automix_create_qobuz_playlist(
+                            qobuz_backend,
+                            pl_name,
+                            qobuz_tracks,
+                        )
+                    )
+
+                    # Qobuz playlist mutation must advance playlist
+                    # generations just as the pre-Q9C Auto-Mix route did.
+                    cache_invalidate("myplaylists")
+
+                logger.info(
+                    "Auto-Mix created: %s "
+                    "(%d tracks, provider=%s)",
+                    pl_name,
+                    track_count,
+                    provider,
+                )
+
+                self._send_json({
+                    "playlist_name": pl_name,
+                    "track_count": track_count,
+                    "provider": provider,
+                })
+
+            except Exception as exc:
+                logger.warning(
+                    "automix create_playlist "
+                    "failed for provider=%s: %s",
+                    provider,
+                    exc,
+                )
+
+                self._send_json({
+                    "error": str(exc)
+                })
+
             return
 
         if self.path == "/api/radio/stations":
@@ -12283,14 +22046,29 @@ def _configure_audio_when_ready(attempt=0):
 
 def configure_audio():
     player = APP_INSTANCE.player
+    if not _native_audio_allowed("output_claim", source="configure-audio"):
+        logger.warning("Native output claim blocked before configure_audio")
+        return False
     logger.info("Configuring audio output: driver=%s device=%s", ALSA_DRIVER, ALSA_DEVICE)
+    previous = {
+        "requested_driver": getattr(player, "requested_driver", None),
+        "requested_device_id": getattr(player, "requested_device_id", None),
+        "bit_perfect_mode": getattr(player, "bit_perfect_mode", False),
+        "exclusive_lock_mode": getattr(player, "exclusive_lock_mode", False),
+        "active_rate_switch": getattr(player, "active_rate_switch", False),
+    }
     player.requested_driver    = ALSA_DRIVER
     player.requested_device_id = ALSA_DEVICE
     player.bit_perfect_mode    = True
     player.exclusive_lock_mode = True
     player.active_rate_switch  = True
-    player.set_output(ALSA_DRIVER, ALSA_DEVICE)
-    return False
+    applied = player.set_output(ALSA_DRIVER, ALSA_DEVICE)
+    if applied is False:
+        for name, value in previous.items():
+            setattr(player, name, value)
+        logger.warning("Native output claim was not applied")
+        return False
+    return True
 
 
 def start_http():
@@ -12301,6 +22079,7 @@ def start_http():
 
 def main():
     global APP_INSTANCE, HTTP_PORT, HTTP_HOST, ALSA_DRIVER, ALSA_DEVICE, ALSA_DAC_NAME
+    global _AUDIO_OUTPUT_SELECTED
     parser = argparse.ArgumentParser(description="SROVA headless")
     parser.add_argument("--port",        type=int, default=None,    help="HTTP port")
     parser.add_argument("--host",        type=str, default="0.0.0.0", help="Bind host")
@@ -12337,6 +22116,11 @@ def main():
         if args.alsa_device is not None:
             ALSA_DEVICE = _validate_audio_device(args.alsa_device)
             ALSA_DAC_NAME = _resolve_dac_name(ALSA_DEVICE)
+        if force_cli_audio and (
+            args.alsa_driver is not None or args.alsa_device is not None
+        ):
+            with _AUDIO_OUTPUT_LOCK:
+                _AUDIO_OUTPUT_SELECTED = True
     logger.info("Starting SROVA headless runtime")
 
     # Silence routine Rust audio state chatter
@@ -12363,6 +22147,7 @@ def main():
         _sys.modules.setdefault("ui",        _types.ModuleType("ui"))
 
     app_init_runtime.init_runtime(APP_INSTANCE)
+    _install_native_audio_guard(APP_INSTANCE.player)
     APP_INSTANCE.player._on_rust_event = filtered_rust_event
 
     try:
@@ -12370,6 +22155,28 @@ def main():
         logger.info("Tidal session restore attempted")
     except Exception as e:
         logger.warning("Session restore failed: %s", e)
+
+    def _restore_qobuz_session():
+        qobuz_backend = getattr(APP_INSTANCE, "qobuz_backend", None)
+        if qobuz_backend is None:
+            return
+        try:
+            restored = qobuz_backend.restore_session()
+            logger.info(
+                "Qobuz session restore completed: authenticated=%s",
+                bool(restored),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Qobuz session restore failed safely (%s)",
+                type(exc).__name__,
+            )
+
+    threading.Thread(
+        target=_restore_qobuz_session,
+        name="qobuz-session-restore",
+        daemon=True,
+    ).start()
 
     # Restore queue from disk (silent -- no auto-resume, Option A)
     load_queue()
@@ -12389,6 +22196,9 @@ def main():
     http_thread = threading.Thread(target=start_http, daemon=True)
     http_thread.start()
 
+    _register_saved_audio_output_reresolve()
+    _register_spotify_endpoint_reconcile()
+
     # Restore audio output preference for status/UI only. The selected DAC is
     # opened lazily by _ensure_audio_output_for_playback() on intentional play.
 
@@ -12404,11 +22214,21 @@ def main():
     GLib.timeout_add(2000, _enable_spectrum)
 
     loop = GLib.MainLoop()
+    _install_sigterm_main_loop_handler(loop)
     logger.info("Entering GLib main loop")
     try:
         loop.run()
     except KeyboardInterrupt:
         logger.info("Shutting down runtime")
+    finally:
+        _shutdown_existing_spotify_endpoint("main-loop-exit")
+        try:
+            _shutdown_qobuz_playback_bridge("main-loop-exit")
+        except Exception as exc:
+            logger.debug(
+                "Qobuz bridge shutdown on main-loop exit failed: %s",
+                exc,
+            )
 
 
 if __name__ == "__main__":

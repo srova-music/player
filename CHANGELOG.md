@@ -1,5 +1,44 @@
 # SROVA Changelog
 
+## 2.0 (`2.0-1`) — 2026-09-25
+
+Version 2.0 adds Qobuz as a full online provider alongside TIDAL and expands
+SROVA's provider-aware playback, navigation and recommendation model.
+
+### Added
+
+- Qobuz authentication, catalog and library access, search and lossless playback
+- Qobuz album, artist and track detail flows
+- Qobuz playlists, favorites and lyrics integration
+- contextual TIDAL and Qobuz provider Radio
+- provider-aware Infinite Play and Auto-Mix
+- provider-aware Go To Album
+- optional Spotify Connect endpoint management through Spotify's official Soloist runtime
+- permanent packaging regression coverage for the SROVA 8081 control-port contract
+
+### Improved
+
+- SOURCE 03 now represents the online-provider family, showing TIDAL or QOBUZ
+  with one authenticated provider and ONLINE when both are available
+- Global Search includes Qobuz with provider-aware navigation
+- playlist loading and state presentation
+- Internet Radio Stop behavior and active queue cleanup
+- first-run DAC selection and headless startup behavior
+- Spotify endpoint lifecycle coordination with native-audio ownership
+
+### Packaging and public source
+
+- public source is curated from locked private PSC2 commit
+  `7e9d57aed0293aca85b2a707cf3843dde59bb2e5`
+  without importing private Git history
+- package version is `2.0-1`
+- user-facing version is 2.0
+- default SROVA control port is 8081
+- configured `SROVA_PORT` remains supported where exposed by the runtime
+- canonical installed runtime root is `/opt/srova`
+- downloaded Spotify Soloist artifacts and private Spotify state are excluded
+  from public source custody
+
 ## 1.4 (`1.4-1`) — 2026-08-28
 
 ### Added

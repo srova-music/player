@@ -10,7 +10,23 @@ def _route_block(path, next_path):
     start_marker = f'if self.path == "{path}":'
     end_marker = f'if self.path == "{next_path}":'
     start = BACKEND_SOURCE.index(start_marker)
-    end = BACKEND_SOURCE.index(end_marker, start)
+
+    try:
+        end = BACKEND_SOURCE.index(end_marker, start)
+    except ValueError:
+        # Some routes intentionally expose compatibility aliases through
+        # an ``if self.path in (...)`` block. Locate next_path inside that
+        # tuple and use the tuple statement itself as the route boundary.
+        tuple_member = f'"{next_path}",'
+        member = BACKEND_SOURCE.index(tuple_member, start)
+        end = BACKEND_SOURCE.rfind(
+            "if self.path in (",
+            start,
+            member,
+        )
+        if end < start:
+            raise
+
     return BACKEND_SOURCE[start:end]
 
 

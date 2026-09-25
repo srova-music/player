@@ -1,4 +1,4 @@
-# SROVA runtime dependencies
+# hiresTI Desktop Dependencies
 tidalapi>=0.7.0
 PyGObject>=3.42.0
 requests>=2.28.0

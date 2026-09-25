@@ -110,7 +110,7 @@ def on_album_sort_clicked(self, field):
 
 
 def _update_track_list_icon(self, target_list=None):
-    """Refresh row icons: show ▶ for the active track and numbers for the others."""
+    """刷新列表图标：当前播放的显示 ▶，其他的显示数字"""
     if self.playing_track_id and not getattr(self, "_playing_pulse_source", 0):
         self._playing_pulse_source = GLib.timeout_add(1000, self._tick_playing_row_pulse)
     if not self.playing_track_id and getattr(self, "_playing_pulse_source", 0):

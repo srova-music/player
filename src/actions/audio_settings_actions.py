@@ -1908,7 +1908,7 @@ def on_exclusive_toggled(self, switch, state):
         self._sync_playback_status_icon()
 
     if state:
-
+        # 开启独占：允许在 ALSA（auto） / ALSA（mmap）之间切换。
         prev_driver = _selected_driver_name(self)
         _refresh_driver_dropdown_options(
             self,
@@ -1917,14 +1917,14 @@ def on_exclusive_toggled(self, switch, state):
         )
         self.on_driver_changed(self.driver_dd, None)
     else:
-
+        # 关闭独占：恢复驱动选择
         _refresh_driver_dropdown_options(
             self,
             preferred_driver=_selected_driver_name(self),
             exclusive_enabled=False,
         )
         self.driver_dd.set_sensitive(True)
-
+        # 刷新一下非独占状态下的设备列表
         self.on_device_changed(self.device_dd, None)
     if hasattr(self, "latency_dd") and self.latency_dd is not None:
         self.latency_dd.set_sensitive(_driver_is_alsa_family(_selected_driver_name(self)))

@@ -1169,6 +1169,8 @@ class RustVizCore:
                 here.parent.parent / "src_rust" / "rust_viz_core" / "target" / "release" / "viz_core.dll",
                 # Flatpak
                 Path("/app/share/hiresti/src_rust/rust_viz_core/target/release/libviz_core.so"),
+                # System install
+                Path("/usr/share/hiresti/src_rust/rust_viz_core/target/release/libviz_core.so"),
             ]
         )
         for p in candidates:

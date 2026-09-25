@@ -343,17 +343,11 @@ def test_batch_load_albums_uses_explicit_flow_target_and_token(monkeypatch):
 
     class _FakeGtkImage:
         def __init__(self, *args, **kwargs):
-            self.icon_name = None
-
-        def set_from_icon_name(self, icon_name):
-            self.icon_name = icon_name
+            pass
 
     class _FakeGtkLabel:
         def __init__(self, *args, **kwargs):
-            self.tooltip_text = None
-
-        def set_tooltip_text(self, text):
-            self.tooltip_text = text
+            pass
 
     class _FakeGtkButton:
         def __init__(self, *args, **kwargs):
@@ -462,12 +456,7 @@ def test_batch_load_artists_uses_explicit_flow_target(monkeypatch):
     wrong_flow = _Container()
     app = SimpleNamespace(
         main_flow=wrong_flow,
-        backend=SimpleNamespace(
-            _artist_artwork_cache={},
-            get_artwork_url=lambda *_args, **_kwargs: "",
-            _is_placeholder_artist_artwork_url=lambda *_args, **_kwargs: False,
-            get_artist_artwork_url=lambda *_args, **_kwargs: "",
-        ),
+        backend=SimpleNamespace(get_artist_artwork_url=lambda *_args, **_kwargs: ""),
         cache_dir="/tmp",
         _artists_render_token=7,
     )

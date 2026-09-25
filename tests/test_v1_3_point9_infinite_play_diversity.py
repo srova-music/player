@@ -528,6 +528,7 @@ def test_live_append_uses_diversity_selector_and_records_history(
         limit=4,
         autoplay=False,
         mode="similar_artist",
+        provider="tidal",
     )
 
     assert result["ok"] is True
@@ -610,6 +611,7 @@ def test_recent_persisted_history_changes_next_batch_selection(
         limit=10,
         autoplay=False,
         mode="surprise_me",
+        provider="tidal",
     )
 
     assert result["ok"] is True

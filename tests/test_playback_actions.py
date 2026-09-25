@@ -16,15 +16,7 @@ def _make_app():
     app.current_track_list = [1, 2, 3, 4]
     app.current_track_index = 1
     app.shuffle_indices = []
-    app._generate_shuffle_list = lambda: setattr(
-        app,
-        "shuffle_indices",
-        [
-            idx
-            for idx in range(len(app.current_track_list))
-            if idx != app.current_track_index
-        ],
-    )
+    app._generate_shuffle_list = lambda: setattr(app, "shuffle_indices", [0, 2, 3])
     return app
 
 

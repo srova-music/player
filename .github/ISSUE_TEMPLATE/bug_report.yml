@@ -14,7 +14,7 @@ body:
     id: version
     attributes:
       label: SROVA version
-      placeholder: "Example: 1.0.0 / 1.0-1"
+      placeholder: "Example: 1.0 RC1 / 1.0~rc1-1"
     validations:
       required: true
 

@@ -24,6 +24,11 @@ def prepare_backend(monkeypatch):
     monkeypatch.setattr(backend, "_tidal_infinite_play_enabled", lambda: True)
     monkeypatch.setattr(
         backend,
+        "_effective_infinite_play_provider",
+        lambda: "tidal",
+    )
+    monkeypatch.setattr(
+        backend,
         "_INFINITE_PLAY_GENERATION_LOCK",
         threading.Lock(),
     )
@@ -40,13 +45,14 @@ def test_generation_coordinator_preserves_all_three_infinite_play_modes(
     prepare_backend(monkeypatch)
     calls = []
 
-    def fake_append(seed_id=None, limit=10, autoplay=False, mode=None):
+    def fake_append(seed_id=None, limit=10, autoplay=False, mode=None, provider=None):
         calls.append(
             {
                 "seed_id": seed_id,
                 "limit": limit,
                 "autoplay": autoplay,
                 "mode": mode,
+                "provider": provider,
             }
         )
         return {
@@ -76,6 +82,7 @@ def test_generation_coordinator_preserves_all_three_infinite_play_modes(
             "limit": 10,
             "autoplay": False,
             "mode": mode,
+            "provider": "tidal",
         }
     ]
 
@@ -92,8 +99,10 @@ def test_eos_waits_for_existing_generation_then_plays_first_appended_track(
     proactive_result = {}
     eos_result = {}
 
-    def fake_append(seed_id=None, limit=10, autoplay=False, mode=None):
-        append_calls.append((seed_id, limit, autoplay, mode))
+    def fake_append(seed_id=None, limit=10, autoplay=False, mode=None, provider=None):
+        append_calls.append(
+            (seed_id, limit, autoplay, mode, provider)
+        )
         generation_started.set()
         assert release_generation.wait(timeout=2.0)
         backend.PLAY_QUEUE.append("200")
@@ -162,6 +171,7 @@ def test_eos_waits_for_existing_generation_then_plays_first_appended_track(
     # The EOS path must not create Batch B. It should observe Batch A and
     # play its first item.
     assert len(append_calls) == 1
+    assert append_calls[0][-1] == "tidal"
     assert proactive_result["added"] == 1
     assert eos_result["added"] == 0
     assert eos_result["already_filled"] is True

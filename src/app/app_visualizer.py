@@ -934,7 +934,7 @@ def _schedule_viz_handle_realign(self, animate=True):
 
 def toggle_visualizer(self, btn):
     """
-    [Overlay-compatible version]
+    [Overlay 适配版]
     """
     if bool(getattr(self, "_viz_fullscreen_active", False)):
         self._set_viz_fullscreen(False, restore_drawer=False)
@@ -1011,7 +1011,7 @@ def _set_visualizer_expanded(self, expanded):
     if self._viz_handle_settle_source:
         GLib.source_remove(self._viz_handle_settle_source)
         self._viz_handle_settle_source = 0
-
+    # 触发 Revealer 动画 (上下滑动)
     self.viz_revealer.set_reveal_child(expanded)
     if expanded:
         self._start_viz_handle_follow_transition()
@@ -1059,7 +1059,7 @@ def _set_visualizer_expanded(self, expanded):
         self._set_viz_content_opacity(1.0)
         self._viz_opened_once = True
 
-
+    # 图标切换
     if expanded:
         self.viz_btn.set_icon_name("hiresti-pan-down-symbolic")
         self.viz_btn.add_css_class("active")
