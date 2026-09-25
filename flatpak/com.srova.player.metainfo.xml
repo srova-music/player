@@ -3,63 +3,45 @@
   <id>com.srova.player</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
-
   <name>SROVA</name>
   <summary>Headless audiophile player with bit-perfect output support</summary>
   <icon type="stock">srova</icon>
-
   <developer id="music.srova">
     <name>SROVA Team</name>
   </developer>
-
   <description>
-    <p>
-      SROVA is a headless audiophile music player for Local Music, TIDAL, and Internet Radio.
-      It is designed for bit-perfect playback, dedicated audio systems, and browser-based control
-      from desktops, tablets, and phones on your local network.
-    </p>
-    <p>
-      SROVA starts automatically after installation and after each reboot. Use the Open button to
-      view the local and network browser addresses for your running SROVA server.
-    </p>
-    <p>
-      Features include Local Music library scanning, TIDAL playback, Internet Radio, DAC status,
-      exclusive audio output indicators, and a responsive web interface.
-    </p>
+    <p>SROVA is a headless audiophile music player for Local Music, TIDAL, Qobuz and Internet Radio. It is designed for high-quality native playback, dedicated audio systems and browser-based control.</p>
+    <p>TIDAL and Qobuz share SROVA's online-provider source with provider-aware search, navigation, Radio, playlists and queue behavior.</p>
+    <p>Spotify Connect can optionally be exposed through Spotify's official Soloist endpoint. That external endpoint is separate from SROVA native playback sources.</p>
   </description>
-
   <launchable type="desktop-id">com.srova.player.desktop</launchable>
   <provides>
     <binary>srova</binary>
     <binary>srova-open</binary>
   </provides>
-
   <categories>
     <category>Audio</category>
     <category>AudioVideo</category>
     <category>Player</category>
   </categories>
-
   <url type="homepage">https://srova.music/</url>
   <url type="bugtracker">https://srova.music/</url>
   <url type="help">https://srova.music/</url>
-
   <screenshots>
     <screenshot type="default">
-      <caption>SROVA web interface for local, TIDAL, and radio playback</caption>
+      <caption>SROVA web interface for local, online-provider and radio playback</caption>
       <image>https://srova.music/srova-site/assets/screenshots/srova-desktop-home.png</image>
     </screenshot>
   </screenshots>
-
   <content_rating type="oars-1.1" />
-
   <releases>
-    <release version="1.4-1" date="2026-08-28"/>
-    <release version="1.3-1" date="2026-08-19"/>
-    <release version="1.2-1" date="2026-08-13"/>
-    <release version="1.1-1" date="2026-08-06"/>
-    <release version="1.0-1" date="2026-07-27"/>
-    <release version="1.0~rc2-1" date="2026-07-15"/>
+    <release version="2.0-1" date="2026-09-25" />
+    <release version="1.4-1" date="2026-08-28" />
+    <release version="1.3-1" date="2026-08-19" />
+    <release version="1.2-1" date="2026-08-13" />
+    <release version="1.1-1" date="2026-08-06" />
+    <release version="1.0-1" date="2026-07-27" />
+    <release version="1.0~rc2-1" date="2026-07-15" />
     <release version="1.0~rc1-1" date="2026-07-10">
       <description>
         <p>

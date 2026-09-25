@@ -24,20 +24,12 @@ class _FakeImage:
     def __init__(self, *args, **kwargs):
         self.args = args
         self.kwargs = kwargs
-        self.icon_name = None
-
-    def set_from_icon_name(self, icon_name):
-        self.icon_name = icon_name
 
 
 class _FakeLabel:
     def __init__(self, *args, **kwargs):
         self.label = kwargs.get("label")
         self.kwargs = kwargs
-        self.tooltip_text = None
-
-    def set_tooltip_text(self, text):
-        self.tooltip_text = text
 
 
 class _FakeFlowBoxChild:
@@ -106,7 +98,6 @@ def test_batch_load_albums_adds_artist_and_year_subtitle(monkeypatch):
         backend=SimpleNamespace(get_artwork_url=lambda *_args, **_kwargs: "artwork"),
         cache_dir="/tmp",
         main_flow=_FakeFlow(),
-        show_album_details=lambda *_args, **_kwargs: None,
     )
 
     assert ui_actions.batch_load_albums(app, [album], batch=6) is False
@@ -115,7 +106,7 @@ def test_batch_load_albums_adds_artist_and_year_subtitle(monkeypatch):
     labels = [item for item in child.child.children if isinstance(item, _FakeLabel)]
     assert [label.label for label in labels] == [
         "Mezzanine",
-        "Massive Attack  •  1998",
+        "1998",
     ]
 
 

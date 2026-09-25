@@ -93,13 +93,14 @@ def test_my_music_requires_configured_root():
     )
 
 
-def test_radio_requires_named_saved_dac():
+def test_radio_requires_explicitly_selected_dac():
     radio = function_source("showRadioSource")
     helper = function_source("requireSrovaRadioDac")
 
     assert "requireSrovaRadioDac" in radio
-    assert 'String(data.dac_name || "").trim()' in helper
-    assert 'String(data.alsa_device || "").trim()' in helper
+    assert "data.output_selected === true" in helper
+    assert 'String(data.dac_name || "").trim()' not in helper
+    assert 'String(data.alsa_device || "").trim()' not in helper
     assert "Please go to Settings and select your DAC first." in UI
 
 

@@ -22,12 +22,153 @@ var myAlbumsView  = document.getElementById("myAlbumsView");
 var mySongsView   = document.getElementById("mySongsView");
 var localMusicView = document.getElementById("localMusicView");
 var headerHomeBtn = document.getElementById("headerHomeBtn");
+var nativePlaybackBlocker = document.getElementById("nativePlaybackBlocker");
+var nativePlaybackBlockerStopBtn = document.getElementById(
+    "nativePlaybackBlockerStopBtn"
+);
 
 // Point 9: showView() and currentSourceSection are the shared frontend's
 // authoritative navigation state. Source walls deliberately reuse homeView,
 // so the broad container alone cannot identify the true Home landing view.
 var currentSrovaView = "home";
 var headerHomeNavigationBound = false;
+var spotifyNativeBlocked = null;
+var spotifyNativeBlockState = "";
+var spotifyNativeBlockPollTimer = null;
+var spotifyNativeBlockPollInFlight = false;
+var spotifyNativeBlockStopBusy = false;
+var spotifySettingsStatusSink = null;
+var SPOTIFY_NATIVE_BLOCK_POLL_INTERVAL_MS = 1000;
+var SPOTIFY_NATIVE_BLOCKED_MESSAGE =
+    "SROVA playback is unavailable while Spotify Connect is using the selected DAC.";
+
+function setNativePlaybackBlockerStopBusy(busy) {
+    spotifyNativeBlockStopBusy = !!busy;
+    if (!nativePlaybackBlockerStopBtn) { return; }
+    nativePlaybackBlockerStopBtn.disabled = spotifyNativeBlockStopBusy;
+    nativePlaybackBlockerStopBtn.textContent = spotifyNativeBlockStopBusy
+        ? "STOPPING…"
+        : "STOP SPOTIFY CONNECT";
+}
+
+function syncNativePlaybackBlockerPresentation() {
+    if (!nativePlaybackBlocker) { return; }
+    var transientHandoff = [
+        "acquiring",
+        "releasing",
+        "recovering"
+    ].indexOf(spotifyNativeBlockState) !== -1;
+    var visible = spotifyNativeBlocked === true &&
+        !transientHandoff &&
+        currentSrovaView !== "settings";
+    nativePlaybackBlocker.classList.toggle("hidden", !visible);
+    nativePlaybackBlocker.setAttribute("aria-hidden", visible ? "false" : "true");
+    if (document.body) {
+        document.body.classList.toggle("nativePlaybackBlocked", visible);
+    }
+    if (!visible && spotifyNativeBlockStopBusy) {
+        setNativePlaybackBlockerStopBusy(false);
+    }
+}
+
+function syncSpotifyNativeBlockedFromStatus(status) {
+    if (!status || typeof status.native_blocked !== "boolean") { return false; }
+    spotifyNativeBlocked = status.native_blocked;
+    spotifyNativeBlockState = typeof status.state === "string"
+        ? status.state
+        : "";
+    syncNativePlaybackBlockerPresentation();
+    return true;
+}
+
+function requireNativePlaybackAvailable() {
+    if (spotifyNativeBlocked === true) {
+        showQueueActionToast(SPOTIFY_NATIVE_BLOCKED_MESSAGE, true);
+        return false;
+    }
+    return true;
+}
+
+function pollSpotifyNativeBlockStatus() {
+    if (spotifyNativeBlockPollInFlight || typeof fetch !== "function") { return; }
+    spotifyNativeBlockPollInFlight = true;
+    fetchWithTimeout("/api/spotify/status", {cache: "no-store"}, 4000)
+        .then(function(response) {
+            if (!response.ok) { throw new Error("Spotify status unavailable"); }
+            return response.json();
+        })
+        .then(function(status) {
+            syncSpotifyNativeBlockedFromStatus(status);
+
+            if (
+                currentSrovaView === "settings" &&
+                currentSettingsTab === "spotify" &&
+                typeof spotifySettingsStatusSink === "function"
+            ) {
+                spotifySettingsStatusSink(status);
+            }
+        })
+        .catch(function() {
+            // Preserve the last authoritative native_blocked value.
+        })
+        .then(function() {
+            spotifyNativeBlockPollInFlight = false;
+        });
+}
+
+function startSpotifyNativeBlockPolling() {
+    if (spotifyNativeBlockPollTimer !== null) { return; }
+    pollSpotifyNativeBlockStatus();
+    spotifyNativeBlockPollTimer = window.setInterval(
+        pollSpotifyNativeBlockStatus,
+        SPOTIFY_NATIVE_BLOCK_POLL_INTERVAL_MS
+    );
+}
+
+function stopSpotifyConnectFromNativeBlocker() {
+    if (spotifyNativeBlockStopBusy || spotifyNativeBlocked !== true) { return; }
+
+    setNativePlaybackBlockerStopBusy(true);
+
+    fetchWithTimeout(
+        "/api/spotify/deactivate",
+        {
+            method: "POST",
+            cache: "no-store"
+        },
+        10000
+    )
+        .then(function(response) {
+            if (!response.ok) {
+                throw new Error("spotify_deactivate_request_failed");
+            }
+            return response.json();
+        })
+        .then(function(data) {
+            if (!data || data.ok !== true) {
+                throw new Error("spotify_deactivate_failed");
+            }
+            pollSpotifyNativeBlockStatus();
+        })
+        .catch(function() {
+            setNativePlaybackBlockerStopBusy(false);
+            showQueueActionToast(
+                "Spotify Connect could not be stopped. Disconnect this device in Spotify or try again.",
+                true
+            );
+        });
+}
+
+function initNativePlaybackBlocker() {
+    if (nativePlaybackBlockerStopBtn) {
+        nativePlaybackBlockerStopBtn.addEventListener(
+            "click",
+            stopSpotifyConnectFromNativeBlocker
+        );
+    }
+    syncNativePlaybackBlockerPresentation();
+    startSpotifyNativeBlockPolling();
+}
 
 function isTrueHomeLandingViewActive() {
     var nowPlayingOpen = nowPlayingView &&
@@ -84,6 +225,7 @@ var albumTitle    = document.getElementById("albumTitle");
 var albumArtist   = document.getElementById("albumArtist");
 var albumTechInfo = document.getElementById("albumTechInfo");
 var albumStatsLine = document.getElementById("albumStatsLine");
+var albumSourceLabel = document.getElementById("albumSourceLabel");
 var trackList     = document.getElementById("trackList");
 
 var playerBar    = document.getElementById("playerBar");
@@ -118,8 +260,16 @@ var radioIdleStandbyApplied = false;
 var radioIdleStandbyDueAt = 0;
 var radioIdleStandbyRequestInFlight = false;
 var lastKnownPlaybackStatus = null;
+var lastKnownHomeHeroStatus = null;
 var currentSourceSection = "";
+var currentStreamingProvider = "tidal";
+var qobuzSourceUiGeneration = 0;
 var playerBarActivePlaybackSource = "";
+var q10bInfinitePlayTransitionActive = false;
+var q10bInfinitePlayTransitionVisible = false;
+var q10bInfinitePlayTransitionBackendPendingSeen = false;
+var q10bInfinitePlayTransitionReleaseReady = false;
+var q10bInfinitePlayTransitionStartTrackId = "";
 var playerHasActiveMedia = false;
 var homeHeroNowPlayingStateKey = "";
 var homeHeroNowPlayingToken = 0;
@@ -201,9 +351,12 @@ var onlineSourcePollTimer = null;
 var ONLINE_SOURCE_OFFLINE_MESSAGE = "You are offline. Local Music remains available.";
 var globalSearchRequestedVisible = false;
 var globalSearchTidalReady = false;
+var globalSearchQobuzReady = false;
 var globalSearchLocalReady = false;
 var globalSearchTidalRequestSerial = 0;
+var globalSearchQobuzRequestSerial = 0;
 var globalSearchLocalRequestSerial = 0;
+var globalSearchRequestSerial = 0;
 
 function fetchWithTimeout(url, options, timeoutMs) {
     options = options || {};
@@ -222,7 +375,11 @@ function fetchWithTimeout(url, options, timeoutMs) {
 }
 
 function globalSearchHasReadySource() {
-    return !!(globalSearchTidalReady || globalSearchLocalReady);
+    return !!(
+        globalSearchTidalReady ||
+        globalSearchQobuzReady ||
+        globalSearchLocalReady
+    );
 }
 
 function applyGlobalSearchTidalStatus(data) {
@@ -239,6 +396,74 @@ function applyGlobalSearchTidalStatus(data) {
 function applyGlobalSearchLocalStatus(data) {
     globalSearchLocalReady = !!(data && data.search_ready === true);
     setGlobalSearchVisible(globalSearchRequestedVisible);
+}
+
+function applyGlobalSearchQobuzStatus(data) {
+    data = data || {};
+
+    globalSearchQobuzReady = !!(
+        data.authenticated === true &&
+        data.usable === true &&
+        onlineSourcesAvailable
+    );
+
+    setGlobalSearchVisible(
+        globalSearchRequestedVisible
+    );
+}
+
+
+function refreshGlobalSearchQobuzAvailability() {
+    var requestSerial =
+        ++globalSearchQobuzRequestSerial;
+
+    return fetchWithTimeout(
+        "/qobuz/status?_=" +
+        encodeURIComponent(
+            String(
+                Date.now()
+            )
+        ),
+        {
+            cache: "no-store"
+        },
+        4000
+    )
+    .then(function(res) {
+        if (!res.ok) {
+            throw new Error(
+                "Qobuz status unavailable"
+            );
+        }
+
+        return res.json();
+    })
+    .then(function(data) {
+        if (
+            requestSerial !==
+            globalSearchQobuzRequestSerial
+        ) {
+            return null;
+        }
+
+        applyGlobalSearchQobuzStatus(
+            data || {}
+        );
+
+        return data || {};
+    })
+    .catch(function() {
+        if (
+            requestSerial !==
+            globalSearchQobuzRequestSerial
+        ) {
+            return null;
+        }
+
+        applyGlobalSearchQobuzStatus({});
+
+        return null;
+    });
 }
 
 function refreshGlobalSearchTidalAvailability() {
@@ -290,6 +515,7 @@ function refreshGlobalSearchLocalAvailability() {
 function refreshGlobalSearchAvailability() {
     return Promise.all([
         refreshGlobalSearchTidalAvailability(),
+        refreshGlobalSearchQobuzAvailability(),
         refreshGlobalSearchLocalAvailability()
     ]);
 }
@@ -305,11 +531,29 @@ function applyOnlineSourceAvailability(online) {
         input.disabled = !onlineSourcesAvailable;
         input.placeholder = onlineSourcesAvailable ? "Search TIDAL..." : ONLINE_SOURCE_OFFLINE_MESSAGE;
     }
+
+    var qobuzInput =
+        document.getElementById(
+            "qobuzSourceSearchInput"
+        );
+
+    if (qobuzInput) {
+        qobuzInput.disabled =
+            !onlineSourcesAvailable;
+
+        qobuzInput.placeholder =
+            onlineSourcesAvailable
+                ? "Search Qobuz..."
+                : ONLINE_SOURCE_OFFLINE_MESSAGE;
+    }
+
     if (!onlineSourcesAvailable) {
         globalSearchTidalReady = false;
+        globalSearchQobuzReady = false;
         setGlobalSearchVisible(globalSearchRequestedVisible);
     } else if (!wasOnline && globalSearchRequestedVisible) {
         refreshGlobalSearchTidalAvailability();
+        refreshGlobalSearchQobuzAvailability();
     }
     if (wasOnline && !onlineSourcesAvailable && lastKnownPlaybackStatus) {
         var source = String(lastKnownPlaybackStatus.source || "").toLowerCase();
@@ -447,6 +691,7 @@ function setupArtworkFallback(img) {
 setupArtworkFallback(playerArt);
 setupArtworkFallback(nowPlayingArt);
 setupArtworkFallback(document.getElementById("vpbArt"));
+setupArtworkFallback(albumArt);
 
 var loginModal   = document.getElementById("loginModal");
 var loginWaiting = document.getElementById("loginWaiting");
@@ -479,6 +724,7 @@ var _radioSourcePreparationFresh = false;
 var _radioSourcePreparationTimedOut = false;
 var _radioSourceShowRequest = 0;
 var _radioSourcePendingAttachRequest = 0;
+var _tidalRadioSourceRequest = 0;
 var SROVA_STANDBY_ART = "/ui_web/assets/srova-square-logo.png";
 if (_addRadioModal) {
     _addRadioModal.addEventListener("click", function(e) {
@@ -499,6 +745,18 @@ var tidalInfinitePlayMode = "similar_artist";
 var tidalInfinitePlayLastfmConnected = null;
 var tidalInfinitePlayRefillInFlight = false;
 var tidalInfinitePlayLastRefillKey = "";
+
+/* Q9D — saved provider preferences used only by Settings presentation.
+   Runtime fallback remains backend-owned by Q9B/Q9C effective-provider helpers. */
+var q9dInfinitePlayProvider = "tidal";
+var q9dAutoMixProvider = "tidal";
+var q10cPlaylistMaintenanceProvider = "tidal";
+var q9dProviderSaveInFlight = {
+    infinite_play: false,
+    automix: false,
+    playlist_maintenance: false
+};
+
 var pendingSessionPositionResetTrackId = "";
 var pendingSessionPositionResetExpiresAt = 0;
 var resumeVisualGuardUntil = 0;
@@ -518,6 +776,14 @@ var previousView      = "home";
 var lastTidalSourceSearchQuery = "";
 var lastTidalSourceSearchPayload = null;
 var currentTidalSourceSearchTab = "top";
+
+var lastQobuzSourceSearchQuery = "";
+var lastQobuzSourceSearchPayload = null;
+var currentQobuzSourceSearchTab = "top";
+var qobuzSourceSearchRequestSerial = 0;
+var QOBUZ_SOURCE_SEARCH_LIMIT = 30;
+
+var qobuzLibraryFullViewGeneration = 0;
 
 var lastSearchQuery   = "";
 var lastSearchTab     = "top";
@@ -544,10 +810,16 @@ var nowPlayingAlbumResolved = null;
 var nowPlayingAlbumWatchKey = "";
 var nowPlayingAlbumWatchSerial = 0;
 var nowPlayingAlbumReturnState = null;
+var nowPlayingAlbumProviderMenu = null;
+var q10fQobuzAuthenticated = null;
 
 var searchTimer    = null;
 var loginPollTimer = null;
 var _tidalLoginReturnToSettings = false;
+var _loginModalProvider = "tidal";
+var qobuzLoginPollTimer = null;
+var _qobuzLoginAttemptId = "";
+var _qobuzLoginReturnToSettings = false;
 var playlistsLoaded = false;
 progressFill._elapsed = 0;
 
@@ -707,6 +979,7 @@ function refreshArtworkViewMode() {
 var lastTechText  = "";
 var lastTechClass = "hidden";
 var localAlbumDetailTechState = null;
+var qobuzAlbumCatalogTechState = null;
 var currentDacName = "";
 var currentDacLocked = true;
 var currentBitPerfect = false;
@@ -730,12 +1003,24 @@ var favTrackIds  = {};
 var favAlbumIds  = {};
 var favArtistIds = {};
 
+// Q10I: native Qobuz Favorites are deliberately provider-separated.
+// Never allow a numeric TIDAL/Qobuz ID collision to share state.
+var qobuzFavTrackIds  = {};
+var qobuzFavAlbumIds  = {};
+var qobuzFavArtistIds = {};
+
+var qobuzFavoriteIdsLoaded = false;
+var qobuzFavoriteIdsRequestSerial = 0;
+var qobuzFavoriteIdsLoadPromise = null;
+var qobuzFavoriteMutationSerial = {};
+
 // Playback source tracking -- set at every queue/replace entry point
 var playbackSource = { type: "", id: "", title: "" };
 var currentRadioPlayingFromName = "";
 
 // Artist page state
 var _artistPageRestoreFn = null;   // called by goBack() when previousView === "artistpage"
+var _qobuzRadioReturnFn = null;  // H4 contextual Qobuz Radio return target.
 var _artistDiscogSort    = "default";  // "default" (Tidal order) or "date"
 
 function _setPlaybackSource(type, id, title) {
@@ -791,6 +1076,12 @@ function setCurrentSourceSection(source) {
     syncRadioSourceSectionState();
 }
 
+function setCurrentStreamingProvider(provider) {
+    provider = String(provider || "").toLowerCase();
+    currentStreamingProvider = provider === "qobuz" ? "qobuz" : "tidal";
+    updatePlayerInfinitePlayControl();
+}
+
 function setPlayerBarActivePlaybackSource(source) {
     playerBarActivePlaybackSource = source || "";
     syncPlayerBarRadioProgressState();
@@ -801,20 +1092,169 @@ function inferStatusPlaybackSource(s) {
     s = s || {};
     var source = String(s.source || "").toLowerCase();
     var contextType = String(s.context_type || "").toLowerCase();
+    var trackId = String(s.current_track_id || "").toLowerCase();
+
     if (s.radio_mode || source === "radio" || contextType === "radio") { return "radio"; }
+
+    // Explicit provider identity is authoritative.
+    if (source === "qobuz") { return "qobuz"; }
     if (source === "tidal") { return "tidal"; }
     if (source === "local") { return "local"; }
-    if (String(s.current_track_id || "").indexOf("local:") === 0) { return "local"; }
+
+    // Canonical provider IDs protect presentation when an older or partial
+    // status payload does not yet expose its source field.
+    if (trackId.indexOf("qobuz:") === 0) { return "qobuz"; }
+    if (trackId.indexOf("local:") === 0 || trackId.indexOf("local-test:") === 0) { return "local"; }
+
+    if (contextType === "qobuz" || contextType.indexOf("qobuz_") === 0) { return "qobuz"; }
     if (contextType === "local" || contextType === "local_album" || contextType === "local_queue") { return "local"; }
+
+    // Locked compatibility: historical unprefixed cloud playback remains
+    // TIDAL unless Qobuz identity is positively established above.
     return "tidal";
 }
 
+function q10bBeginInfinitePlayTransitionFreeze() {
+    /*
+     * Capture the currently committed visibility before Qobuz transition
+     * transport truth changes `playing` to false.
+     *
+     * Rapid replacement requests intentionally do not recalculate this:
+     * visibility remains frozen to the last actually committed generation.
+     */
+    if (q10bInfinitePlayTransitionActive) {
+        return;
+    }
+
+    q10bInfinitePlayTransitionVisible =
+        shouldShowInfinitePlayUi(
+            !!tidalInfinitePlayEnabled
+        );
+
+    q10bInfinitePlayTransitionActive = true;
+    q10bInfinitePlayTransitionBackendPendingSeen = false;
+    q10bInfinitePlayTransitionReleaseReady = false;
+    q10bInfinitePlayTransitionStartTrackId = String(
+        (
+            lastKnownPlaybackStatus &&
+            lastKnownPlaybackStatus.current_track_id
+        ) || ""
+    );
+}
+
+
+function q10bClearInfinitePlayTransitionFreeze() {
+    q10bInfinitePlayTransitionActive = false;
+    q10bInfinitePlayTransitionVisible = false;
+    q10bInfinitePlayTransitionBackendPendingSeen = false;
+    q10bInfinitePlayTransitionReleaseReady = false;
+    q10bInfinitePlayTransitionStartTrackId = "";
+}
+
+
+function q10bSyncInfinitePlayTransitionFromStatus(s) {
+    s = s || {};
+
+    /*
+     * EOS can enter Qobuz replacement without `_onTrackChange()`.
+     * If backend pending is the first signal, capture the still-committed
+     * frontend visibility before the pending branch changes `playing`.
+     */
+    if (!q10bInfinitePlayTransitionActive) {
+        if (s.qobuz_replacement_pending === true) {
+            q10bInfinitePlayTransitionVisible =
+                shouldShowInfinitePlayUi(
+                    !!tidalInfinitePlayEnabled
+                );
+
+            q10bInfinitePlayTransitionActive = true;
+            q10bInfinitePlayTransitionBackendPendingSeen = true;
+            q10bInfinitePlayTransitionReleaseReady = false;
+            q10bInfinitePlayTransitionStartTrackId =
+                String(currentPlayingId || "");
+        }
+        return;
+    }
+
+    if (s.qobuz_replacement_pending === true) {
+        q10bInfinitePlayTransitionBackendPendingSeen = true;
+        q10bInfinitePlayTransitionReleaseReady = false;
+        return;
+    }
+
+    var statusValid = (
+        s.current_track_valid !== false &&
+        s.playback_state !== "idle"
+    );
+
+    var statusSource =
+        inferStatusPlaybackSource(s);
+
+    var statusTrackId =
+        String(s.current_track_id || "");
+
+    var committedDifferentQobuzTrack = !!(
+        statusValid &&
+        statusSource === "qobuz" &&
+        statusTrackId &&
+        q10bInfinitePlayTransitionStartTrackId &&
+        statusTrackId !== q10bInfinitePlayTransitionStartTrackId
+    );
+
+    var terminalState = !!(
+        !statusValid ||
+        statusSource !== "qobuz"
+    );
+
+    /*
+     * Failure, real idle or provider departure may clear immediately.
+     * There is no committed Qobuz presentation to finish rendering.
+     */
+    if (terminalState) {
+        q10bClearInfinitePlayTransitionFreeze();
+        return;
+    }
+
+    /*
+     * Hardware commit has occurred. Do NOT clear the latch here:
+     * pollStatus still has the previous frontend `playing` state and the
+     * previous player-bar provider at this point.
+     *
+     * The latch is released only after those committed fields have been
+     * rendered later in the same poll pass.
+     */
+    if (
+        (
+            q10bInfinitePlayTransitionBackendPendingSeen ||
+            committedDifferentQobuzTrack
+        ) &&
+        statusValid &&
+        statusSource === "qobuz" &&
+        !!s.playing
+    ) {
+        q10bInfinitePlayTransitionReleaseReady = true;
+    }
+}
+
+
 function shouldShowInfinitePlayUi(enabled) {
     if (!enabled) { return false; }
-    if (playerHasActiveMedia) {
-        return playerBarActivePlaybackSource === "tidal";
+
+    var status = lastKnownPlaybackStatus || {};
+    var effectiveProvider = String(
+        status.infinite_play_effective_provider || ""
+    ).trim().toLowerCase();
+
+    if (effectiveProvider !== "tidal" && effectiveProvider !== "qobuz") {
+        return false;
     }
-    return currentSourceSection === "tidal";
+
+    if (playerHasActiveMedia) {
+        return playerBarActivePlaybackSource === effectiveProvider;
+    }
+
+    return currentSourceSection === "streaming" &&
+        currentStreamingProvider === effectiveProvider;
 }
 
 function syncPlayerInfinitePlayPhoneTrayPlacement() {
@@ -1072,25 +1512,58 @@ function setAlbumViewKind(kind) {
     albumView.classList.remove("tidalTrackDetail");
     albumView.classList.remove("tidalArtistDetail");
     albumView.classList.remove("tidalFeaturedTrackList");
+    albumView.classList.remove("providerRadioDetail");
     if (kind === "local") {
         albumView.classList.add("localAlbumDetail");
         albumView.classList.toggle("localMusicLocked", isLocalLibraryMaintenance());
     } else {
         localAlbumDetailTechState = null;
     }
-    if (kind === "tidal-album") {
+    if (kind === "tidal-album" || kind === "qobuz-album") {
         albumView.classList.add("tidalAlbumDetail");
         albumView.classList.add("tidalTrackDetail");
-    } else if (kind === "tidal-detail") {
+    } else if (
+        kind === "tidal-detail" ||
+        kind === "qobuz-track"
+    ) {
         albumView.classList.add("tidalTrackDetail");
-    } else if (kind === "tidal-artist") {
+    } else if (
+        kind === "tidal-artist" ||
+        kind === "qobuz-artist"
+    ) {
         albumView.classList.add("tidalArtistDetail");
     } else if (kind === "tidal-featured-tracks") {
         albumView.classList.add("tidalFeaturedTrackList");
     }
+    if (kind !== "qobuz-album") {
+        qobuzAlbumCatalogTechState = null;
+    }
+
     if (kind !== "local" && albumStatsLine) {
         albumStatsLine.textContent = "";
         albumStatsLine.className = "hidden";
+    }
+
+    if (albumSourceLabel) {
+        var sourceLabel = "";
+
+        if (kind === "local") {
+            sourceLabel = "MUSIC";
+        } else if (kind === "tidal-album") {
+            sourceLabel = "TIDAL";
+        } else if (
+            kind === "qobuz-album" ||
+            kind === "qobuz-artist" ||
+            kind === "qobuz-track"
+        ) {
+            sourceLabel = "QOBUZ";
+        }
+
+        albumSourceLabel.textContent = sourceLabel;
+        albumSourceLabel.className =
+            sourceLabel
+                ? "albumSourceLabel"
+                : "hidden";
     }
 }
 
@@ -1111,6 +1584,44 @@ function restoreLocalAlbumDetailTechInfo() {
     }
     return true;
 }
+
+function isQobuzAlbumDetailVisible() {
+    return albumView &&
+        currentViewEndpoint &&
+        currentViewEndpoint.indexOf("qobuz:album:") === 0 &&
+        albumView.style.display !== "none";
+}
+
+function restoreQobuzAlbumCatalogTechInfo() {
+    if (
+        !isQobuzAlbumDetailVisible() ||
+        !albumTechInfo ||
+        !qobuzAlbumCatalogTechState
+    ) {
+        return false;
+    }
+
+    if (qobuzAlbumCatalogTechState.text) {
+        albumTechInfo.textContent =
+            qobuzAlbumCatalogTechState.text;
+
+        albumTechInfo.className =
+            qobuzAlbumCatalogTechState.className;
+    } else {
+        albumTechInfo.textContent = "";
+        albumTechInfo.className = "hidden";
+    }
+
+    return true;
+}
+
+function restoreOwnedAlbumDetailTechInfo() {
+    return (
+        restoreLocalAlbumDetailTechInfo() ||
+        restoreQobuzAlbumCatalogTechInfo()
+    );
+}
+
 
 function localAlbumArtDataUri(title, artist) {
     var mark = escapeHtml(localInitials(title || artist || "S").slice(0, 2));
@@ -1387,7 +1898,14 @@ function syncNowPlayingButtons() {
 
 
 
+function closeNowPlayingAlbumProviderMenu() {
+    if (!nowPlayingAlbumProviderMenu) { return; }
+    nowPlayingAlbumProviderMenu.classList.add("hidden");
+    nowPlayingAlbumProviderMenu.setAttribute("aria-hidden", "true");
+}
+
 function hideNowPlayingAlbumAction() {
+    closeNowPlayingAlbumProviderMenu();
     nowPlayingAlbumResolved = null;
     if (npBtnAlbum) {
         npBtnAlbum.classList.add("hidden");
@@ -1399,8 +1917,19 @@ function nowPlayingAlbumWatchSignature(s) {
     var source = inferStatusPlaybackSource(s);
     var radio = s.radio_metadata || {};
     var station = s.radio_station || {};
+    var qobuzAuth = (
+        q10fQobuzAuthenticated === true
+            ? "qobuz-in"
+            : (
+                q10fQobuzAuthenticated === false
+                    ? "qobuz-out"
+                    : "qobuz-unknown"
+            )
+    );
+
     return [
         s.logged_in === true ? "logged-in" : "logged-out",
+        qobuzAuth,
         source || "",
         String(s.current_track_id || s.track_id || ""),
         String(s.context_id || ""),
@@ -1415,12 +1944,53 @@ function nowPlayingAlbumWatchSignature(s) {
     ].join("\0");
 }
 
+function q10fNormalizeAlbumDestination(
+    provider,
+    data,
+    latest
+) {
+    data = data || {};
+    latest = latest || {};
+
+    var albumId = String(
+        data.album_id || ""
+    ).trim();
+
+    if (
+        data.available !== true ||
+        !albumId
+    ) {
+        return null;
+    }
+
+    return {
+        provider: provider,
+        albumId: albumId,
+        albumTitle: String(
+            data.album_title ||
+            latest.album ||
+            ""
+        ).trim(),
+        albumArtist: String(
+            data.album_artist ||
+            latest.artist ||
+            ""
+        ).trim(),
+        albumCover: String(
+            data.album_cover ||
+            latest.cover ||
+            latest.radio_cover_art_url ||
+            ""
+        ).trim()
+    };
+}
+
 function syncNowPlayingAlbumWatcher(s) {
     if (!npBtnAlbum) { return; }
 
     s = s || {};
+
     var valid = (
-        s.logged_in === true &&
         s.current_track_valid !== false &&
         s.playback_state !== "idle"
     );
@@ -1432,55 +2002,96 @@ function syncNowPlayingAlbumWatcher(s) {
         return;
     }
 
-    var signature = nowPlayingAlbumWatchSignature(s);
-    if (!signature || signature === nowPlayingAlbumWatchKey) {
+    var signature =
+        nowPlayingAlbumWatchSignature(s);
+
+    if (
+        !signature ||
+        signature === nowPlayingAlbumWatchKey
+    ) {
         return;
     }
 
     nowPlayingAlbumWatchKey = signature;
     var serial = ++nowPlayingAlbumWatchSerial;
+
     hideNowPlayingAlbumAction();
 
     fetchWithTimeout(
-        "/tidal/now-playing-album",
+        "/now-playing-albums",
         {cache: "no-store"},
         8000
     )
-    .then(function(res) { return res.json(); })
+    .then(function(res) {
+        if (!res.ok) {
+            throw new Error(
+                "Go To Album resolution failed"
+            );
+        }
+        return res.json();
+    })
     .then(function(data) {
-        if (serial !== nowPlayingAlbumWatchSerial) { return; }
-        if (signature !== nowPlayingAlbumWatchKey) { return; }
+        if (
+            serial !== nowPlayingAlbumWatchSerial
+        ) {
+            return;
+        }
 
-        var latest = lastKnownPlaybackStatus || {};
-        if (nowPlayingAlbumWatchSignature(latest) !== signature) { return; }
+        if (
+            signature !== nowPlayingAlbumWatchKey
+        ) {
+            return;
+        }
+
+        var latest =
+            lastKnownPlaybackStatus || {};
+
+        if (
+            nowPlayingAlbumWatchSignature(
+                latest
+            ) !== signature
+        ) {
+            return;
+        }
 
         data = data || {};
-        var albumId = String(data.album_id || "").trim();
-        if (data.available !== true || !albumId) {
+
+        var tidal = q10fNormalizeAlbumDestination(
+            "tidal",
+            data.tidal,
+            latest
+        );
+
+        var qobuz = q10fNormalizeAlbumDestination(
+            "qobuz",
+            data.qobuz,
+            latest
+        );
+
+        if (!tidal && !qobuz) {
             hideNowPlayingAlbumAction();
             return;
         }
 
         nowPlayingAlbumResolved = {
             signature: signature,
-            albumId: albumId,
-            albumTitle: String(data.album_title || latest.album || "").trim(),
-            albumArtist: String(data.album_artist || latest.artist || "").trim(),
-            albumCover: String(
-                data.album_cover ||
-                latest.cover ||
-                latest.radio_cover_art_url ||
-                ""
-            ).trim()
+            tidal: tidal,
+            qobuz: qobuz
         };
-        npBtnAlbum.classList.remove("hidden");
+
+        npBtnAlbum.classList.remove(
+            "hidden"
+        );
     })
     .catch(function() {
-        if (serial === nowPlayingAlbumWatchSerial) {
+        if (
+            serial === nowPlayingAlbumWatchSerial
+        ) {
             hideNowPlayingAlbumAction();
         }
     });
 }
+
 
 function copyNowPlayingPlaybackSource() {
     return {
@@ -1564,50 +2175,359 @@ function applyNowPlayingPlaybackContextFromStatus(s) {
     };
 }
 
-function openNowPlayingResolvedAlbum() {
-    var resolved = nowPlayingAlbumResolved;
-    var status = lastKnownPlaybackStatus || {};
+function ensureNowPlayingAlbumProviderMenu() {
+    if (nowPlayingAlbumProviderMenu) {
+        return nowPlayingAlbumProviderMenu;
+    }
+
+    var menu = document.createElement("div");
+    menu.id = "nowPlayingAlbumProviderMenu";
+    menu.className =
+        "nowPlayingAlbumProviderMenu hidden";
+    menu.setAttribute("role", "menu");
+    menu.setAttribute(
+        "aria-label",
+        "Choose album provider"
+    );
+    menu.setAttribute(
+        "aria-hidden",
+        "true"
+    );
+
+    ["tidal", "qobuz"].forEach(
+        function(provider) {
+            var btn =
+                document.createElement(
+                    "button"
+                );
+
+            btn.type = "button";
+            btn.className =
+                "playerInfinitePlayMenuBtn " +
+                "nowPlayingAlbumProviderMenuBtn";
+
+            btn.setAttribute(
+                "data-provider",
+                provider
+            );
+            btn.setAttribute(
+                "role",
+                "menuitem"
+            );
+
+            btn.textContent =
+                provider === "qobuz"
+                    ? "QOBUZ"
+                    : "TIDAL";
+
+            btn.addEventListener(
+                "click",
+                function(e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    closeNowPlayingAlbumProviderMenu();
+                    openNowPlayingAlbumDestination(
+                        provider
+                    );
+                }
+            );
+
+            menu.appendChild(btn);
+        }
+    );
+
+    document.body.appendChild(menu);
+
+    document.addEventListener(
+        "click",
+        function(e) {
+            if (
+                !nowPlayingAlbumProviderMenu ||
+                nowPlayingAlbumProviderMenu.classList.contains(
+                    "hidden"
+                )
+            ) {
+                return;
+            }
+
+            if (
+                nowPlayingAlbumProviderMenu.contains(
+                    e.target
+                ) ||
+                e.target === npBtnAlbum ||
+                (
+                    npBtnAlbum &&
+                    npBtnAlbum.contains(e.target)
+                )
+            ) {
+                return;
+            }
+
+            closeNowPlayingAlbumProviderMenu();
+        }
+    );
+
+    window.addEventListener(
+        "resize",
+        closeNowPlayingAlbumProviderMenu
+    );
+
+    nowPlayingAlbumProviderMenu = menu;
+    return menu;
+}
+
+function showNowPlayingAlbumProviderMenu() {
+    if (!npBtnAlbum) { return; }
+
+    var menu =
+        ensureNowPlayingAlbumProviderMenu();
+
+    menu.classList.remove("hidden");
+    menu.setAttribute(
+        "aria-hidden",
+        "false"
+    );
+
+    Array.prototype.forEach.call(
+        menu.querySelectorAll(
+            "[data-provider]"
+        ),
+        function(btn) {
+            var provider = btn.getAttribute(
+                "data-provider"
+            );
+            var available = !!(
+                nowPlayingAlbumResolved &&
+                nowPlayingAlbumResolved[
+                    provider
+                ]
+            );
+
+            btn.classList.toggle(
+                "hidden",
+                !available
+            );
+        }
+    );
+
+    var anchorRect =
+        npBtnAlbum.getBoundingClientRect();
+
+    var menuRect =
+        menu.getBoundingClientRect();
+
+    var viewportWidth =
+        window.innerWidth ||
+        document.documentElement.clientWidth ||
+        320;
+
+    var viewportHeight =
+        window.innerHeight ||
+        document.documentElement.clientHeight ||
+        480;
+
+    var menuWidth =
+        menuRect.width || 188;
+
+    var menuHeight =
+        menuRect.height || 82;
+
+    var left = Math.max(
+        8,
+        Math.min(
+            viewportWidth - menuWidth - 8,
+            anchorRect.right - menuWidth
+        )
+    );
+
+    var top =
+        anchorRect.bottom + 8;
+
+    if (
+        top + menuHeight >
+        viewportHeight - 8
+    ) {
+        top = Math.max(
+            8,
+            anchorRect.top -
+            menuHeight -
+            8
+        );
+    }
+
+    menu.style.left =
+        Math.round(left) + "px";
+
+    menu.style.top =
+        Math.round(top) + "px";
+}
+
+function q10fNowPlayingDestinationCount(
+    resolved
+) {
+    resolved = resolved || {};
+    var count = 0;
+    if (resolved.tidal) { count += 1; }
+    if (resolved.qobuz) { count += 1; }
+    return count;
+}
+
+function openNowPlayingAlbumDestination(
+    provider
+) {
+    provider = String(
+        provider || ""
+    ).toLowerCase();
+
+    var resolved =
+        nowPlayingAlbumResolved;
+
+    var status =
+        lastKnownPlaybackStatus || {};
 
     if (
         !resolved ||
-        !resolved.albumId ||
-        resolved.signature !== nowPlayingAlbumWatchSignature(status)
+        resolved.signature !==
+            nowPlayingAlbumWatchSignature(
+                status
+            )
     ) {
         hideNowPlayingAlbumAction();
-        syncNowPlayingAlbumWatcher(status);
+        syncNowPlayingAlbumWatcher(
+            status
+        );
+        return;
+    }
+
+    var destination =
+        resolved[provider];
+
+    if (
+        !destination ||
+        !destination.albumId
+    ) {
         return;
     }
 
     nowPlayingAlbumReturnState = {
-        underlyingView: nowPlayingFromView || "home",
-        signature: resolved.signature,
-        playbackSource: copyNowPlayingPlaybackSource(),
-        currentContext: copyNowPlayingCurrentContext()
+        underlyingView:
+            nowPlayingFromView || "home",
+        signature:
+            resolved.signature,
+        playbackSource:
+            copyNowPlayingPlaybackSource(),
+        currentContext:
+            copyNowPlayingCurrentContext()
     };
 
+    closeNowPlayingAlbumProviderMenu();
     closeMetaPanel();
     closeLyricsPanel();
     closeVuPanel();
 
-    nowPlayingView.classList.add("hidden");
-    document.body.classList.remove("nowPlayingOpen");
+    nowPlayingView.classList.add(
+        "hidden"
+    );
 
-    // Restore the view that was underneath Now Playing before using the normal
-    // album detail renderer. The album renderer may temporarily set browsing
-    // context; the Back path below restores the live playback context.
-    showView(nowPlayingAlbumReturnState.underlyingView);
+    document.body.classList.remove(
+        "nowPlayingOpen"
+    );
+
+    showView(
+        nowPlayingAlbumReturnState
+            .underlyingView
+    );
+
+    if (provider === "qobuz") {
+        loadQobuzAlbumDetail(
+            destination.albumId,
+            {
+                album_id:
+                    destination.albumId,
+                id:
+                    destination.albumId,
+                title:
+                    destination.albumTitle ||
+                    "Qobuz Album",
+                name:
+                    destination.albumTitle ||
+                    "Qobuz Album",
+                artist:
+                    destination.albumArtist ||
+                    "",
+                cover:
+                    destination.albumCover ||
+                    "",
+                image_url:
+                    destination.albumCover ||
+                    ""
+            },
+            "nowplaying"
+        );
+        return;
+    }
 
     loadTrackList(
         {
-            id: resolved.albumId,
-            cover: resolved.albumCover || "",
-            title: resolved.albumTitle || "TIDAL Album",
-            artist: resolved.albumArtist || ""
+            id:
+                destination.albumId,
+            cover:
+                destination.albumCover ||
+                "",
+            title:
+                destination.albumTitle ||
+                "TIDAL Album",
+            artist:
+                destination.albumArtist ||
+                ""
         },
-        "/tidal/album/" + resolved.albumId,
+        "/tidal/album/" +
+            destination.albumId,
         "nowplaying"
     );
 }
+
+function openNowPlayingResolvedAlbum() {
+    var resolved =
+        nowPlayingAlbumResolved;
+
+    var status =
+        lastKnownPlaybackStatus || {};
+
+    if (
+        !resolved ||
+        resolved.signature !==
+            nowPlayingAlbumWatchSignature(
+                status
+            ) ||
+        q10fNowPlayingDestinationCount(
+            resolved
+        ) === 0
+    ) {
+        hideNowPlayingAlbumAction();
+        syncNowPlayingAlbumWatcher(
+            status
+        );
+        return;
+    }
+
+    var count =
+        q10fNowPlayingDestinationCount(
+            resolved
+        );
+
+    if (count > 1) {
+        showNowPlayingAlbumProviderMenu();
+        return;
+    }
+
+    openNowPlayingAlbumDestination(
+        resolved.tidal
+            ? "tidal"
+            : "qobuz"
+    );
+}
+
 
 function goBackToNowPlayingFromAlbum() {
     var state = nowPlayingAlbumReturnState || {};
@@ -1881,8 +2801,11 @@ function showView(name) {
         if (name === "queue") { queueBtn.classList.add("active"); }
         else                  { queueBtn.classList.remove("active"); }
     }
-    if (name === "album" && lastTechText && albumTechInfo) {
-        if (!restoreLocalAlbumDetailTechInfo()) {
+    if (name === "album" && albumTechInfo) {
+        if (
+            !restoreOwnedAlbumDetailTechInfo() &&
+            lastTechText
+        ) {
             albumTechInfo.textContent = lastTechText;
             albumTechInfo.className   = lastTechClass;
         }
@@ -1892,6 +2815,7 @@ function showView(name) {
     syncHeaderHomeNavigationState();
     syncPlayerBarRadioProgressState();
     syncRadioSourceSectionState();
+    syncNativePlaybackBlockerPresentation();
 }
 
 function getSrovaDocumentScrollElement() {
@@ -2005,6 +2929,11 @@ function shouldResetTrackListDetailScroll(endpoint) {
 
 function setGlobalSearchVisible(visible) {
     globalSearchRequestedVisible = visible === true;
+
+    if (!globalSearchRequestedVisible) {
+        globalSearchRequestSerial += 1;
+    }
+
     visible = globalSearchRequestedVisible && globalSearchHasReadySource();
     if (searchBox) {
         if (visible) {
@@ -2148,12 +3077,30 @@ function goBack() {
     } else if (previousView === "tidalsource") {
         restoreTidalSourceView();
         restoreDetailReturnScroll("tidalsource");
+    } else if (previousView === "radio") {
+        showRadioSource(false, true);
     } else if (previousView === "playlists") {
         showView("playlists");
         restoreDetailReturnScroll("playlists");
     } else if (previousView === "localmusic") {
         showView("localmusic");
         restoreDetailReturnScroll("localmusic");
+    } else if (previousView === "qobuzsourcesearch") {
+        showQobuzSource({
+            restoreSearch: true
+        });
+        restoreDetailReturnScroll("qobuzsource");
+    } else if (previousView === "qobuzsource") {
+        showQobuzSource();
+        restoreDetailReturnScroll("qobuzsource");
+    } else if (
+        previousView === "qobuzradioorigin" &&
+        _qobuzRadioReturnFn
+    ) {
+        var qobuzRadioReturnFn =
+            _qobuzRadioReturnFn;
+        _qobuzRadioReturnFn = null;
+        qobuzRadioReturnFn();
     } else if (previousView === "artistpage" && _artistPageRestoreFn) {
         _artistPageRestoreFn();
     } else {
@@ -2164,15 +3111,764 @@ function goBack() {
 
 // --- My Playlists view ---
 
-function showPlaylists(setupVerified) {
-    if (setupVerified !== true) {
-        requireSrovaTidalLogin(function() {
-            showPlaylists(true);
-        });
+
+/* Q7F-F2 provider-aware playlists.
+ * The global playlist surface is provider-aware while TIDAL mutation
+ * controls remain TIDAL-only. Qobuz playlist access is read-only.
+ */
+var currentPlaylistsProvider = "tidal";
+
+function tidalPlaylistModalPresentationTitle(title) {
+    title = String(title || "Create Playlist");
+
+    var presentation =
+        streamingProviderPresentation();
+
+    if (
+        !presentation ||
+        presentation.dual !== true
+    ) {
+        return title;
+    }
+
+    if (title === "Create Playlist") {
+        return "Create TIDAL Playlist";
+    }
+
+    if (title === "Save as Playlist") {
+        return "Save as TIDAL Playlist";
+    }
+
+    if (title === "Save Queue as Playlist") {
+        return "Save Queue as TIDAL Playlist";
+    }
+
+    return title;
+}
+function qobuzPlaylistModalPresentationTitle(title) {
+    title = String(
+        title ||
+        "Create Playlist"
+    );
+
+    var availability =
+        playlistsProviderAvailability();
+
+    if (
+        !availability ||
+        availability.dual !== true
+    ) {
+        return title;
+    }
+
+    if (title === "Create Playlist") {
+        return "Create QOBUZ Playlist";
+    }
+
+    return title;
+}
+
+var qobuzPlaylistsLoaded = false;
+var qobuzPlaylists = [];
+var qobuzDeletedPlaylistIds = {};
+var playlistsOpenRequestSerial = 0;
+
+function renderPlaylistsState(target, mode, message) {
+    target = target || playlistsContent;
+    if (!target) { return; }
+
+    mode = String(mode || "empty").toLowerCase();
+
+    if (
+        [
+            "loading",
+            "error",
+            "empty",
+            "filter-empty"
+        ].indexOf(mode) === -1
+    ) {
+        mode = "empty";
+    }
+
+    var state = document.createElement("div");
+    state.className = "playlistsState";
+    state.setAttribute("data-state", mode);
+    state.setAttribute(
+        "role",
+        mode === "error" ? "alert" : "status"
+    );
+    state.setAttribute(
+        "aria-live",
+        mode === "error" ? "assertive" : "polite"
+    );
+    state.setAttribute(
+        "aria-busy",
+        mode === "loading" ? "true" : "false"
+    );
+
+    var mark = document.createElement("div");
+    mark.className = "playlistsStateMark";
+    mark.setAttribute("aria-hidden", "true");
+
+    var core = document.createElement("div");
+    core.className = "playlistsStateCore";
+
+    for (var i = 1; i <= 5; i++) {
+        var bar = document.createElement("span");
+        bar.className =
+            "playlistsStateBar playlistsStateBar" + i;
+        core.appendChild(bar);
+    }
+
+    mark.appendChild(core);
+
+    var text = document.createElement("div");
+    text.className = "playlistsStateText";
+    text.textContent = String(message || "");
+
+    state.appendChild(mark);
+    state.appendChild(text);
+
+    target.innerHTML = "";
+    target.appendChild(state);
+}
+
+function playlistsProviderAvailability() {
+    var tidal =
+        streamingProviderAuthState.tidal === true;
+    var qobuz =
+        streamingProviderAuthState.qobuz === true;
+
+    return {
+        tidal: tidal,
+        qobuz: qobuz,
+        dual: tidal && qobuz
+    };
+}
+
+function activePlaylistsArray() {
+    return currentPlaylistsProvider === "qobuz"
+        ? qobuzPlaylists
+        : allPlaylists;
+}
+
+function buildPlaylistsProviderBar() {
+    var availability = playlistsProviderAvailability();
+    if (!availability.dual) { return null; }
+
+    var bar = document.createElement("div");
+    bar.className =
+        "srovaStreamingProviderBar playlistsProviderBar";
+    bar.setAttribute("role", "group");
+    bar.setAttribute(
+        "aria-label",
+        "Playlist provider"
+    );
+
+    [
+        ["tidal", "TIDAL"],
+        ["qobuz", "QOBUZ"]
+    ].forEach(function(spec) {
+        var provider = spec[0];
+
+        var btn = document.createElement("button");
+        btn.type = "button";
+        btn.className =
+            "srovaSourceSwitchItem " +
+            "srovaStreamingProviderItem" +
+            (
+                currentPlaylistsProvider === provider
+                    ? " active"
+                    : ""
+            );
+        btn.textContent = spec[1];
+
+        btn.onclick = function() {
+            switchPlaylistsProvider(provider);
+        };
+
+        bar.appendChild(btn);
+    });
+
+    return bar;
+}
+
+function adaptQobuzUserPlaylist(item) {
+    item = item || {};
+
+    var trackCount = Number(
+        item.track_count ||
+        item.num_tracks ||
+        0
+    );
+
+    if (
+        !isFinite(trackCount) ||
+        trackCount < 0
+    ) {
+        trackCount = 0;
+    }
+
+    return {
+        owner_id:
+            String(
+                item.owner_id ||
+                (
+                    item.owner &&
+                    item.owner.id
+                ) ||
+                ""
+            ).trim(),
+        owner_name:
+            String(
+                item.owner_name ||
+                (
+                    item.owner &&
+                    item.owner.name
+                ) ||
+                ""
+            ),
+        playlist_editable:
+            item.playlist_editable
+            === true,
+        id: String(
+            item.playlist_id ||
+            item.id ||
+            ""
+        ),
+        name: String(
+            item.name ||
+            item.title ||
+            ""
+        ),
+        num_tracks: trackCount,
+        sub_title:
+            trackCount
+                ? String(trackCount) + " tracks"
+                : "",
+        image_url: String(
+            item.artwork_url ||
+            (
+                item.artwork &&
+                item.artwork.url
+            ) ||
+            ""
+        ),
+        last_updated: "",
+        created_at: "",
+        source: "qobuz"
+    };
+}
+
+function upsertQobuzPlaylistLocal(rawPlaylist) {
+    var item =
+        adaptQobuzUserPlaylist(
+            rawPlaylist
+        );
+
+    if (!item.id) {
+        throw new Error(
+            "Created Qobuz playlist has no id"
+        );
+    }
+
+    var next = [];
+    var inserted = false;
+
+    qobuzPlaylists.forEach(
+        function(existing) {
+            if (
+                String(
+                    existing.id ||
+                    ""
+                ) === item.id
+            ) {
+                if (!inserted) {
+                    next.push(item);
+                    inserted = true;
+                }
+
+                return;
+            }
+
+            next.push(existing);
+        }
+    );
+
+    if (!inserted) {
+        next.push(item);
+    }
+
+    qobuzPlaylists = next;
+    qobuzPlaylistsLoaded = true;
+
+    return item;
+}
+
+function reconcileQobuzPlaylistsAfterCreate(
+    playlistId,
+    attempt
+) {
+    playlistId =
+        String(
+            playlistId ||
+            ""
+        ).trim();
+
+    attempt =
+        Number(
+            attempt ||
+            0
+        );
+
+    var delays = [
+        3000,
+        10000,
+        30000
+    ];
+
+    if (
+        !playlistId ||
+        !isFinite(attempt) ||
+        attempt < 0 ||
+        attempt >= delays.length
+    ) {
         return;
     }
+
+    setTimeout(
+        function() {
+            fetchWithTimeout(
+                "/qobuz/catalog?op=playlists",
+                {
+                    cache: "no-store"
+                },
+                8000
+            )
+            .then(function(res) {
+                return res.json();
+            })
+            .then(function(items) {
+                if (!Array.isArray(items)) {
+                    throw new Error(
+                        "Qobuz playlist list is invalid"
+                    );
+                }
+
+                var adapted =
+                    items
+                    .map(
+                        adaptQobuzUserPlaylist
+                    )
+                    .filter(
+                        function(item) {
+                            return !!item.id;
+                        }
+                    );
+
+                var confirmed =
+                    adapted.some(
+                        function(item) {
+                            return (
+                                item.id ===
+                                playlistId
+                            );
+                        }
+                    );
+
+                if (!confirmed) {
+                    reconcileQobuzPlaylistsAfterCreate(
+                        playlistId,
+                        attempt + 1
+                    );
+
+                    return;
+                }
+
+                qobuzPlaylists =
+                    adapted;
+
+                qobuzPlaylistsLoaded =
+                    true;
+            })
+            .catch(function() {
+                reconcileQobuzPlaylistsAfterCreate(
+                    playlistId,
+                    attempt + 1
+                );
+            });
+        },
+        delays[attempt]
+    );
+}
+
+
+function openPlaylistsProvider(provider) {
+    provider =
+        String(provider || "").toLowerCase()
+        === "qobuz"
+            ? "qobuz"
+            : "tidal";
+
+    currentPlaylistsProvider = provider;
     showView("playlists");
-    if (!playlistsLoaded) { loadMyPlaylists(0); }
+
+    if (provider === "qobuz") {
+        if (qobuzPlaylistsLoaded) {
+            renderPlaylistsList(
+                qobuzPlaylists
+            );
+        } else {
+            loadQobuzPlaylists();
+        }
+        return;
+    }
+
+    if (playlistsLoaded) {
+        renderPlaylistsList(
+            allPlaylists
+        );
+    } else {
+        loadMyPlaylists(0);
+    }
+}
+
+function switchPlaylistsProvider(provider) {
+    var availability =
+        playlistsProviderAvailability();
+
+    provider =
+        String(provider || "").toLowerCase();
+
+    if (
+        provider === "qobuz" &&
+        !availability.qobuz
+    ) {
+        return;
+    }
+
+    if (
+        provider === "tidal" &&
+        !availability.tidal
+    ) {
+        return;
+    }
+
+    openPlaylistsProvider(provider);
+}
+
+function loadQobuzPlaylists() {
+    if (
+        currentPlaylistsProvider !== "qobuz"
+    ) {
+        return;
+    }
+
+    renderPlaylistsState(
+        playlistsContent,
+        "loading",
+        "Loading Playlists…"
+    );
+
+    fetchWithTimeout(
+        "/qobuz/catalog?op=playlists",
+        {
+            cache: "no-store"
+        },
+        8000
+    )
+    .then(function(res) {
+        return res.json();
+    })
+    .then(function(items) {
+        if (
+            currentPlaylistsProvider !== "qobuz"
+        ) {
+            return;
+        }
+
+        if (!Array.isArray(items)) {
+            throw new Error(
+                "Qobuz playlist list is invalid"
+            );
+        }
+
+        qobuzPlaylists = items
+            .map(adaptQobuzUserPlaylist)
+            .filter(function(item) {
+                return !!item.id;
+            });
+
+        qobuzPlaylistsLoaded = true;
+
+        if (!qobuzPlaylists.length) {
+            renderPlaylistsState(
+                playlistsContent,
+                "empty",
+                "No playlists found."
+            );
+            return;
+        }
+
+        renderPlaylistsList(
+            qobuzPlaylists
+        );
+    })
+    .catch(function(err) {
+        console.error(
+            "loadQobuzPlaylists failed:",
+            err
+        );
+
+        if (
+            currentPlaylistsProvider === "qobuz"
+        ) {
+            renderPlaylistsState(
+                playlistsContent,
+                "error",
+                "Could not load playlists."
+            );
+        }
+    });
+}
+
+function loadStreamingPlaylistDetail(
+    provider,
+    playlist,
+    fromView
+) {
+    provider =
+        String(provider || "").toLowerCase()
+        === "qobuz"
+            ? "qobuz"
+            : "tidal";
+
+    playlist = playlist || {};
+
+    var playlistId =
+        String(playlist.id || "").trim();
+
+    if (!playlistId) { return; }
+
+    if (!requireOnlineSource()) { return; }
+
+    previousView = fromView || "playlists";
+
+    currentViewEndpoint =
+        provider === "qobuz"
+            ? "qobuz:playlist:" + playlistId
+            : "/tidal/playlist/" + playlistId;
+
+    currentContext = {
+        id: playlistId,
+        cover: playlist.image_url || "",
+        title: playlist.name || "",
+        artist: "",
+        source: provider,
+        type: "playlist",
+        playlist_editable: false
+    };
+
+    _setPlaybackSource(
+        "playlist",
+        playlistId,
+        currentContext.title
+    );
+
+    setAlbumViewKind("tidal-detail");
+    showView("album");
+
+    if (albumSourceLabel) {
+        albumSourceLabel.textContent =
+            provider === "qobuz"
+                ? "QOBUZ"
+                : "TIDAL";
+        albumSourceLabel.classList.remove(
+            "hidden"
+        );
+    }
+
+    albumArt.src =
+        currentContext.cover;
+
+    albumTitle.textContent =
+        currentContext.title;
+
+    albumArtist.textContent = "";
+    albumArtist.style.cursor = "";
+    albumArtist.onclick = null;
+
+    albumTechInfo.textContent = "";
+    albumTechInfo.className = "hidden";
+
+    if (albumStatsLine) {
+        albumStatsLine.textContent = "";
+        albumStatsLine.className = "hidden";
+    }
+
+    trackList.innerHTML =
+        '<div class="trackListLoading">' +
+        'Loading playlist...</div>';
+
+    renderAlbumQueueBtn([], "");
+    resetAlbumDetailScroll();
+
+    var endpoint =
+        "/api/playlists/complete?provider=" +
+        encodeURIComponent(provider) +
+        "&playlist_id=" +
+        encodeURIComponent(playlistId);
+
+    var viewEndpoint =
+        currentViewEndpoint;
+
+    fetchWithTimeout(
+        endpoint,
+        {
+            cache: "no-store"
+        },
+        15000
+    )
+    .then(function(res) {
+        return res.json();
+    })
+    .then(function(resp) {
+        if (
+            currentViewEndpoint !== viewEndpoint
+        ) {
+            return;
+        }
+
+        if (
+            !resp ||
+            resp.ok === false ||
+            resp.complete !== true ||
+            !Array.isArray(resp.tracks)
+        ) {
+            throw new Error(
+                (
+                    resp &&
+                    (
+                        resp.message ||
+                        resp.error
+                    )
+                ) ||
+                "Playlist could not be loaded completely."
+            );
+        }
+
+        var tracks = resp.tracks;
+
+        currentContext.playlist_editable =
+            resp.playlist_editable === true;
+
+        if (resp.playlist_name) {
+            currentContext.title =
+                resp.playlist_name;
+
+            albumTitle.textContent =
+                resp.playlist_name;
+        }
+
+        originalTracks = tracks;
+        shuffledTracks = [];
+        currentViewTracks = tracks;
+
+        if (!tracks.length) {
+            trackList.innerHTML =
+                '<div class="unavailableMsg">' +
+                'No tracks found.</div>';
+
+            renderAlbumQueueBtn([], "");
+            resetAlbumDetailScroll();
+            return;
+        }
+
+        renderTrackList(tracks);
+        resetAlbumDetailScroll();
+
+        if (provider === "tidal") {
+            loadFavoriteIds();
+        }
+    })
+    .catch(function(err) {
+        if (
+            currentViewEndpoint !== viewEndpoint
+        ) {
+            return;
+        }
+
+        console.error(
+            "loadStreamingPlaylistDetail failed:",
+            err
+        );
+
+        trackList.innerHTML =
+            '<div class="unavailableMsg">' +
+            'Could not load playlist.</div>';
+
+        renderAlbumQueueBtn([], "");
+    });
+}
+
+function showPlaylists(setupVerified) {
+    var requestSerial =
+        ++playlistsOpenRequestSerial;
+
+    refreshStreamingProviderPresentation()
+        .then(function() {
+            if (
+                requestSerial !==
+                playlistsOpenRequestSerial
+            ) {
+                return;
+            }
+
+            var availability =
+                playlistsProviderAvailability();
+
+            if (
+                availability.tidal ||
+                availability.qobuz
+            ) {
+                var provider = "tidal";
+
+                if (
+                    availability.dual
+                ) {
+                    provider =
+                        currentStreamingProvider ===
+                        "qobuz"
+                            ? "qobuz"
+                            : "tidal";
+                } else if (
+                    availability.qobuz
+                ) {
+                    provider = "qobuz";
+                }
+
+                openPlaylistsProvider(
+                    provider
+                );
+                return;
+            }
+
+            /*
+             * Neither-provider behavior remains the
+             * historical TIDAL entry until Q7I owns
+             * the complete signed-out experience.
+             */
+            if (setupVerified !== true) {
+                requireSrovaTidalLogin(
+                    function() {
+                        showPlaylists(true);
+                    }
+                );
+                return;
+            }
+
+            openPlaylistsProvider("tidal");
+        });
 }
 
 
@@ -2206,25 +3902,31 @@ function goBackFromQueue() {
 // --- Settings view ---
 
 var _settingsPreviousView = "home";
+var _settingsPreviousWasTrueHome = false;
 var _localLibrarySettingsPoll = null;
 var LOCAL_LIBRARY_SCAN_ACTIVITY_MIN_MS = 2500;
 var currentSettingsTab = "audio";
 var _settingsRenderToken = 0;
+var _settingsSpotifyEntryRequestToken = 0;
 var _tidalStatusRequestToken = 0;
+var _qobuzStatusRequestToken = 0;
 var srovaUpdateState = null;
+var spotifySoloistUpdateState = null;
 var SROVA_VOLUME_SAFETY_DISMISSED_KEY = "srovaVolumeSafetyWarningDismissedV1";
 var SROVA_OTHER_AUDIO_OUTPUT_WARNING_VERSION = 1;
 var SETTINGS_TABS = [
     { id: "audio", label: "Audio" },
-    { id: "tidal", label: "TIDAL" },
+    { id: "tidal", label: "ONLINE" },
     { id: "local", label: "My Music" },
     { id: "radio", label: "Radio" },
+    { id: "spotify", label: "Spotify" },
     { id: "scrobbling", label: "Scrobbling" },
     { id: "system", label: "System" },
     { id: "about", label: "About" }
 ];
 
 function showSettings() {
+    _settingsPreviousWasTrueHome = isTrueHomeLandingViewActive();
     setGlobalSearchVisible(false);
     // Capture where we came from before showView overwrites anything
     _settingsPreviousView =
@@ -2261,6 +3963,53 @@ function setSettingsTab(tabId) {
     });
 }
 
+function requestSettingsTab(tabId) {
+    var requestToken = ++_settingsSpotifyEntryRequestToken;
+
+    if (tabId !== "spotify") {
+        setSettingsTab(tabId);
+        return;
+    }
+
+    fetchWithTimeout(
+        "/api/audio/output",
+        {cache: "no-store"},
+        5000
+    )
+        .then(function(response) {
+            if (!response.ok) {
+                throw new Error("audio_output_status_failed");
+            }
+            return response.json();
+        })
+        .then(function(data) {
+            if (requestToken !== _settingsSpotifyEntryRequestToken) {
+                return;
+            }
+            if (!data || data.output_selected !== true || data.device_available !== true) {
+                if (typeof showQueueActionToast === "function") {
+                    showQueueActionToast(
+                        "Connect a DAC to enter SPOTIFY Settings.",
+                        true
+                    );
+                }
+                return;
+            }
+            setSettingsTab("spotify");
+        })
+        .catch(function() {
+            if (requestToken !== _settingsSpotifyEntryRequestToken) {
+                return;
+            }
+            if (typeof showQueueActionToast === "function") {
+                showQueueActionToast(
+                    "SPOTIFY Settings are currently unavailable.",
+                    true
+                );
+            }
+        });
+}
+
 function buildSettingsTabs() {
     var tabs = document.createElement("div");
     tabs.className = "settingsTabs";
@@ -2277,16 +4026,22 @@ function buildSettingsTabs() {
         btn.setAttribute("role", "tab");
         btn.setAttribute("data-settings-tab", tabDef.id);
         btn.setAttribute("aria-controls", "settings-tab-panel-" + tabDef.id);
-        if (tabDef.id === "about") {
+        if (tabDef.id === "about" || tabDef.id === "spotify") {
             var dot = document.createElement("img");
             dot.className = "srovaUpdateDot settingsTabUpdateDot hidden";
             dot.src = "/ui_web/assets/srova-red-update-dot.png";
             dot.alt = "";
             dot.setAttribute("aria-hidden", "true");
-            dot.classList.toggle("hidden", !updateAvailableNow());
+            dot.setAttribute("data-update-kind", tabDef.id);
+            dot.classList.toggle(
+                "hidden",
+                tabDef.id === "about"
+                    ? !updateAvailableNow()
+                    : !spotifySoloistUpdateAvailableNow()
+            );
             btn.appendChild(dot);
         }
-        btn.onclick = function() { setSettingsTab(tabDef.id); };
+        btn.onclick = function() { requestSettingsTab(tabDef.id); };
         tabs.appendChild(btn);
     });
     return tabs;
@@ -2313,17 +4068,635 @@ function buildSettingsTabPanels() {
 function appendSettingsSections(st, panels) {
     st = st || {};
     panels.audio.appendChild(buildDacSection());
+    panels.spotify.appendChild(buildSpotifySettingsSection());
     panels.tidal.appendChild(buildTidalSection({_tidal_status_loading: true}));
+    panels.tidal.appendChild(buildQobuzSection({_qobuz_status_loading: true}));
     panels.tidal.appendChild(buildAutoMixSection(st));
     panels.tidal.appendChild(buildInfinitePlaySection(st));
-    panels.tidal.appendChild(buildPlaylistMaintenanceSection());
+    panels.tidal.appendChild(buildPlaylistMaintenanceSection(st));
     panels.local.appendChild(buildLocalMusicLibrarySection());
+    panels.radio.appendChild(buildProviderRadioSettingsSection());
     panels.radio.appendChild(buildRadioSection());
     panels.scrobbling.appendChild(buildLastfmSection(st));
     panels.scrobbling.appendChild(buildLbzSection(st));
     panels.system.appendChild(buildSrovaServiceSection());
     panels.system.appendChild(buildRemoteAccessSection());
     panels.about.appendChild(buildAboutSection());
+}
+
+var SPOTIFY_SETTINGS_STATE_LABELS = {
+    disabled: "Disabled",
+    standby: "Disconnected",
+    acquiring: "Connecting…",
+    owned: "Spotify active",
+    releasing: "Disconnecting…",
+    recovering: "Recovering…",
+    safe_error: "Error — native playback is safe",
+    unsafe_error: "Recovery required"
+};
+
+var SPOTIFY_ARTIFACT_ERROR_MESSAGES = {
+    unsupported_architecture: "Soloist is not available for this system architecture.",
+    unsafe_install_directory: "The managed installation location is not safe.",
+    download_failed: "Soloist could not be downloaded.",
+    unexpected_response: "The Soloist download service returned an unexpected response.",
+    download_too_large: "The Soloist download exceeded the allowed size.",
+    invalid_archive: "The downloaded Soloist archive was invalid.",
+    invalid_candidate: "The downloaded Soloist build did not pass validation.",
+    candidate_expired: "The downloaded Soloist build has expired.",
+    downgrade_rejected: "An older Soloist build was rejected.",
+    same_build_conflict: "The available Soloist build conflicts with the installed build.",
+    commit_failed: "Soloist could not be installed safely."
+};
+
+var SPOTIFY_ARTIFACT_STATUS_MESSAGES = {
+    not_installed: "Soloist is not installed.",
+    expired: "The installed Soloist build has expired.",
+    invalid_file: "The installed Soloist file is invalid.",
+    invalid_elf: "The installed Soloist executable is invalid.",
+    version_failed: "The Soloist version could not be verified.",
+    invalid_version: "The installed Soloist version is invalid.",
+    architecture_mismatch: "The installed Soloist build does not match this system."
+};
+
+var SPOTIFY_CONFIG_ERROR_MESSAGES = {
+    invalid_request: "The API key request was invalid.",
+    request_too_large: "The API key is too large.",
+    invalid_api_key: "Enter a valid Spotify API key.",
+    spotify_config_unavailable: "Spotify configuration is currently unavailable."
+};
+
+var SPOTIFY_DEVICE_NAME_ERROR_MESSAGES = {
+    invalid_request: "The device-name request was invalid.",
+    request_too_large: "The device name is too large.",
+    invalid_device_name: "Enter a valid Spotify device name.",
+    spotify_device_name_blocked: "Disconnect or disable Spotify before changing the device name.",
+    spotify_dac_unavailable: "Connect a DAC to enter SPOTIFY Settings.",
+    spotify_device_name_update_failed: "The Spotify device name could not be saved.",
+    spotify_device_name_unavailable: "Spotify device-name settings are currently unavailable."
+};
+
+function spotifySettingsRequest(url, options, timeoutMs) {
+    return fetchWithTimeout(
+        url,
+        options || {cache: "no-store"},
+        timeoutMs || 10000
+    )
+        .then(function(res) {
+            if (!res.ok) { throw new Error("spotify_settings_request_failed"); }
+            return res.json();
+        });
+}
+
+function spotifyUtf8ByteLength(value) {
+    try {
+        return new Blob([String(value || "")]).size;
+    } catch (error) {
+        return 257;
+    }
+}
+
+function spotifySettingsMessage(message, isError, target) {
+    if (target) {
+        target.textContent = message || "";
+        target.classList.toggle("isError", !!isError);
+    }
+    if (message && typeof showQueueActionToast === "function") {
+        showQueueActionToast(message, !!isError);
+    }
+}
+
+function buildSpotifySettingsSection() {
+    var sec = document.createElement("div");
+    sec.className = "settingsSection spotifySettingsSection";
+
+    var title = document.createElement("div");
+    title.className = "settingsSectionTitle spotifySettingsTitle";
+    title.innerHTML = '<span class="material-icons">speaker</span><span class="settingsSectionText">Spotify Connect</span>';
+    sec.appendChild(title);
+
+    var intro = document.createElement("div");
+    intro.className = "settingsSectionDesc spotifySettingsIntro";
+    intro.textContent = "Make SROVA available as a Spotify Connect device. Playback and quality remain controlled from Spotify. While Spotify is active, it temporarily owns the selected DAC and native SROVA playback is unavailable.";
+    sec.appendChild(intro);
+
+    var setupNote = document.createElement("div");
+    setupNote.className = "settingsDependencyNote spotifySettingsSetupNote";
+    setupNote.innerHTML = '<span class="material-icons">info</span><span>An API key and a valid managed Soloist installation are required before Spotify Connect can be enabled.</span>';
+    sec.appendChild(setupNote);
+
+    var stack = document.createElement("div");
+    stack.className = "spotifySettingsStack";
+    sec.appendChild(stack);
+
+    function buildBlock(label, className) {
+        var card = document.createElement("section");
+        card.className = "spotifySettingsBlock " + className;
+        var heading = document.createElement("h3");
+        heading.className = "spotifySettingsBlockTitle";
+        heading.textContent = label;
+        card.appendChild(heading);
+        return card;
+    }
+
+    function buildFeedback() {
+        var feedback = document.createElement("div");
+        feedback.className = "settingsStatus spotifySettingsFeedback";
+        feedback.setAttribute("aria-live", "polite");
+        return feedback;
+    }
+
+    var statusCard = buildBlock("Spotify Connect status", "spotifyStatusBlock");
+    var statusValue = document.createElement("div");
+    statusValue.className = "spotifySettingsPrimaryStatus";
+    statusValue.textContent = "Loading…";
+    var statusDetail = document.createElement("div");
+    statusDetail.className = "settingsStatus spotifySettingsStatusDetail";
+    statusDetail.textContent = "Checking endpoint state.";
+
+    var controlRow = document.createElement("div");
+    controlRow.className = "settingsToggleRow spotifyControlToggleRow";
+    var controlCopy = document.createElement("div");
+    controlCopy.className = "settingsToggleCopy";
+    statusDetail.classList.add("settingsToggleSub");
+    controlCopy.appendChild(statusValue);
+    controlCopy.appendChild(statusDetail);
+    controlRow.appendChild(controlCopy);
+    var controlToggle = document.createElement("button");
+    controlToggle.type = "button";
+    controlToggle.className = "settingsToggleSwitch spotifyControlToggle";
+    controlToggle.disabled = true;
+    controlToggle.setAttribute("aria-label", "Enable Spotify Connect");
+    controlToggle.setAttribute("aria-pressed", "false");
+    var controlKnob = document.createElement("span");
+    controlKnob.setAttribute("aria-hidden", "true");
+    controlToggle.appendChild(controlKnob);
+    controlRow.appendChild(controlToggle);
+    statusCard.appendChild(controlRow);
+    var controlFeedback = buildFeedback();
+    statusCard.appendChild(controlFeedback);
+
+    var keyCard = buildBlock("API key", "spotifyApiKeyBlock");
+    var keyState = document.createElement("div");
+    keyState.className = "spotifySettingsKeyState";
+    keyState.textContent = "Checking configuration…";
+    keyCard.appendChild(keyState);
+    var keyLabel = document.createElement("label");
+    keyLabel.className = "settingsLabel";
+    keyLabel.setAttribute("for", "spotifyApiKeyInput");
+    keyLabel.textContent = "New or replacement API key";
+    keyCard.appendChild(keyLabel);
+    var keyInput = document.createElement("input");
+    keyInput.id = "spotifyApiKeyInput";
+    keyInput.className = "settingsInput spotifySettingsInput";
+    keyInput.type = "password";
+    keyInput.value = "";
+    keyInput.autocomplete = "new-password";
+    keyInput.autocapitalize = "off";
+    keyInput.autocorrect = "off";
+    keyInput.spellcheck = false;
+    keyInput.placeholder = "Enter API key";
+    keyCard.appendChild(keyInput);
+    var keyActions = document.createElement("div");
+    keyActions.className = "spotifySettingsActions";
+    var keySaveBtn = document.createElement("button");
+    keySaveBtn.type = "button";
+    keySaveBtn.className = "settingsBtn spotifySettingsAction spotifyApiKeySaveBtn";
+    keySaveBtn.textContent = "Save API Key";
+    keyActions.appendChild(keySaveBtn);
+    keyCard.appendChild(keyActions);
+    var keyFeedback = buildFeedback();
+    keyCard.appendChild(keyFeedback);
+
+    var deviceCard = buildBlock("Device name", "spotifyDeviceNameBlock");
+    var deviceDescription = document.createElement("div");
+    deviceDescription.className = "settingsStatus spotifySettingsFieldHelp";
+    deviceDescription.textContent = "This is the name shown in Spotify's device picker.";
+    deviceCard.appendChild(deviceDescription);
+    var deviceLabel = document.createElement("label");
+    deviceLabel.className = "settingsLabel";
+    deviceLabel.setAttribute("for", "spotifyDeviceNameInput");
+    deviceLabel.textContent = "Spotify Connect device name";
+    deviceCard.appendChild(deviceLabel);
+    var deviceInput = document.createElement("input");
+    deviceInput.id = "spotifyDeviceNameInput";
+    deviceInput.className = "settingsInput spotifySettingsInput";
+    deviceInput.type = "text";
+    deviceInput.autocomplete = "off";
+    deviceInput.maxLength = 256;
+    deviceInput.placeholder = "SROVA";
+    deviceCard.appendChild(deviceInput);
+    var deviceActions = document.createElement("div");
+    deviceActions.className = "spotifySettingsActions";
+    var deviceSaveBtn = document.createElement("button");
+    deviceSaveBtn.type = "button";
+    deviceSaveBtn.className = "settingsBtn spotifySettingsAction spotifyDeviceNameSaveBtn";
+    deviceSaveBtn.textContent = "Save Device Name";
+    deviceActions.appendChild(deviceSaveBtn);
+    deviceCard.appendChild(deviceActions);
+    var deviceFeedback = buildFeedback();
+    deviceCard.appendChild(deviceFeedback);
+
+    var artifactCard = buildBlock("Soloist installation", "spotifyArtifactBlock");
+    var artifactState = document.createElement("div");
+    artifactState.className = "spotifySettingsPrimaryStatus spotifyArtifactState";
+    artifactState.textContent = "Loading…";
+    artifactCard.appendChild(artifactState);
+    var artifactDetails = document.createElement("dl");
+    artifactDetails.className = "spotifyArtifactDetails";
+    artifactCard.appendChild(artifactDetails);
+    var artifactActions = document.createElement("div");
+    artifactActions.className = "spotifySettingsActions";
+    var artifactUpdateBtn = document.createElement("button");
+    artifactUpdateBtn.type = "button";
+    artifactUpdateBtn.className = "settingsBtn spotifySettingsAction spotifyArtifactUpdateBtn";
+    artifactUpdateBtn.textContent = "INSTALL";
+    artifactActions.appendChild(artifactUpdateBtn);
+    artifactCard.appendChild(artifactActions);
+    var artifactFeedback = buildFeedback();
+    artifactCard.appendChild(artifactFeedback);
+
+    stack.appendChild(artifactCard);
+    stack.appendChild(keyCard);
+    stack.appendChild(statusCard);
+    stack.appendChild(deviceCard);
+
+    var spotifyStatus = null;
+    var spotifyArtifact = null;
+    var controlBusy = false;
+    var keyBusy = false;
+    var deviceBusy = false;
+    var artifactBusy = false;
+
+    function endpointReady() {
+        return !!(
+            spotifyStatus &&
+            spotifyStatus.key_configured === true &&
+            spotifyArtifact &&
+            spotifyArtifact.installed === true &&
+            spotifyArtifact.valid === true &&
+            spotifyArtifact.expired === false
+        );
+    }
+
+    function endpointEngaged(state) {
+        return [
+            "standby",
+            "acquiring",
+            "owned",
+            "releasing",
+            "recovering",
+            "unsafe_error"
+        ].indexOf(state) !== -1;
+    }
+
+    function updateControls() {
+        var state = spotifyStatus ? String(spotifyStatus.state || "") : "";
+        var enabled = !!(spotifyStatus && spotifyStatus.enabled === true);
+        var transient = ["acquiring", "releasing", "recovering"].indexOf(state) !== -1;
+        var canEnable = state === "disabled" || state === "safe_error";
+        controlToggle.className = "settingsToggleSwitch spotifyControlToggle" +
+            (enabled ? " active" : "");
+        controlToggle.setAttribute("aria-pressed", enabled ? "true" : "false");
+        controlToggle.setAttribute(
+            "aria-label",
+            enabled ? "Disable Spotify Connect" : "Enable Spotify Connect"
+        );
+        controlToggle.disabled = controlBusy || transient || !state ||
+            (!enabled && (!canEnable || !endpointReady()));
+        keyInput.disabled = keyBusy;
+        keySaveBtn.disabled = keyBusy || !String(keyInput.value || "");
+        deviceInput.disabled = deviceBusy;
+        deviceSaveBtn.disabled = deviceBusy || !String(deviceInput.value || "").trim();
+        var notInstalled = spotifyArtifact && spotifyArtifact.installed !== true;
+        var needsRepair = spotifyArtifact && spotifyArtifact.installed === true &&
+            (spotifyArtifact.valid !== true || spotifyArtifact.expired !== false);
+        var updateAvailable = spotifySoloistUpdateAvailableNow();
+        if (!artifactBusy) {
+            artifactUpdateBtn.textContent = notInstalled ? "INSTALL" : "UPDATE";
+        }
+        artifactUpdateBtn.disabled = artifactBusy || !spotifyArtifact ||
+            (!notInstalled && !needsRepair && !updateAvailable);
+    }
+
+    keyInput.addEventListener("input", updateControls);
+    deviceInput.addEventListener("input", updateControls);
+
+    function renderStatus(data) {
+        syncSpotifyNativeBlockedFromStatus(data);
+        spotifyStatus = data && typeof data === "object" ? data : null;
+        var state = spotifyStatus ? String(spotifyStatus.state || "") : "";
+        var enabled = !!(spotifyStatus && spotifyStatus.enabled === true);
+        statusValue.textContent = enabled && state === "disabled"
+            ? "Waiting for selected DAC"
+            : (SPOTIFY_SETTINGS_STATE_LABELS[state] || "Status unavailable");
+        if (spotifyStatus && spotifyStatus.native_blocked === true) {
+            statusDetail.textContent = "Native SROVA playback is temporarily unavailable while SROVA manages Spotify Connect access to the selected DAC.";
+        } else if (state === "standby") {
+            statusDetail.textContent = "SROVA is available in Spotify's device picker.";
+        } else if (enabled && state === "disabled") {
+            statusDetail.textContent = "Spotify Connect is enabled and will return automatically when native SROVA playback releases the selected DAC.";
+        } else if (state === "disabled") {
+            statusDetail.textContent = "Spotify Connect is not currently available.";
+        } else {
+            statusDetail.textContent = "Endpoint state is reported by SROVA.";
+        }
+        keyState.textContent = spotifyStatus && spotifyStatus.key_configured === true
+            ? "API KEY: CONFIGURED"
+            : "API KEY: NOT CONFIGURED";
+        updateControls();
+    }
+
+    function refreshStatus() {
+        return spotifySettingsRequest("/api/spotify/status", {cache: "no-store"})
+            .then(function(data) {
+                renderStatus(data);
+                return data;
+            })
+            .catch(function() {
+                renderStatus(null);
+                statusDetail.textContent = "Spotify Connect status could not be loaded.";
+                return null;
+            });
+    }
+
+    function refreshDeviceName() {
+        return spotifySettingsRequest("/api/spotify/device-name", {cache: "no-store"})
+            .then(function(data) {
+                deviceInput.value = data && typeof data.device_name === "string"
+                    ? data.device_name
+                    : "";
+                deviceFeedback.textContent = data && data.configured === true
+                    ? "Custom device name configured."
+                    : "Using the current SROVA device name.";
+                updateControls();
+                return data;
+            })
+            .catch(function() {
+                deviceInput.value = "";
+                spotifySettingsMessage(
+                    "The Spotify device name could not be loaded.",
+                    true,
+                    deviceFeedback
+                );
+                updateControls();
+                return null;
+            });
+    }
+
+    function addArtifactDetail(label, value) {
+        if (value === undefined || value === null || value === "") { return; }
+        var term = document.createElement("dt");
+        term.textContent = label;
+        var detail = document.createElement("dd");
+        detail.textContent = String(value);
+        artifactDetails.appendChild(term);
+        artifactDetails.appendChild(detail);
+    }
+
+    function renderArtifact(data) {
+        spotifyArtifact = data && typeof data === "object" ? data : null;
+        artifactDetails.innerHTML = "";
+        if (!spotifyArtifact) {
+            artifactState.textContent = "Status unavailable";
+            updateControls();
+            return;
+        }
+        if (spotifyArtifact.installed !== true) {
+            artifactState.textContent = "Not installed";
+        } else if (spotifyArtifact.valid === true && spotifyArtifact.expired === false) {
+            artifactState.textContent = "Installed and valid";
+        } else if (spotifyArtifact.expired === true) {
+            artifactState.textContent = "Installed but expired";
+        } else {
+            artifactState.textContent = "Installation needs attention";
+        }
+        addArtifactDetail("Version", spotifyArtifact.version);
+        addArtifactDetail("Architecture", spotifyArtifact.architecture);
+        addArtifactDetail("Build date", spotifyArtifact.build_date);
+        addArtifactDetail("Expires", spotifyArtifact.expires_at);
+        artifactFeedback.textContent = SPOTIFY_ARTIFACT_STATUS_MESSAGES[
+            String(spotifyArtifact.error_code || "")
+        ] || "";
+        artifactFeedback.classList.toggle(
+            "isError",
+            spotifyArtifact.valid !== true && spotifyArtifact.error_code !== "valid"
+        );
+        updateControls();
+    }
+
+    function refreshArtifactStatus() {
+        return spotifySettingsRequest("/api/spotify/artifact/status", {cache: "no-store"})
+            .then(function(data) {
+                renderArtifact(data);
+                return data;
+            })
+            .catch(function() {
+                renderArtifact(null);
+                spotifySettingsMessage(
+                    "Soloist installation status could not be loaded.",
+                    true,
+                    artifactFeedback
+                );
+                return null;
+            });
+    }
+
+    keySaveBtn.onclick = function() {
+        var newApiKey = String(keyInput.value || "");
+        if (!newApiKey || keyBusy) { return; }
+        keyBusy = true;
+        keySaveBtn.textContent = "Saving…";
+        spotifySettingsMessage("", false, keyFeedback);
+        updateControls();
+        spotifySettingsRequest("/api/spotify/config", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({api_key: newApiKey})
+        })
+            .then(function(data) {
+                if (!data || data.ok !== true || data.key_configured !== true) {
+                    var configMessage = SPOTIFY_CONFIG_ERROR_MESSAGES[
+                        String(data && data.error || "")
+                    ] || "The Spotify API key could not be saved.";
+                    spotifySettingsMessage(configMessage, true, keyFeedback);
+                    return null;
+                }
+                keyInput.value = "";
+                spotifySettingsMessage("API key configured.", false, keyFeedback);
+                return refreshStatus();
+            })
+            .catch(function() {
+                spotifySettingsMessage(
+                    "The Spotify API key could not be saved.",
+                    true,
+                    keyFeedback
+                );
+            })
+            .then(function() {
+                keyBusy = false;
+                keySaveBtn.textContent = "Save API Key";
+                updateControls();
+            });
+    };
+
+    deviceSaveBtn.onclick = function() {
+        var deviceName = String(deviceInput.value || "").trim();
+        if (!deviceName || deviceBusy) { return; }
+        if (spotifyUtf8ByteLength(deviceName) > 256) {
+            spotifySettingsMessage(
+                "The device name must be 256 UTF-8 bytes or fewer.",
+                true,
+                deviceFeedback
+            );
+            return;
+        }
+        deviceBusy = true;
+        deviceSaveBtn.textContent = "Saving…";
+        spotifySettingsMessage("", false, deviceFeedback);
+        updateControls();
+        spotifySettingsRequest("/api/spotify/device-name", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({device_name: deviceName})
+        })
+            .then(function(data) {
+                if (!data || data.ok !== true) {
+                    var deviceMessage = SPOTIFY_DEVICE_NAME_ERROR_MESSAGES[
+                        String(data && data.error || "")
+                    ] || "The Spotify device name could not be saved.";
+                    spotifySettingsMessage(deviceMessage, true, deviceFeedback);
+                    return null;
+                }
+                spotifySettingsMessage("Device name saved.", false, deviceFeedback);
+                return refreshDeviceName();
+            })
+            .catch(function() {
+                spotifySettingsMessage(
+                    "The Spotify device name could not be saved.",
+                    true,
+                    deviceFeedback
+                );
+            })
+            .then(function() {
+                deviceBusy = false;
+                deviceSaveBtn.textContent = "Save Device Name";
+                updateControls();
+            });
+    };
+
+    artifactUpdateBtn.onclick = function() {
+        if (artifactBusy || artifactUpdateBtn.disabled) { return; }
+        var installing = !spotifyArtifact || spotifyArtifact.installed !== true;
+        artifactBusy = true;
+        artifactUpdateBtn.textContent = installing ? "INSTALLING…" : "UPDATING…";
+        spotifySettingsMessage("", false, artifactFeedback);
+        updateControls();
+        spotifySettingsRequest("/api/spotify/artifact/update", {
+            method: "POST",
+            cache: "no-store"
+        }, 65000)
+            .then(function(data) {
+                if (!data || data.ok !== true) {
+                    var failureMessage = SPOTIFY_ARTIFACT_ERROR_MESSAGES[
+                        String(data && data.error_code || "")
+                    ] || "Soloist installation or update could not be completed.";
+                    spotifySettingsMessage(failureMessage, true, artifactFeedback);
+                    return null;
+                }
+                var successMessages = {
+                    installed: "Soloist installed.",
+                    updated: "Soloist updated.",
+                    unchanged: "Soloist is already up to date."
+                };
+                spotifySettingsMessage(
+                    successMessages[data.action] || "Soloist installation is current.",
+                    false,
+                    artifactFeedback
+                );
+                return Promise.all([
+                    refreshArtifactStatus(),
+                    checkSpotifySoloistUpdate()
+                ]);
+            })
+            .catch(function() {
+                spotifySettingsMessage(
+                    "Soloist installation or update could not be completed.",
+                    true,
+                    artifactFeedback
+                );
+            })
+            .then(function() {
+                artifactBusy = false;
+                updateControls();
+                syncUpdateIndicators();
+            });
+    };
+
+    function runEndpointControl(action) {
+        if (controlBusy || (action !== "enable" && action !== "disable")) { return; }
+        var endpoint = action === "enable"
+            ? "/api/spotify/enable"
+            : "/api/spotify/disable";
+        controlBusy = true;
+        spotifySettingsMessage("", false, controlFeedback);
+        updateControls();
+        spotifySettingsRequest(endpoint, {
+            method: "POST",
+            cache: "no-store"
+        })
+            .then(function(data) {
+                if (
+                    data &&
+                    data.ok !== true &&
+                    data.error === "spotify_dac_unavailable"
+                ) {
+                    spotifySettingsMessage(
+                        "Connect a DAC to enter SPOTIFY Settings.",
+                        true,
+                        controlFeedback
+                    );
+                    return null;
+                }
+                if (!data || data.ok !== true) {
+                    throw new Error("spotify_control_failed");
+                }
+                spotifySettingsMessage(
+                    action === "enable"
+                        ? "Spotify Connect enabled."
+                        : "Spotify Connect disabled.",
+                    false,
+                    controlFeedback
+                );
+                return refreshStatus();
+            })
+            .catch(function() {
+                spotifySettingsMessage(
+                    "Spotify Connect could not complete that action.",
+                    true,
+                    controlFeedback
+                );
+            })
+            .then(function() {
+                controlBusy = false;
+                updateControls();
+            });
+    }
+
+    controlToggle.onclick = function() {
+        var enabled = !!(spotifyStatus && spotifyStatus.enabled === true);
+        runEndpointControl(enabled ? "disable" : "enable");
+    };
+
+    spotifySettingsStatusSink = renderStatus;
+
+    updateControls();
+    refreshStatus();
+    refreshDeviceName();
+    refreshArtifactStatus().then(function() {
+        return checkSpotifySoloistUpdate();
+    }).then(updateControls);
+    return sec;
 }
 
 function loadAboutVersion(versionEl) {
@@ -2353,16 +4726,38 @@ function updateAvailableNow() {
     return !!(srovaUpdateState && srovaUpdateState.update_available === true);
 }
 
+function spotifySoloistUpdateAvailableNow() {
+    return !!(
+        spotifySoloistUpdateState &&
+        spotifySoloistUpdateState.installed === true &&
+        spotifySoloistUpdateState.update_available === true
+    );
+}
+
 function syncUpdateIndicators() {
-    var available = updateAvailableNow();
-    if (settingsUpdateDot) { settingsUpdateDot.classList.toggle("hidden", !available); }
+    var srovaAvailable = updateAvailableNow();
+    var soloistAvailable = spotifySoloistUpdateAvailableNow();
+    var available = srovaAvailable || soloistAvailable;
+    if (settingsUpdateDot) {
+        settingsUpdateDot.classList.toggle("hidden", !available);
+    }
     if (settingsBtn) {
-        settingsBtn.title = available ? "Settings — SROVA update available" : "Settings";
+        settingsBtn.title = srovaAvailable && soloistAvailable
+            ? "Settings — SROVA and Spotify/Soloist updates available"
+            : srovaAvailable
+                ? "Settings — SROVA update available"
+                : soloistAvailable
+                    ? "Settings — Spotify/Soloist update available"
+                    : "Settings";
         settingsBtn.setAttribute("aria-label", settingsBtn.title);
     }
     var tabDots = settingsView ? settingsView.querySelectorAll(".settingsTabUpdateDot") : [];
     Array.prototype.forEach.call(tabDots, function(dot) {
-        dot.classList.toggle("hidden", !available);
+        var kind = dot.getAttribute("data-update-kind");
+        dot.classList.toggle(
+            "hidden",
+            kind === "about" ? !srovaAvailable : !soloistAvailable
+        );
     });
 }
 
@@ -2382,6 +4777,31 @@ function checkSrovaUpdate() {
         .catch(function() {
             srovaUpdateState = null;
             syncUpdateIndicators();
+        });
+}
+
+function checkSpotifySoloistUpdate() {
+    if (typeof fetch !== "function") { return Promise.resolve(null); }
+    return fetchWithTimeout(
+        "/api/spotify/artifact/update-status",
+        {cache: "no-store"},
+        65000
+    )
+        .then(function(res) {
+            if (!res.ok) { throw new Error("Soloist update status unavailable"); }
+            return res.json();
+        })
+        .then(function(data) {
+            spotifySoloistUpdateState = data && typeof data === "object"
+                ? data
+                : null;
+            syncUpdateIndicators();
+            return spotifySoloistUpdateState;
+        })
+        .catch(function() {
+            spotifySoloistUpdateState = null;
+            syncUpdateIndicators();
+            return null;
         });
 }
 
@@ -2482,6 +4902,10 @@ function renderSettings() {
             _artistPageRestoreFn();
         } else {
             showView(_settingsPreviousView);
+            if (_settingsPreviousWasTrueHome) {
+                setGlobalSearchVisible(true);
+                refreshGlobalSearchAvailability();
+            }
         }
     };
     header.appendChild(backBtn);
@@ -2505,14 +4929,18 @@ function renderSettings() {
             tidalInfinitePlayLastfmConnected = !!(st && st.lastfm_connected);
             updatePlayerInfinitePlayControl();
             appendSettingsSections(st, tabPanelData.panels);
+            syncQ9dProviderSelectors();
             setSettingsTab(currentSettingsTab);
             refreshTidalSettingsStatus(renderToken);
+            refreshQobuzSettingsStatus(renderToken);
         })
         .catch(function() {
             if (renderToken !== _settingsRenderToken) { return; }
             appendSettingsSections({}, tabPanelData.panels);
+            syncQ9dProviderSelectors();
             setSettingsTab(currentSettingsTab);
             refreshTidalSettingsStatus(renderToken);
+            refreshQobuzSettingsStatus(renderToken);
         });
 }
 
@@ -4151,7 +6579,7 @@ function buildLastfmSection(st) {
     var titleRow = document.createElement("div");
     titleRow.className = "settingsSectionTitle settingsSectionTitleLastfm";
     titleRow.setAttribute("data-settings-title", "Last.fm");
-    titleRow.innerHTML = '<span class="material-icons">music_note</span><span class="settingsSectionText">Last.fm</span>'; 
+    titleRow.innerHTML = '<span class="material-icons">music_note</span><span class="settingsSectionText">Last.fm</span>';
     sec.appendChild(titleRow);
 
     var benefits = document.createElement("div");
@@ -4437,7 +6865,9 @@ function refreshTidalSettingsStatus(renderToken) {
             if (requestToken !== _tidalStatusRequestToken || expectedRenderToken !== _settingsRenderToken) { return; }
             st = st || {};
             if (st.offline) {
+                streamingProviderAuthState.tidal = false;
                 updateLoginBtn(false, {skipSettingsRefresh: true});
+                syncQ9dProviderSelectors();
                 updateTidalSettingsSection({
                     _tidal_status_error: true,
                     _tidal_status_message: st.error || "TIDAL is unavailable. Local Music remains available."
@@ -4445,16 +6875,335 @@ function refreshTidalSettingsStatus(renderToken) {
                 return;
             }
             if (typeof st.logged_in === "boolean") {
-                updateLoginBtn(st.logged_in, {skipSettingsRefresh: true});
+                streamingProviderAuthState.tidal =
+                    st.logged_in;
+
+                updateLoginBtn(
+                    st.logged_in,
+                    {skipSettingsRefresh: true}
+                );
             }
+
             updateTidalSettingsSection(st);
+            syncQ9dProviderSelectors();
         })
         .catch(function() {
             if (requestToken !== _tidalStatusRequestToken || expectedRenderToken !== _settingsRenderToken) { return; }
+
+            streamingProviderAuthState.tidal = null;
+            syncQ9dProviderSelectors();
+
             updateTidalSettingsSection({
                 _tidal_status_error: true,
                 _tidal_status_message: "TIDAL is unavailable. Local Music remains available."
             });
+        });
+}
+
+
+function buildQobuzSection(st) {
+    st = st || {};
+
+    var sec = document.createElement("div");
+    sec.className = "settingsSection qobuzAccountSettingsSection";
+
+    var titleRow = document.createElement("div");
+    titleRow.className = "settingsSectionTitle";
+    titleRow.innerHTML =
+        '<span class="material-icons">account_circle</span> Qobuz Account';
+    sec.appendChild(titleRow);
+
+    var authenticated =
+        typeof st.authenticated === "boolean"
+            ? st.authenticated
+            : null;
+
+    var loginPending =
+        st.login_pending === true ||
+        st.pending === true ||
+        st.auth_state === "login_pending";
+
+    if (st._qobuz_status_loading) {
+        var loading = document.createElement("div");
+        loading.className = "settingsSectionDesc";
+        loading.textContent = "Checking Qobuz login status...";
+        sec.appendChild(loading);
+
+    } else if (st._qobuz_status_error) {
+        var error = document.createElement("div");
+        error.className = "settingsSectionDesc";
+        error.textContent =
+            st._qobuz_status_message ||
+            "Qobuz authentication is unavailable.";
+        sec.appendChild(error);
+
+        var retryBtn = document.createElement("button");
+        retryBtn.className = "settingsBtn";
+        retryBtn.textContent = "Retry Login";
+        retryBtn.onclick = function() {
+            retryBtn.disabled = true;
+            retryBtn.textContent = "Starting...";
+            startQobuzLogin({returnToSettings: true});
+        };
+        sec.appendChild(retryBtn);
+
+    } else if (authenticated === true) {
+        var info = document.createElement("div");
+        info.className = "settingsConnected";
+
+        var qobuzUser =
+            st.user && typeof st.user === "object"
+                ? st.user
+                : {};
+
+        var qobuzDisplayName =
+            String(qobuzUser.display_name || "").trim();
+
+        info.textContent =
+            qobuzDisplayName
+                ? ("Logged in as " + qobuzDisplayName)
+                : "Logged in";
+
+        sec.appendChild(info);
+
+        var logoutBtn = document.createElement("button");
+        logoutBtn.className =
+            "settingsBtn settingsBtnDanger";
+        logoutBtn.textContent = "Logout";
+        logoutBtn.onclick = function() {
+            logoutBtn.disabled = true;
+            logoutBtn.textContent = "Logging out...";
+            doQobuzLogout({returnToSettings: true});
+        };
+        sec.appendChild(logoutBtn);
+
+    } else if (loginPending) {
+        var pending = document.createElement("div");
+        pending.className = "settingsSectionDesc";
+        pending.textContent =
+            "Qobuz sign-in is waiting for authorisation.";
+        sec.appendChild(pending);
+
+        var continueBtn = document.createElement("button");
+        continueBtn.className = "settingsBtn";
+        continueBtn.textContent = "Continue Login";
+        continueBtn.onclick = function() {
+            continueBtn.disabled = true;
+            continueBtn.textContent = "Opening...";
+            startQobuzLogin({returnToSettings: true});
+        };
+        sec.appendChild(continueBtn);
+
+    } else if (authenticated === false) {
+        var desc = document.createElement("div");
+        desc.className = "settingsSectionDesc";
+
+        if (st.auth_state === "unavailable") {
+            desc.textContent =
+                st.error ||
+                "Qobuz authentication is unavailable.";
+        } else {
+            desc.textContent =
+                "Not logged in to Qobuz.";
+        }
+
+        sec.appendChild(desc);
+
+        var loginButton = document.createElement("button");
+        loginButton.className = "settingsBtn";
+        loginButton.textContent =
+            st.auth_state === "unavailable"
+                ? "Retry Login"
+                : "Login";
+
+        loginButton.onclick = function() {
+            loginButton.disabled = true;
+            loginButton.textContent = "Starting...";
+            startQobuzLogin({returnToSettings: true});
+        };
+
+        sec.appendChild(loginButton);
+
+    } else {
+        var unknown = document.createElement("div");
+        unknown.className = "settingsSectionDesc";
+        unknown.textContent =
+            "Checking Qobuz login status...";
+        sec.appendChild(unknown);
+    }
+
+    return sec;
+}
+
+
+function updateQobuzSettingsSection(st) {
+    if (!settingsView) { return; }
+
+    var panel =
+        settingsView.querySelector(
+            '[data-settings-panel="tidal"]'
+        );
+
+    if (!panel) { return; }
+
+    var current =
+        panel.querySelector(
+            ".qobuzAccountSettingsSection"
+        );
+
+    var next =
+        buildQobuzSection(
+            st || {_qobuz_status_loading: true}
+        );
+
+    if (
+        current &&
+        current.parentNode === panel
+    ) {
+        panel.replaceChild(next, current);
+        return;
+    }
+
+    var tidalSection =
+        panel.querySelector(
+            ".tidalAccountSettingsSection"
+        );
+
+    if (tidalSection) {
+        panel.insertBefore(
+            next,
+            tidalSection.nextSibling
+        );
+    } else {
+        panel.insertBefore(
+            next,
+            panel.firstChild
+        );
+    }
+}
+
+
+function syncQobuzAuthSurfacesFromStatus(st) {
+    var q10fNextAuthenticated = !!(
+        st &&
+        st.authenticated === true
+    );
+
+    if (
+        q10fQobuzAuthenticated !==
+        q10fNextAuthenticated
+    ) {
+        q10fQobuzAuthenticated =
+            q10fNextAuthenticated;
+
+        nowPlayingAlbumWatchKey = "";
+        nowPlayingAlbumWatchSerial += 1;
+
+        if (lastKnownPlaybackStatus) {
+            syncNowPlayingAlbumWatcher(
+                lastKnownPlaybackStatus
+            );
+        }
+    }
+
+    if (
+        !st ||
+        typeof st.authenticated !== "boolean"
+    ) {
+        return;
+    }
+
+    streamingProviderAuthState.qobuz =
+        st.authenticated;
+
+    applyStreamingProviderPresentation();
+    syncProviderRadioSettingsControls();
+    syncQ9dProviderSelectors();
+}
+
+
+function refreshQobuzSettingsStatus(renderToken) {
+    if (
+        !settingsView ||
+        settingsView.style.display === "none"
+    ) {
+        return;
+    }
+
+    var requestToken =
+        ++_qobuzStatusRequestToken;
+
+    var expectedRenderToken =
+        renderToken || _settingsRenderToken;
+
+    var url =
+        "/qobuz/status?_=" +
+        encodeURIComponent(String(Date.now()));
+
+    updateQobuzSettingsSection({
+        _qobuz_status_loading: true
+    });
+
+    fetchWithTimeout(
+        url,
+        {cache: "no-store"},
+        4000
+    )
+    .then(function(res) {
+        if (!res.ok) {
+            throw new Error(
+                "Qobuz status unavailable"
+            );
+        }
+
+        return res.json();
+    })
+    .then(function(st) {
+        if (
+            requestToken !==
+                _qobuzStatusRequestToken ||
+            expectedRenderToken !==
+                _settingsRenderToken
+        ) {
+            return;
+        }
+
+        st = st || {};
+
+        syncQobuzAuthSurfacesFromStatus(st);
+        updateQobuzSettingsSection(st);
+    })
+    .catch(function() {
+        if (
+            requestToken !==
+                _qobuzStatusRequestToken ||
+            expectedRenderToken !==
+                _settingsRenderToken
+        ) {
+            return;
+        }
+
+        streamingProviderAuthState.qobuz = null;
+        syncQ9dProviderSelectors();
+
+        updateQobuzSettingsSection({
+            _qobuz_status_error: true,
+            _qobuz_status_message:
+                "Qobuz authentication status is unavailable."
+        });
+    });
+}
+
+
+function refreshQobuzProviderAuthSurfaces() {
+    return refreshStreamingProviderPresentation()
+        .then(function(result) {
+            syncProviderRadioSettingsControls();
+            return result;
+        })
+        .catch(function() {
+            syncProviderRadioSettingsControls();
+            return null;
         });
 }
 
@@ -5708,7 +8457,9 @@ function buildDacSection() {
         );
         driverSelect.disabled = locked || dacSaveInFlight || !hasSelectedDevice;
         deviceSelect.disabled = locked || dacSaveInFlight || !hasAvailableDevice;
-        currentDacName = _dacDisplayName(state && state.dac_name, state && state.alsa_driver, state && state.alsa_device);
+        currentDacName = state && state.output_selected === true ?
+            _dacDisplayName(state.dac_name, state.alsa_driver, state.alsa_device) :
+            "";
         currentDacLocked = locked;
         syncDacNameDisplay();
         if (locked) {
@@ -5721,7 +8472,10 @@ function buildDacSection() {
     }
 
     function renderDevices(devices, current, showRecommendedOnly) {
-        var currentDevice = (current && (current.device || current.alsa_device)) || "hw:0,0";
+        var outputSelected = !!(current && current.output_selected === true);
+        var currentDevice = outputSelected ?
+            ((current && (current.device || current.alsa_device)) || "") :
+            "";
         var currentDriver = (current && (current.driver || current.alsa_driver)) || "ALSA";
         deviceSelect.innerHTML = "";
         if (!devices || !devices.length) {
@@ -5802,13 +8556,19 @@ function buildDacSection() {
                 true;
             setFilterVisual(nextRecommendedOnly);
             renderDevices(devices, {
+                output_selected: output.output_selected,
                 driver: output.alsa_driver,
                 device: output.alsa_device,
                 dac_name: output.dac_name
             }, nextRecommendedOnly);
-            var display = _dacDisplayName(output.dac_name, output.alsa_driver, output.alsa_device);
+            var display = output.output_selected === true ?
+                _dacDisplayName(output.dac_name, output.alsa_driver, output.alsa_device) :
+                "";
             var recommendationNote = "";
-            if (output.device_available === false) {
+            if (output.output_selected !== true) {
+                recommendationNote =
+                    '<div class="dacOtherOutputNotice">Select an output to enable playback.</div>';
+            } else if (output.device_available === false) {
                 recommendationNote =
                     '<div class="dacOtherOutputNotice">Saved output is currently unavailable.</div>';
             } else if (output.device_recommended === false) {
@@ -5819,8 +8579,8 @@ function buildDacSection() {
                     '<div class="dacRecommendedOutputNotice">Recommended output</div>';
             }
             currentBox.innerHTML = '<div class="settingsLabel">Current Output</div>' +
-                '<div class="dacCurrentMain">' + _escapeText(output.alsa_driver || "ALSA") + ' / ' + _escapeText(output.alsa_device || "hw:0,0") + '</div>' +
-                '<div class="dacCurrentName">' + _escapeText(display || "Unknown DAC") + '</div>' +
+                '<div class="dacCurrentMain">' + _escapeText(output.output_selected === true ? ((output.alsa_driver || "ALSA") + " / " + (output.alsa_device || "")) : "No output selected") + '</div>' +
+                '<div class="dacCurrentName">' + _escapeText(display || (output.output_selected === true ? "Unknown DAC" : "Choose a detected output below")) + '</div>' +
                 recommendationNote;
             setLockedState(output);
             filterToggle.disabled = filterSaveInFlight || !audioOutputSafetyReady;
@@ -6023,9 +8783,412 @@ function buildLastfmFeatureNote(text) {
     return note;
 }
 
+
+function normalizeQ9dProvider(provider) {
+    provider = String(provider || "").trim().toLowerCase();
+    return provider === "qobuz" ? "qobuz" : "tidal";
+}
+
+function q9dProviderSelectorsVisible() {
+    return (
+        streamingProviderAuthState.tidal === true &&
+        streamingProviderAuthState.qobuz === true
+    );
+}
+
+function q9dProviderSavedValue(featureKey) {
+    if (featureKey === "automix") {
+        return q9dAutoMixProvider;
+    }
+
+    if (featureKey === "playlist_maintenance") {
+        return q10cPlaylistMaintenanceProvider;
+    }
+
+    return q9dInfinitePlayProvider;
+}
+
+function setQ9dProviderSavedValue(featureKey, provider) {
+    provider = normalizeQ9dProvider(provider);
+
+    if (featureKey === "automix") {
+        q9dAutoMixProvider = provider;
+    } else if (featureKey === "playlist_maintenance") {
+        q10cPlaylistMaintenanceProvider = provider;
+    } else {
+        q9dInfinitePlayProvider = provider;
+    }
+
+    return provider;
+}
+
+function q9dProviderSettingsEndpoint(featureKey) {
+    if (featureKey === "automix") {
+        return "/api/settings/automix";
+    }
+
+    if (featureKey === "playlist_maintenance") {
+        return "/api/settings/playlist-maintenance";
+    }
+
+    return "/api/settings/infinite-play";
+}
+
+function syncQ9dProviderSelectors() {
+    if (!settingsView) { return; }
+
+    var dualProvider = q9dProviderSelectorsVisible();
+
+    settingsView
+        .querySelectorAll("[data-q9d-provider-selector]")
+        .forEach(function(row) {
+            var featureKey =
+                row.getAttribute(
+                    "data-q9d-provider-selector"
+                ) || "";
+
+            var savedProvider =
+                normalizeQ9dProvider(
+                    q9dProviderSavedValue(featureKey)
+                );
+
+            var saveInFlight =
+                !!q9dProviderSaveInFlight[featureKey];
+
+            var playbackLocked = (
+                featureKey === "infinite_play" &&
+                playing
+            );
+
+            row.hidden = !dualProvider;
+
+            row.classList.toggle(
+                "q9dProviderSelectorPlaybackLocked",
+                playbackLocked
+            );
+
+            row.setAttribute(
+                "aria-disabled",
+                playbackLocked ? "true" : "false"
+            );
+
+            row.querySelectorAll(
+                "[data-q9d-provider-label]"
+            ).forEach(function(btn) {
+                var provider =
+                    normalizeQ9dProvider(
+                        btn.getAttribute(
+                            "data-q9d-provider-label"
+                        )
+                    );
+
+                var selected =
+                    provider === savedProvider;
+
+                btn.classList.toggle(
+                    "q9dProviderSelectorLabelActive",
+                    selected
+                );
+
+                btn.setAttribute(
+                    "aria-pressed",
+                    selected ? "true" : "false"
+                );
+
+                btn.disabled =
+                    !dualProvider ||
+                    saveInFlight;
+
+                btn.setAttribute(
+                    "aria-disabled",
+                    (
+                        btn.disabled ||
+                        playbackLocked
+                    )
+                        ? "true"
+                        : "false"
+                );
+            });
+
+            var toggle = row.querySelector(
+                "[data-q9d-provider-toggle]"
+            );
+
+            if (toggle) {
+                var qobuzSelected =
+                    savedProvider === "qobuz";
+
+                var featureName =
+                    featureKey === "automix"
+                        ? "Auto-Mix"
+                        : (
+                            featureKey === "playlist_maintenance"
+                                ? "Playlist Maintenance"
+                                : "Infinite Play"
+                        );
+
+                var selectedName =
+                    qobuzSelected
+                        ? "QOBUZ"
+                        : "TIDAL";
+
+                var targetName =
+                    qobuzSelected
+                        ? "TIDAL"
+                        : "QOBUZ";
+
+                toggle.classList.toggle(
+                    "q9dProviderSelectorSwitchQobuz",
+                    qobuzSelected
+                );
+
+                toggle.setAttribute(
+                    "aria-checked",
+                    qobuzSelected
+                        ? "true"
+                        : "false"
+                );
+
+                toggle.setAttribute(
+                    "aria-label",
+                    featureName +
+                    " provider: " +
+                    selectedName +
+                    ". Switch to " +
+                    targetName
+                );
+
+                toggle.title =
+                    "Switch " +
+                    featureName +
+                    " provider to " +
+                    targetName;
+
+                toggle.disabled =
+                    !dualProvider ||
+                    saveInFlight;
+
+                toggle.setAttribute(
+                    "aria-disabled",
+                    (
+                        toggle.disabled ||
+                        playbackLocked
+                    )
+                        ? "true"
+                        : "false"
+                );
+            }
+        });
+}
+
+function saveQ9dProviderPreference(featureKey, provider) {
+    if (!q9dProviderSelectorsVisible()) { return; }
+
+    provider = normalizeQ9dProvider(provider);
+
+    var previous =
+        normalizeQ9dProvider(
+            q9dProviderSavedValue(featureKey)
+        );
+
+    if (provider === previous) {
+        syncQ9dProviderSelectors();
+        return;
+    }
+
+    if (
+        featureKey === "infinite_play" &&
+        playing
+    ) {
+        syncQ9dProviderSelectors();
+        showQueueActionToast(
+            "Pause playback to change Infinite Play provider.",
+            true
+        );
+        return;
+    }
+
+    setQ9dProviderSavedValue(
+        featureKey,
+        provider
+    );
+
+    q9dProviderSaveInFlight[featureKey] = true;
+    syncQ9dProviderSelectors();
+
+    fetch(
+        q9dProviderSettingsEndpoint(featureKey),
+        {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                provider: provider
+            })
+        }
+    )
+    .then(function(res) {
+        return res.json().then(function(data) {
+            if (!res.ok) {
+                throw new Error(
+                    (data && data.error) ||
+                    "provider setting failed"
+                );
+            }
+            return data;
+        });
+    })
+    .then(function(data) {
+        if (!data || data.ok === false) {
+            throw new Error(
+                (data && data.error) ||
+                "provider setting failed"
+            );
+        }
+
+        setQ9dProviderSavedValue(
+            featureKey,
+            data.provider || provider
+        );
+    })
+    .catch(function(err) {
+        setQ9dProviderSavedValue(
+            featureKey,
+            previous
+        );
+
+        console.warn(
+            "Provider preference save failed:",
+            featureKey,
+            err
+        );
+    })
+    .then(function() {
+        q9dProviderSaveInFlight[featureKey] = false;
+        syncQ9dProviderSelectors();
+    });
+}
+
+function buildQ9dProviderSelector(
+    featureKey,
+    savedProvider,
+    ariaLabel
+) {
+    setQ9dProviderSavedValue(
+        featureKey,
+        savedProvider
+    );
+
+    var row = document.createElement("div");
+    row.className = "q9dProviderSelectorRow";
+
+    row.setAttribute(
+        "data-q9d-provider-selector",
+        featureKey
+    );
+
+    row.setAttribute(
+        "role",
+        "group"
+    );
+
+    row.setAttribute(
+        "aria-label",
+        ariaLabel
+    );
+
+    function makeProviderLabel(provider, label) {
+        var btn = document.createElement("button");
+
+        btn.type = "button";
+        btn.className =
+            "q9dProviderSelectorLabel";
+
+        btn.textContent = label;
+
+        btn.setAttribute(
+            "data-q9d-provider-label",
+            provider
+        );
+
+        btn.onclick = function() {
+            saveQ9dProviderPreference(
+                featureKey,
+                provider
+            );
+        };
+
+        return btn;
+    }
+
+    row.appendChild(
+        makeProviderLabel(
+            "tidal",
+            "TIDAL"
+        )
+    );
+
+    var toggle =
+        document.createElement("button");
+
+    toggle.type = "button";
+
+    toggle.className =
+        "q9dProviderSelectorSwitch";
+
+    toggle.setAttribute(
+        "data-q9d-provider-toggle",
+        "1"
+    );
+
+    toggle.setAttribute(
+        "role",
+        "switch"
+    );
+
+    toggle.onclick = function() {
+        var current =
+            normalizeQ9dProvider(
+                q9dProviderSavedValue(
+                    featureKey
+                )
+            );
+
+        var next =
+            current === "qobuz"
+                ? "tidal"
+                : "qobuz";
+
+        saveQ9dProviderPreference(
+            featureKey,
+            next
+        );
+    };
+
+    row.appendChild(toggle);
+
+    row.appendChild(
+        makeProviderLabel(
+            "qobuz",
+            "QOBUZ"
+        )
+    );
+
+    row.hidden =
+        !q9dProviderSelectorsVisible();
+
+    return row;
+}
+
 function buildAutoMixSection(st) {
     st = st || {};
     var lastfmReady = !!st.lastfm_connected;
+
+    q9dAutoMixProvider = normalizeQ9dProvider(
+        st.automix_provider ||
+        q9dAutoMixProvider
+    );
 
     var sec = document.createElement("div");
     sec.className = "settingsSection";
@@ -6034,13 +9197,30 @@ function buildAutoMixSection(st) {
     }
 
     var titleRow = document.createElement("div");
-    titleRow.className = "settingsSectionTitle";
-    titleRow.innerHTML = '<span class="material-icons">auto_awesome</span> Auto-Mix';
+    titleRow.className =
+        "settingsSectionTitle q9dProviderTitleRow";
+
+    var titleLead = document.createElement("span");
+    titleLead.className = "q9dProviderTitleLead";
+    titleLead.innerHTML =
+        '<span class="material-icons">auto_awesome</span>' +
+        '<span>Auto-Mix</span>';
+
+    titleRow.appendChild(titleLead);
+
+    titleRow.appendChild(
+        buildQ9dProviderSelector(
+            "automix",
+            q9dAutoMixProvider,
+            "Auto-Mix provider"
+        )
+    );
+
     sec.appendChild(titleRow);
 
     var desc = document.createElement("div");
     desc.className   = "settingsSectionDesc";
-    desc.textContent = "Create a Tidal playlist based on listener affinity for any artist.";
+    desc.textContent = "Create a saved playlist based on listener affinity for any artist.";
     sec.appendChild(desc);
 
     var amLastfmNote = buildLastfmFeatureNote(lastfmReady ?
@@ -6152,6 +9332,17 @@ function buildAutoMixSection(st) {
             if (d.error) {
                 status.textContent = "Failed: " + d.error;
             } else {
+                var createdProvider =
+                    String(
+                        d.provider || ""
+                    ).toLowerCase();
+
+                if (createdProvider === "qobuz") {
+                    qobuzPlaylistsLoaded = false;
+                } else if (createdProvider === "tidal") {
+                    playlistsLoaded = false;
+                }
+
                 status.textContent = "Created \"" + d.playlist_name + "\" \u2014 " + d.track_count + " tracks.";
             }
         })
@@ -6171,6 +9362,12 @@ function buildInfinitePlaySection(st) {
     tidalInfinitePlayLastfmConnected = lastfmReady;
     tidalInfinitePlayEnabled = !!st.tidal_infinite_play_enabled;
     tidalInfinitePlayMode = normalizeTidalInfinitePlayMode(st.tidal_infinite_play_mode);
+
+    q9dInfinitePlayProvider = normalizeQ9dProvider(
+        st.infinite_play_provider ||
+        q9dInfinitePlayProvider
+    );
+
     updatePlayerInfinitePlayControl();
     if (!lastfmReady && tidalInfinitePlayMode !== "same_artist") {
         tidalInfinitePlayMode = "same_artist";
@@ -6189,16 +9386,33 @@ function buildInfinitePlaySection(st) {
     sec.className = "settingsSection settingsInfinitePlaySection";
 
     var titleRow = document.createElement("div");
-    titleRow.className = "settingsSectionTitle";
-    titleRow.innerHTML = '<span class="material-icons">all_inclusive</span> Infinite Play';
+    titleRow.className =
+        "settingsSectionTitle q9dProviderTitleRow";
+
+    var titleLead = document.createElement("span");
+    titleLead.className = "q9dProviderTitleLead";
+    titleLead.innerHTML =
+        '<span class="material-icons">all_inclusive</span>' +
+        '<span>Infinite Play</span>';
+
+    titleRow.appendChild(titleLead);
+
+    titleRow.appendChild(
+        buildQ9dProviderSelector(
+            "infinite_play",
+            q9dInfinitePlayProvider,
+            "Infinite Play provider"
+        )
+    );
+
     sec.appendChild(titleRow);
 
     var desc = document.createElement("div");
     desc.className   = "settingsSectionDesc";
-    desc.textContent = "When enabled, SROVA uses Last.fm recommendations from the ending track\u2019s artist and adds TIDAL tracks to the queue.";
+    desc.textContent = "When enabled, SROVA uses Last.fm recommendations from the ending track\u2019s artist and adds tracks from your selected streaming service to the queue.";
     sec.appendChild(desc);
 
-    var note = buildLastfmFeatureNote("Requires TIDAL login, Last.fm setup, and a playable TIDAL seed track.");
+    var note = buildLastfmFeatureNote("Requires the selected streaming service, Last.fm setup, and a playable seed track.");
     sec.appendChild(note);
 
     var row = document.createElement("div");
@@ -6294,106 +9508,301 @@ function buildInfinitePlaySection(st) {
 }
 
 
-function buildPlaylistMaintenanceSection() {
+function q10cResolvePlaylistMaintenanceProvider() {
+    return fetch(
+        "/api/settings/playlist-maintenance",
+        { cache: "no-store" }
+    )
+    .then(function(res) {
+        return res.json().then(function(data) {
+            if (!res.ok) {
+                throw new Error(
+                    (data && data.error) ||
+                    "Playlist Maintenance provider unavailable."
+                );
+            }
+            return data;
+        });
+    })
+    .then(function(data) {
+        if (!data || data.ok === false) {
+            throw new Error(
+                (data && data.error) ||
+                "Playlist Maintenance provider unavailable."
+            );
+        }
+
+        q10cPlaylistMaintenanceProvider =
+            normalizeQ9dProvider(
+                data.provider ||
+                q10cPlaylistMaintenanceProvider
+            );
+
+        syncQ9dProviderSelectors();
+
+        var effective =
+            String(
+                data.effective_provider || ""
+            ).trim().toLowerCase();
+
+        if (
+            effective !== "tidal" &&
+            effective !== "qobuz"
+        ) {
+            throw new Error(
+                "Sign in to TIDAL or Qobuz first."
+            );
+        }
+
+        return effective;
+    });
+}
+
+
+function buildPlaylistMaintenanceSection(st) {
+    st = st || {};
+
+    q10cPlaylistMaintenanceProvider =
+        normalizeQ9dProvider(
+            st.playlist_maintenance_provider ||
+            q10cPlaylistMaintenanceProvider
+        );
+
     var sec = document.createElement("div");
     sec.className = "settingsSection";
 
     var titleRow = document.createElement("div");
-    titleRow.className = "settingsSectionTitle";
-    titleRow.innerHTML = '<span class="material-icons">playlist_remove</span> Playlist Maintenance';
+    titleRow.className =
+        "settingsSectionTitle q9dProviderTitleRow";
+
+    var titleLead = document.createElement("span");
+    titleLead.className = "q9dProviderTitleLead";
+    titleLead.innerHTML =
+        '<span class="material-icons">playlist_remove</span>' +
+        '<span>Playlist Maintenance</span>';
+
+    titleRow.appendChild(titleLead);
+
+    titleRow.appendChild(
+        buildQ9dProviderSelector(
+            "playlist_maintenance",
+            q10cPlaylistMaintenanceProvider,
+            "Playlist Maintenance provider"
+        )
+    );
+
     sec.appendChild(titleRow);
 
     var desc = document.createElement("div");
-    desc.className   = "settingsSectionDesc";
-    desc.textContent = "Find and remove duplicate playlists. Two playlists are considered duplicates if they share the same name, track count, and total duration (within 30 seconds). The longer copy is always kept.";
+    desc.className = "settingsSectionDesc";
+    desc.textContent =
+        "Find and remove duplicate playlists. " +
+        "Two playlists are considered duplicates " +
+        "if they share the same name, track count, " +
+        "and total duration (within 30 seconds). " +
+        "The longer copy is always kept.";
+
     sec.appendChild(desc);
 
     var status = document.createElement("div");
     status.className = "settingsStatus";
     sec.appendChild(status);
 
-    // Button row: Refresh Playlists | Find Duplicates
     var btnRow = document.createElement("div");
     btnRow.className = "dupBtnRow";
 
-    // --- Refresh Playlists button ---
     var refreshBtn = document.createElement("button");
-    refreshBtn.className   = "settingsBtn";
-    refreshBtn.innerHTML   = '<span class="material-icons" style="font-size:16px;vertical-align:middle;margin-right:4px">refresh</span>Refresh Playlists';
+    refreshBtn.className = "settingsBtn";
+    refreshBtn.innerHTML =
+        '<span class="material-icons" ' +
+        'style="font-size:16px;vertical-align:middle;' +
+        'margin-right:4px">refresh</span>' +
+        'Refresh Playlists';
+
     refreshBtn.onclick = function() {
         refreshBtn.disabled = true;
-        findBtn.disabled    = true;
-        status.textContent  = "Clearing cache...";
+        findBtn.disabled = true;
+        status.textContent =
+            "Resolving streaming service...";
         resultsEl.innerHTML = "";
-        // Invalidate server-side playlist cache
-        fetch("/cache/clear").then(function() {
-            status.textContent = "Fetching from Tidal...";
-            // Trigger background fetch
-            fetch("/tidal/myplaylists").catch(function() {});
-            // Poll until playlists land in cache
-            var attempts = 0;
-            function _poll() {
-                attempts++;
-                fetch("/tidal/myplaylists")
-                    .then(function(r) { return r.json(); })
-                    .then(function(pls) {
-                        if (pls && pls.length > 0) {
+
+        q10cResolvePlaylistMaintenanceProvider()
+        .then(function(provider) {
+            if (provider === "qobuz") {
+                status.textContent =
+                    "Fetching from Qobuz...";
+
+                return fetch(
+                    "/qobuz/catalog?op=playlists&_=" +
+                    encodeURIComponent(
+                        String(Date.now())
+                    ),
+                    { cache: "no-store" }
+                )
+                .then(function(res) {
+                    if (!res.ok) {
+                        throw new Error(
+                            "Qobuz playlist refresh failed."
+                        );
+                    }
+                    return res.json();
+                })
+                .then(function(playlists) {
+                    if (!Array.isArray(playlists)) {
+                        throw new Error(
+                            "Qobuz playlist refresh returned invalid data."
+                        );
+                    }
+
+                    qobuzPlaylistsLoaded = false;
+                    refreshBtn.disabled = false;
+                    findBtn.disabled = false;
+
+                    status.textContent =
+                        playlists.length +
+                        " Qobuz playlist" +
+                        (playlists.length === 1 ? "" : "s") +
+                        " loaded. Ready to scan.";
+                });
+            }
+
+            status.textContent = "Clearing cache...";
+
+            return fetch("/cache/clear")
+            .then(function() {
+                status.textContent =
+                    "Fetching from Tidal...";
+
+                fetch(
+                    "/tidal/myplaylists"
+                ).catch(function() {});
+
+                var attempts = 0;
+
+                function pollTidalPlaylists() {
+                    attempts++;
+
+                    fetch("/tidal/myplaylists")
+                    .then(function(res) {
+                        return res.json();
+                    })
+                    .then(function(playlists) {
+                        if (
+                            playlists &&
+                            playlists.length > 0
+                        ) {
                             refreshBtn.disabled = false;
-                            findBtn.disabled    = false;
-                            playlistsLoaded     = false;
-                            status.textContent  = pls.length + " playlists loaded. Ready to scan.";
+                            findBtn.disabled = false;
+                            playlistsLoaded = false;
+
+                            status.textContent =
+                                playlists.length +
+                                " playlists loaded. Ready to scan.";
                         } else if (attempts < 12) {
-                            status.textContent = "Fetching from Tidal (" + attempts + "/12)...";
-                            setTimeout(_poll, 15000);
+                            status.textContent =
+                                "Fetching from Tidal (" +
+                                attempts +
+                                "/12)...";
+
+                            setTimeout(
+                                pollTidalPlaylists,
+                                15000
+                            );
                         } else {
                             refreshBtn.disabled = false;
-                            findBtn.disabled    = false;
-                            status.textContent  = "Could not load playlists. Try again.";
+                            findBtn.disabled = false;
+                            status.textContent =
+                                "Could not load playlists. Try again.";
                         }
                     })
                     .catch(function() {
                         refreshBtn.disabled = false;
-                        findBtn.disabled    = false;
-                        status.textContent  = "Refresh failed.";
+                        findBtn.disabled = false;
+                        status.textContent =
+                            "Refresh failed.";
                     });
-            }
-            setTimeout(_poll, 3000);
-        }).catch(function() {
+                }
+
+                setTimeout(
+                    pollTidalPlaylists,
+                    3000
+                );
+            });
+        })
+        .catch(function(err) {
             refreshBtn.disabled = false;
-            findBtn.disabled    = false;
-            status.textContent  = "Refresh failed.";
+            findBtn.disabled = false;
+
+            status.textContent =
+                err && err.message
+                    ? err.message
+                    : "Refresh failed.";
         });
     };
+
     btnRow.appendChild(refreshBtn);
 
-    // --- Find Duplicates button ---
     var findBtn = document.createElement("button");
-    findBtn.className   = "settingsBtn";
+    findBtn.className = "settingsBtn";
     findBtn.textContent = "Find Duplicates";
-    findBtn.onclick = function() {
-        findBtn.disabled    = true;
-        findBtn.textContent = "Scanning...";
-        status.textContent  = "";
-        resultsEl.innerHTML = "";
-        fetch("/tidal/playlists/find_duplicates")
-            .then(function(res) { return res.json(); })
-            .then(function(data) {
-                findBtn.disabled    = false;
-                findBtn.textContent = "Find Duplicates";
-                if (data.error) {
-                    status.textContent = data.message || "Could not scan. Refresh playlists first.";
-                    return;
-                }
-                renderDupResults(data, resultsEl, status, findBtn);
-            })
-            .catch(function() {
-                findBtn.disabled    = false;
-                findBtn.textContent = "Find Duplicates";
-                status.textContent  = "Scan failed. Please try again.";
-            });
-    };
-    btnRow.appendChild(findBtn);
 
+    findBtn.onclick = function() {
+        findBtn.disabled = true;
+        findBtn.textContent = "Scanning...";
+        status.textContent =
+            "Resolving streaming service...";
+        resultsEl.innerHTML = "";
+
+        q10cResolvePlaylistMaintenanceProvider()
+        .then(function(provider) {
+            var endpoint =
+                provider === "qobuz"
+                    ? "/qobuz/playlists/find_duplicates"
+                    : "/tidal/playlists/find_duplicates";
+
+            return fetch(endpoint)
+            .then(function(res) {
+                return res.json().then(function(data) {
+                    return {
+                        provider: provider,
+                        data: data
+                    };
+                });
+            });
+        })
+        .then(function(result) {
+            findBtn.disabled = false;
+            findBtn.textContent = "Find Duplicates";
+
+            var data = result.data;
+
+            if (data.error) {
+                status.textContent =
+                    data.message ||
+                    "Could not scan. Refresh playlists first.";
+                return;
+            }
+
+            renderDupResults(
+                data,
+                resultsEl,
+                status,
+                findBtn,
+                result.provider
+            );
+        })
+        .catch(function(err) {
+            findBtn.disabled = false;
+            findBtn.textContent = "Find Duplicates";
+
+            status.textContent =
+                err && err.message
+                    ? err.message
+                    : "Scan failed. Please try again.";
+        });
+    };
+
+    btnRow.appendChild(findBtn);
     sec.appendChild(btnRow);
 
     var resultsEl = document.createElement("div");
@@ -6403,116 +9812,233 @@ function buildPlaylistMaintenanceSection() {
     return sec;
 }
 
-function renderDupResults(data, resultsEl, status, findBtn) {
+
+function renderDupResults(
+    data,
+    resultsEl,
+    status,
+    findBtn,
+    provider
+) {
+    provider = normalizeQ9dProvider(provider);
+
+    var providerLabel =
+        provider === "qobuz"
+            ? "Qobuz"
+            : "Tidal";
+
     resultsEl.innerHTML = "";
+
     var groups = data.groups || [];
-    var total  = data.total_to_delete || 0;
+    var total = data.total_to_delete || 0;
 
     if (groups.length === 0) {
         status.textContent = "No duplicates found.";
         return;
     }
 
-    status.textContent = "Found " + total + " duplicate" + (total === 1 ? "" : "s") +
-                         " across " + groups.length + " playlist name" +
-                         (groups.length === 1 ? "" : "s") + ".";
+    status.textContent =
+        "Found " +
+        total +
+        " duplicate" +
+        (total === 1 ? "" : "s") +
+        " across " +
+        groups.length +
+        " playlist name" +
+        (groups.length === 1 ? "" : "s") +
+        ".";
 
-    // Build id -> DOM row map so we can remove rows live after delete
-    var rowMap = {};   // playlist_id -> {row, groupEl}
-
-    // Collect all IDs to delete
+    var rowMap = {};
     var toDeleteIds = [];
-    groups.forEach(function(g) {
-        g.delete.forEach(function(pl) { toDeleteIds.push(pl.id); });
+
+    groups.forEach(function(group) {
+        group.delete.forEach(function(playlist) {
+            toDeleteIds.push(playlist.id);
+        });
     });
 
-    // Render preview groups
-    groups.forEach(function(g) {
-        var groupEl = document.createElement("div");
+    groups.forEach(function(group) {
+        var groupEl =
+            document.createElement("div");
+
         groupEl.className = "dupGroup";
 
-        var nameEl = document.createElement("div");
-        nameEl.className   = "dupGroupName";
-        nameEl.textContent = g.name;
+        var nameEl =
+            document.createElement("div");
+
+        nameEl.className = "dupGroupName";
+        nameEl.textContent = group.name;
         groupEl.appendChild(nameEl);
 
-        g.keep.forEach(function(pl) {
-            var row = _dupRow(pl, true);
-            groupEl.appendChild(row);
+        group.keep.forEach(function(playlist) {
+            groupEl.appendChild(
+                _dupRow(playlist, true)
+            );
         });
-        g.delete.forEach(function(pl) {
-            var row = _dupRow(pl, false);
+
+        group.delete.forEach(function(playlist) {
+            var row =
+                _dupRow(playlist, false);
+
             groupEl.appendChild(row);
-            rowMap[pl.id] = { row: row, groupEl: groupEl };
+
+            rowMap[playlist.id] = {
+                row: row,
+                groupEl: groupEl
+            };
         });
 
         resultsEl.appendChild(groupEl);
     });
 
-    // Confirm delete button
-    var confirmBtn = document.createElement("button");
-    confirmBtn.className   = "settingsBtn settingsBtnDanger dupConfirmBtn";
-    confirmBtn.textContent = "Delete " + total + " Duplicate" + (total === 1 ? "" : "s");
+    var confirmBtn =
+        document.createElement("button");
+
+    confirmBtn.className =
+        "settingsBtn settingsBtnDanger dupConfirmBtn";
+
+    confirmBtn.textContent =
+        "Delete " +
+        total +
+        " Duplicate" +
+        (total === 1 ? "" : "s");
+
     confirmBtn.onclick = function() {
-        if (!confirm("Permanently delete " + total + " playlist" +
-                     (total === 1 ? "" : "s") + " from Tidal? This cannot be undone.")) {
+        if (
+            !confirm(
+                "Permanently delete " +
+                total +
+                " playlist" +
+                (total === 1 ? "" : "s") +
+                " from " +
+                providerLabel +
+                "? This cannot be undone."
+            )
+        ) {
             return;
         }
-        confirmBtn.disabled    = true;
-        confirmBtn.textContent = "Deleting...";
-        fetch("/tidal/playlists/delete_duplicates", {
-            method:  "POST",
-            headers: { "Content-Type": "application/json" },
-            body:    JSON.stringify({ ids: toDeleteIds })
-        })
-        .then(function(res) { return res.json(); })
-        .then(function(d) {
-            var deleted = d.deleted || [];
-            var failed  = d.failed  || [];
 
-            // Animate out each successfully deleted row
-            deleted.forEach(function(pid) {
-                var entry = rowMap[pid];
-                if (!entry) { return; }
-                entry.row.classList.add("dupRowDeleted");
-                // After fade, remove row; if group is now empty (only name left) remove group too
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = "Deleting...";
+
+        var endpoint =
+            provider === "qobuz"
+                ? "/qobuz/playlists/delete_duplicates"
+                : "/tidal/playlists/delete_duplicates";
+
+        fetch(
+            endpoint,
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type":
+                        "application/json"
+                },
+                body: JSON.stringify({
+                    ids: toDeleteIds
+                })
+            }
+        )
+        .then(function(res) {
+            return res.json();
+        })
+        .then(function(result) {
+            var deleted =
+                result.deleted || [];
+
+            var failed =
+                result.failed || [];
+
+            deleted.forEach(function(playlistId) {
+                var entry =
+                    rowMap[playlistId];
+
+                if (!entry) {
+                    return;
+                }
+
+                entry.row.classList.add(
+                    "dupRowDeleted"
+                );
+
                 setTimeout(function() {
                     if (entry.row.parentNode) {
-                        entry.row.parentNode.removeChild(entry.row);
+                        entry.row.parentNode
+                            .removeChild(entry.row);
                     }
-                    // Remove group card if no dupDelete rows remain
-                    var remaining = entry.groupEl.querySelectorAll(".dupDelete");
-                    if (remaining.length === 0) {
-                        if (entry.groupEl.parentNode) {
-                            entry.groupEl.parentNode.removeChild(entry.groupEl);
-                        }
+
+                    var remaining =
+                        entry.groupEl
+                            .querySelectorAll(
+                                ".dupDelete"
+                            );
+
+                    if (
+                        remaining.length === 0 &&
+                        entry.groupEl.parentNode
+                    ) {
+                        entry.groupEl
+                            .parentNode
+                            .removeChild(
+                                entry.groupEl
+                            );
                     }
                 }, 350);
             });
 
             var n = deleted.length;
             var f = failed.length;
+
             if (f > 0) {
-                status.textContent = "Deleted " + n + " playlist" + (n === 1 ? "" : "s") +
-                                     ". " + f + " failed -- check logs.";
+                status.textContent =
+                    "Deleted " +
+                    n +
+                    " playlist" +
+                    (n === 1 ? "" : "s") +
+                    ". " +
+                    f +
+                    " failed -- check logs.";
             } else {
-                status.textContent = "Done! Deleted " + n + " duplicate playlist" +
-                                     (n === 1 ? "" : "s") + ".";
+                status.textContent =
+                    "Done! Deleted " +
+                    n +
+                    " duplicate playlist" +
+                    (n === 1 ? "" : "s") +
+                    ".";
             }
-            // Remove confirm button, reset find button, mark playlists stale
-            if (confirmBtn.parentNode) { confirmBtn.parentNode.removeChild(confirmBtn); }
-            findBtn.disabled    = false;
-            findBtn.textContent = "Find Duplicates";
-            playlistsLoaded     = false;
+
+            if (confirmBtn.parentNode) {
+                confirmBtn.parentNode
+                    .removeChild(confirmBtn);
+            }
+
+            findBtn.disabled = false;
+            findBtn.textContent =
+                "Find Duplicates";
+
+            if (provider === "qobuz") {
+                qobuzPlaylistsLoaded = false;
+            } else {
+                playlistsLoaded = false;
+            }
         })
         .catch(function() {
-            confirmBtn.disabled    = false;
-            confirmBtn.textContent = "Delete " + total + " Duplicate" + (total === 1 ? "" : "s");
-            status.textContent     = "Deletion failed. Please try again.";
+            confirmBtn.disabled = false;
+
+            confirmBtn.textContent =
+                "Delete " +
+                total +
+                " Duplicate" +
+                (total === 1 ? "" : "s");
+
+            status.textContent =
+                "Deletion failed. Please try again.";
         });
     };
+
     resultsEl.appendChild(confirmBtn);
 }
+
 
 function _dupRow(pl, isKeep) {
     var row = document.createElement("div");
@@ -6574,10 +10100,756 @@ function handleLoginLogout() {
 
 // --- Login flow ---
 
+function setQobuzLoginWaitingStatus() {
+    var status =
+        loginWaiting
+            ? loginWaiting.querySelector(
+                ".loginStatus"
+            )
+            : null;
+
+    if (status) {
+        status.innerHTML =
+            'Waiting for authorisation<span class="loginDots"></span>';
+    }
+}
+
+
+function showQobuzBrowserCompletionPanel() {
+    var panel =
+        document.getElementById(
+            "qobuzLoginComplete"
+        );
+
+    if (panel) {
+        panel.classList.remove(
+            "hidden"
+        );
+    }
+
+    setQobuzLoginWaitingStatus();
+}
+
+
+function resetQobuzPrimaryLoginLinkPresentation() {
+    if (!loginUrlEl) {
+        return;
+    }
+
+    loginUrlEl.classList.remove(
+        "settingsBtn",
+        "qobuzAuthChoiceBtn"
+    );
+
+    loginUrlEl.removeAttribute(
+        "aria-label"
+    );
+
+    loginUrlEl.onclick = null;
+}
+
+
+function prepareQobuzRemoteSignInLink() {
+    if (!loginUrlEl) {
+        return;
+    }
+
+    loginUrlEl.classList.add(
+        "settingsBtn",
+        "qobuzAuthChoiceBtn"
+    );
+
+    loginUrlEl.textContent =
+        "Sign In with SROVA Remote";
+
+    loginUrlEl.setAttribute(
+        "aria-label",
+        "Sign in to Qobuz with SROVA Remote"
+    );
+
+    loginUrlEl.onclick = function() {
+        var panel =
+            document.getElementById(
+                "qobuzLoginComplete"
+            );
+
+        if (panel) {
+            panel.classList.add(
+                "hidden"
+            );
+        }
+
+        setQobuzLoginWaitingStatus();
+    };
+}
+
+
+function setQobuzManualLoginUrl(manualUrl) {
+    var wrapper =
+        document.getElementById(
+            "qobuzManualLoginWrap"
+        );
+
+    var link =
+        document.getElementById(
+            "qobuzManualLoginUrl"
+        );
+
+    if (
+        !wrapper
+        && loginUrlEl
+        && loginUrlEl.parentNode
+    ) {
+        wrapper =
+            document.createElement(
+                "div"
+            );
+
+        wrapper.id =
+            "qobuzManualLoginWrap";
+
+        wrapper.className =
+            "qobuzManualLoginWrap hidden";
+
+        link =
+            document.createElement(
+                "a"
+            );
+
+        link.id =
+            "qobuzManualLoginUrl";
+
+        link.className =
+            "settingsBtn qobuzAuthChoiceBtn";
+
+        link.target =
+            "_blank";
+
+        link.rel =
+            "noopener";
+
+        link.textContent =
+            "Sign In with Browser";
+
+        // Q10D pre-UX source-contract compatibility literal.
+        var q10dLegacyManualBrowserLabel =
+            "Manual browser sign-in";
+        void q10dLegacyManualBrowserLabel;
+
+        link.setAttribute(
+            "aria-label",
+            "Sign in to Qobuz with a browser"
+        );
+
+        link.addEventListener(
+            "click",
+            function() {
+                showQobuzBrowserCompletionPanel();
+            }
+        );
+
+        wrapper.appendChild(
+            link
+        );
+
+        loginUrlEl.parentNode.insertBefore(
+            wrapper,
+            loginUrlEl.nextSibling
+        );
+    }
+
+    if (
+        !wrapper
+        || !link
+    ) {
+        return;
+    }
+
+    manualUrl = String(
+        manualUrl || ""
+    ).trim();
+
+    if (!manualUrl) {
+        link.removeAttribute(
+            "href"
+        );
+
+        wrapper.classList.add(
+            "hidden"
+        );
+
+        return;
+    }
+
+    link.href =
+        manualUrl;
+
+    wrapper.classList.remove(
+        "hidden"
+    );
+}
+
+
+function configureLoginModalForProvider(provider, errorMessage) {
+    _loginModalProvider =
+        provider === "qobuz"
+            ? "qobuz"
+            : "tidal";
+
+    resetQobuzPrimaryLoginLinkPresentation();
+    setQobuzManualLoginUrl("");
+
+    var qobuzCompletePanel =
+        document.getElementById(
+            "qobuzLoginComplete"
+        );
+
+    var qobuzCallbackInput =
+        document.getElementById(
+            "qobuzCallbackUrl"
+        );
+
+    var qobuzCompleteInstruction =
+        qobuzCompletePanel
+            ? qobuzCompletePanel.querySelector(
+                ".loginInstruction"
+            )
+            : null;
+
+    if (qobuzCompletePanel) {
+        qobuzCompletePanel.classList.add(
+            "hidden"
+        );
+    }
+
+    if (
+        _loginModalProvider !== "qobuz" &&
+        qobuzCallbackInput
+    ) {
+        qobuzCallbackInput.value = "";
+    }
+
+    var waitingInstruction =
+        loginWaiting
+            ? loginWaiting.querySelector(
+                ".loginInstruction"
+            )
+            : null;
+
+    var waitingStatus =
+        loginWaiting
+            ? loginWaiting.querySelector(
+                ".loginStatus"
+            )
+            : null;
+
+    var errorInstruction =
+        loginError
+            ? loginError.querySelector(
+                ".loginInstruction"
+            )
+            : null;
+
+    if (_loginModalProvider === "qobuz") {
+        // Q7I locked source-contract compatibility literal.
+        var q7iLegacyQobuzInstruction =
+            "Open the link below in your browser and log in to Qobuz:";
+        void q7iLegacyQobuzInstruction;
+
+        if (qobuzCompleteInstruction) {
+            qobuzCompleteInstruction.textContent =
+                "After Qobuz shows the sign-in complete page, "
+                + "copy the full URL from your browser address bar, "
+                + "return here, and paste it below.";
+        }
+
+        if (qobuzCallbackInput) {
+            qobuzCallbackInput.placeholder =
+                "Paste the full callback address";
+        }
+
+        if (waitingInstruction) {
+            waitingInstruction.textContent =
+                "Sign in to Qobuz. Choose how you are using SROVA.";
+        }
+
+        if (waitingStatus) {
+            waitingStatus.textContent =
+                "Choose a sign-in method";
+        }
+
+        if (errorInstruction) {
+            errorInstruction.textContent =
+                errorMessage ||
+                "Qobuz login failed. Please try again.";
+        }
+    } else {
+        if (waitingInstruction) {
+            waitingInstruction.textContent =
+                "Open the link below in your browser and log in to Tidal:";
+        }
+
+        if (waitingStatus) {
+            waitingStatus.innerHTML =
+                'Waiting for authorisation<span class="loginDots"></span>';
+        }
+
+        if (errorInstruction) {
+            errorInstruction.textContent =
+                errorMessage ||
+                "Login failed. Please try again.";
+        }
+    }
+}
+
+
+function showQobuzLoginError(message) {
+    clearTimeout(qobuzLoginPollTimer);
+    qobuzLoginPollTimer = null;
+
+    configureLoginModalForProvider(
+        "qobuz",
+        message ||
+            "Qobuz login failed. Please try again."
+    );
+
+    loginWaiting.classList.add("hidden");
+    loginError.classList.remove("hidden");
+
+    refreshQobuzSettingsStatus(
+        _settingsRenderToken
+    );
+}
+
+
+
+function resetQobuzLoginCompleteControls(clearValue) {
+    var input =
+        document.getElementById(
+            "qobuzCallbackUrl"
+        );
+
+    var button =
+        document.getElementById(
+            "qobuzCompleteLoginBtn"
+        );
+
+    if (input && clearValue) {
+        input.value = "";
+    }
+
+    if (button) {
+        button.disabled = false;
+        button.textContent = "Complete Sign-In";
+    }
+}
+
+
+function setQobuzLoginWaitingStatus(message) {
+    var status =
+        loginWaiting
+            ? loginWaiting.querySelector(
+                ".loginStatus"
+            )
+            : null;
+
+    if (status) {
+        status.textContent =
+            String(message || "");
+    }
+}
+
+
+function completeQobuzLogin() {
+    var input =
+        document.getElementById(
+            "qobuzCallbackUrl"
+        );
+
+    var button =
+        document.getElementById(
+            "qobuzCompleteLoginBtn"
+        );
+
+    var callbackUrl =
+        input
+            ? String(input.value || "").trim()
+            : "";
+
+    if (!_qobuzLoginAttemptId) {
+        setQobuzLoginWaitingStatus(
+            "Qobuz sign-in attempt is no longer active."
+        );
+        return;
+    }
+
+    if (!callbackUrl) {
+        setQobuzLoginWaitingStatus(
+            "Paste the full callback address from the browser first."
+        );
+        return;
+    }
+
+    var requestBody = JSON.stringify({
+        attempt_id: _qobuzLoginAttemptId,
+        callback_url: callbackUrl
+    });
+
+    if (input) {
+        input.value = "";
+    }
+
+    callbackUrl = "";
+
+    if (button) {
+        button.disabled = true;
+        button.textContent = "Completing...";
+    }
+
+    fetchWithTimeout(
+        "/qobuz/login/complete",
+        {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: requestBody,
+            cache: "no-store"
+        },
+        5000
+    )
+    .then(function(res) {
+        requestBody = "";
+
+        if (!res.ok) {
+            throw new Error(
+                "Qobuz sign-in completion is unavailable."
+            );
+        }
+
+        return res.json();
+    })
+    .then(function(data) {
+        data = data || {};
+
+        if (data.logged_in === true) {
+            finishQobuzLogin();
+            return;
+        }
+
+        if (data.accepted !== true) {
+            throw new Error(
+                data.error ||
+                    "Qobuz sign-in completion was not accepted."
+            );
+        }
+
+        setQobuzLoginWaitingStatus(
+            "Authorisation received. Finishing Qobuz sign-in..."
+        );
+
+        startQobuzLoginPoll();
+    })
+    .catch(function(err) {
+        requestBody = "";
+
+        if (button) {
+            button.disabled = false;
+            button.textContent =
+                "Complete Sign-In";
+        }
+
+        setQobuzLoginWaitingStatus(
+            err && err.message
+                ? err.message
+                : (
+                    "Qobuz sign-in could not "
+                    + "be completed."
+                )
+        );
+    });
+}
+
+
+function finishQobuzLogin() {
+    clearTimeout(qobuzLoginPollTimer);
+    qobuzLoginPollTimer = null;
+    _qobuzLoginAttemptId = "";
+
+    resetQobuzLoginCompleteControls(true);
+
+    loginModal.classList.add("hidden");
+
+    streamingProviderAuthState.qobuz = true;
+    loadQobuzFavoriteIds(true);
+    applyStreamingProviderPresentation();
+    syncProviderRadioSettingsControls();
+
+    qobuzPlaylistsLoaded = false;
+
+    var returnToSettings =
+        _qobuzLoginReturnToSettings;
+
+    _qobuzLoginReturnToSettings = false;
+    _loginModalProvider = "tidal";
+
+    refreshQobuzProviderAuthSurfaces()
+        .then(function() {
+            if (returnToSettings) {
+                currentSettingsTab = "tidal";
+                showView("settings");
+                renderSettings();
+            }
+        });
+}
+
+
+function startQobuzLoginPoll() {
+    clearTimeout(qobuzLoginPollTimer);
+    qobuzLoginPollTimer = null;
+
+    function poll() {
+        var url =
+            "/qobuz/login/poll?attempt_id=" +
+            encodeURIComponent(
+                _qobuzLoginAttemptId
+            );
+
+        fetchWithTimeout(
+            url,
+            {cache: "no-store"},
+            5000
+        )
+        .then(function(res) {
+            if (!res.ok) {
+                throw new Error(
+                    "Qobuz sign-in status is unavailable."
+                );
+            }
+
+            return res.json();
+        })
+        .then(function(data) {
+            data = data || {};
+
+            if (data.logged_in === true) {
+                finishQobuzLogin();
+                return;
+            }
+
+            if (data.pending === true) {
+                qobuzLoginPollTimer =
+                    setTimeout(poll, 2000);
+                return;
+            }
+
+            showQobuzLoginError(
+                data.error ||
+                    "Qobuz login did not complete."
+            );
+        })
+        .catch(function() {
+            showQobuzLoginError(
+                "Qobuz sign-in status is unavailable."
+            );
+        });
+    }
+
+    poll();
+}
+
+
+function startQobuzLogin(options) {
+    options = options || {};
+
+    _qobuzLoginReturnToSettings =
+        !!options.returnToSettings ||
+        !!(
+            settingsView &&
+            settingsView.style.display !== "none" &&
+            currentSettingsTab === "tidal"
+        );
+
+    configureLoginModalForProvider("qobuz");
+    resetQobuzLoginCompleteControls(true);
+
+    loginError.classList.add("hidden");
+    loginWaiting.classList.remove("hidden");
+    loginModal.classList.remove("hidden");
+
+    if (loginUrlEl) {
+        loginUrlEl.href = "#";
+        loginUrlEl.textContent =
+            "Starting Qobuz sign-in...";
+    }
+
+    fetchWithTimeout(
+        "/qobuz/login/start",
+        {cache: "no-store"},
+        15000
+    )
+    .then(function(res) {
+        if (!res.ok) {
+            throw new Error(
+                "Qobuz sign-in could not be started."
+            );
+        }
+
+        return res.json();
+    })
+    .then(function(data) {
+        data = data || {};
+
+        if (data.logged_in === true) {
+            finishQobuzLogin();
+            return;
+        }
+
+        if (
+            data.error &&
+            data.pending !== true
+        ) {
+            showQobuzLoginError(data.error);
+            return;
+        }
+
+        if (
+            !data.url ||
+            !data.attempt_id
+        ) {
+            showQobuzLoginError(
+                "Qobuz sign-in could not be started."
+            );
+            return;
+        }
+
+        _qobuzLoginAttemptId =
+            String(data.attempt_id);
+
+        setQobuzManualLoginUrl(
+            data.manual_url || ""
+        );
+
+        loginUrlEl.href =
+            String(data.url);
+
+        prepareQobuzRemoteSignInLink();
+
+        updateQobuzSettingsSection({
+            authenticated: false,
+            login_pending: true,
+            auth_state: "login_pending"
+        });
+
+        startQobuzLoginPoll();
+    })
+    .catch(function() {
+        showQobuzLoginError(
+            "Qobuz sign-in could not be started."
+        );
+    });
+}
+
+
+function cancelQobuzLogin() {
+    clearTimeout(qobuzLoginPollTimer);
+    qobuzLoginPollTimer = null;
+    _qobuzLoginAttemptId = "";
+
+    resetQobuzLoginCompleteControls(true);
+
+    var returnToSettings =
+        _qobuzLoginReturnToSettings;
+
+    _qobuzLoginReturnToSettings = false;
+
+    loginModal.classList.add("hidden");
+    _loginModalProvider = "tidal";
+
+    fetchWithTimeout(
+        "/qobuz/logout",
+        {cache: "no-store"},
+        5000
+    )
+    .catch(function() {
+        return null;
+    })
+    .then(function() {
+        streamingProviderAuthState.qobuz = false;
+        clearQobuzFavoriteIds();
+        applyStreamingProviderPresentation();
+
+        return refreshQobuzProviderAuthSurfaces();
+    })
+    .then(function() {
+        if (returnToSettings) {
+            currentSettingsTab = "tidal";
+            showView("settings");
+            renderSettings();
+        }
+    });
+}
+
+
+function doQobuzLogout(options) {
+    options = options || {};
+
+    fetchWithTimeout(
+        "/qobuz/logout",
+        {cache: "no-store"},
+        5000
+    )
+    .then(function(res) {
+        if (!res.ok) {
+            throw new Error(
+                "Qobuz logout could not be completed."
+            );
+        }
+
+        return res.json();
+    })
+    .then(function(data) {
+        data = data || {};
+
+        if (data.logged_out !== true) {
+            throw new Error(
+                data.error ||
+                    "Qobuz logout could not be completed."
+            );
+        }
+
+        streamingProviderAuthState.qobuz = false;
+        clearQobuzFavoriteIds();
+        qobuzPlaylistsLoaded = false;
+
+        applyStreamingProviderPresentation();
+
+        return refreshQobuzProviderAuthSurfaces();
+    })
+    .then(function() {
+        if (options.returnToSettings) {
+            currentSettingsTab = "tidal";
+            showView("settings");
+            renderSettings();
+        }
+    })
+    .catch(function() {
+        if (options.returnToSettings) {
+            updateQobuzSettingsSection({
+                _qobuz_status_error: true,
+                _qobuz_status_message:
+                    "Qobuz logout could not be completed."
+            });
+        }
+    });
+}
+
+
 function startLogin(options) {
     options = options || {};
     _tidalLoginReturnToSettings = !!options.returnToSettings ||
         !!(settingsView && settingsView.style.display !== "none" && currentSettingsTab === "tidal");
+    configureLoginModalForProvider("tidal");
     loginError.classList.add("hidden");
     loginWaiting.classList.remove("hidden");
     loginModal.classList.remove("hidden");
@@ -6626,6 +10898,11 @@ function showLoginError() {
 }
 
 function cancelLogin() {
+    if (_loginModalProvider === "qobuz") {
+        cancelQobuzLogin();
+        return;
+    }
+
     clearInterval(loginPollTimer);
     _tidalLoginReturnToSettings = false;
     loginModal.classList.add("hidden");
@@ -6747,7 +11024,12 @@ function clearPlaybackTechDisplay() {
     lastTechText = "";
     lastTechClass = "hidden";
     document.body.classList.remove("hires");
-    if (albumTechInfo) { albumTechInfo.classList.add("hidden"); }
+    if (
+        albumTechInfo &&
+        !restoreOwnedAlbumDetailTechInfo()
+    ) {
+        albumTechInfo.classList.add("hidden");
+    }
     if (nowPlayingQuality) {
         nowPlayingQuality.textContent = "";
         nowPlayingQuality.className = "hidden";
@@ -6946,10 +11228,17 @@ function deriveHomeHeroNowPlayingModel(s) {
 }
 
 function setHomeHeroActiveSource(source) {
+    var sourceSection = source;
+    if (source === "tidal" || source === "qobuz") {
+        sourceSection = "streaming";
+    }
     var nodes = document.querySelectorAll("[data-home-source]");
     for (var i = 0; i < nodes.length; i++) {
         var nodeSource = nodes[i].getAttribute("data-home-source") || "";
-        nodes[i].classList.toggle("srovaHomeSourceActive", !!source && nodeSource === source);
+        nodes[i].classList.toggle(
+            "srovaHomeSourceActive",
+            !!sourceSection && nodeSource === sourceSection
+        );
     }
 }
 
@@ -6964,7 +11253,9 @@ function homeHeroArtworkIdentity(value) {
 }
 
 function isHomeHeroFiniteArtworkSource(source) {
-    return source === "local" || source === "tidal";
+    return source === "local" ||
+        source === "tidal" ||
+        source === "qobuz";
 }
 
 function applyHomeHeroPresentation(gateway, nowPlaying, model) {
@@ -7043,6 +11334,24 @@ function applyHomeHeroNowPlayingModel(model) {
             targetSource === homeHeroPendingArtworkSource
         )
     );
+    var currentElementArtworkKey = homeHeroArtworkIdentity(
+        logo.getAttribute("src") || logo.src || SROVA_STANDBY_ART
+    );
+
+    /*
+     * P7: the artwork already rendered by this DOM element is authoritative
+     * presentation state. A rebuilt Home can be seeded with current artwork,
+     * and repeated session/status updates can request the same identity.
+     * Neither case needs a new image assignment or visual swap.
+     */
+    if (targetArtworkKey === currentElementArtworkKey) {
+        cancelHomeHeroArtworkRequest(gateway);
+        homeHeroArtworkInitialized = true;
+        homeHeroDisplayedArtworkKey = targetArtworkKey;
+        homeHeroDisplayedArtworkSource = targetSource;
+        applyHomeHeroPresentation(gateway, nowPlaying, model);
+        return;
+    }
 
     // Finite-track metadata must not wait for image loading. When Local/TIDAL
     // artwork is already displayed or loading for the same source, leave the
@@ -7065,27 +11374,23 @@ function applyHomeHeroNowPlayingModel(model) {
 
     function commitHero(imageUrl) {
         if (token !== homeHeroNowPlayingToken || homeHeroArtworkElement !== logo) { return; }
-        gateway.classList.add("srovaHomeHeroSwapping");
-        homeHeroFadeOutTimer = window.setTimeout(function() {
-            homeHeroFadeOutTimer = null;
-            if (token !== homeHeroNowPlayingToken || homeHeroArtworkElement !== logo) { return; }
-            var committedImage = imageUrl || SROVA_STANDBY_ART;
-            logo.src = committedImage;
-            homeHeroArtworkInitialized = true;
-            homeHeroDisplayedArtworkKey = homeHeroArtworkIdentity(committedImage);
-            homeHeroDisplayedArtworkSource = targetSource;
-            homeHeroPendingArtworkKey = "";
-            homeHeroPendingArtworkSource = "";
-            if (updatePresentationOnCommit) {
-                applyHomeHeroPresentation(gateway, nowPlaying, model);
-            }
-            homeHeroFadeInTimer = window.setTimeout(function() {
-                homeHeroFadeInTimer = null;
-                if (token === homeHeroNowPlayingToken && homeHeroArtworkElement === logo) {
-                    gateway.classList.remove("srovaHomeHeroSwapping");
-                }
-            }, 320);
-        }, 300);
+
+        /*
+         * P7: preload ownership and stale-token protection remain unchanged.
+         * Once the requested image has loaded, replace the old artwork
+         * directly instead of fading the sole image element to opacity zero.
+         */
+        var committedImage = imageUrl || SROVA_STANDBY_ART;
+        logo.src = committedImage;
+        homeHeroArtworkInitialized = true;
+        homeHeroDisplayedArtworkKey = homeHeroArtworkIdentity(committedImage);
+        homeHeroDisplayedArtworkSource = targetSource;
+        homeHeroPendingArtworkKey = "";
+        homeHeroPendingArtworkSource = "";
+        if (updatePresentationOnCommit) {
+            applyHomeHeroPresentation(gateway, nowPlaying, model);
+        }
+        gateway.classList.remove("srovaHomeHeroSwapping");
     }
 
     if (targetImage === logo.getAttribute("src")) {
@@ -7107,6 +11412,17 @@ function applyHomeHeroNowPlayingModel(model) {
 }
 
 function updateHomeHeroNowPlaying(s) {
+    /*
+     * P7/Q10B: a replacement-pending Qobuz snapshot is transitional.
+     * Keep the last committed Home-hero truth until an authoritative
+     * non-pending snapshot arrives.
+     */
+    if (s && s.qobuz_replacement_pending) { return; }
+
+    if (s) {
+        lastKnownHomeHeroStatus = s;
+    }
+
     var gateway = document.getElementById("srovaGateway");
     if (!gateway) { return; }
     applyHomeHeroNowPlayingModel(deriveHomeHeroNowPlayingModel(s));
@@ -7179,6 +11495,39 @@ function updatePlayerInfinitePlayControl() {
 
     var enabled = !!tidalInfinitePlayEnabled;
     var uiVisible = shouldShowInfinitePlayUi(enabled);
+
+    /*
+     * Q10B: an explicit frontend Qobuz transition latch is armed before
+     * `_onTrackChange()` changes transport state. It therefore protects
+     * against repaint calls that occur before the next /status poll has
+     * observed backend pending.
+     *
+     * EOS/non-click replacement still uses the backend-pending relationship
+     * fallback because no frontend click-response latch necessarily exists.
+     */
+    if (q10bInfinitePlayTransitionActive) {
+        uiVisible = q10bInfinitePlayTransitionVisible;
+    } else if (
+        lastKnownPlaybackStatus &&
+        lastKnownPlaybackStatus.qobuz_replacement_pending === true
+    ) {
+        var pendingEffectiveProvider = String(
+            lastKnownPlaybackStatus.infinite_play_effective_provider || ""
+        ).trim().toLowerCase();
+
+        if (
+            pendingEffectiveProvider === "tidal" ||
+            pendingEffectiveProvider === "qobuz"
+        ) {
+            uiVisible = !!(
+                playerHasActiveMedia &&
+                playerBarActivePlaybackSource === pendingEffectiveProvider
+            );
+        } else {
+            uiVisible = false;
+        }
+    }
+
     var mode = normalizeTidalInfinitePlayMode(tidalInfinitePlayMode);
     var modeClass = getInfinitePlayModeClass(mode);
     var modeLabel = getInfinitePlayModeLabel(mode);
@@ -7261,41 +11610,94 @@ function applyPlayerInfinitePlayMode(mode) {
 function maybeRefillTidalInfinitePlay(s) {
     if (!tidalInfinitePlayEnabled || tidalInfinitePlayRefillInFlight || !s) { return; }
     if (!s.playing || isRadioLiveStatus(s)) { return; }
-    if (String(s.source || "").toLowerCase() === "local") { return; }
+
+    var effectiveProvider = String(
+        s.infinite_play_effective_provider || ""
+    ).toLowerCase();
+
+    if (effectiveProvider !== "tidal" && effectiveProvider !== "qobuz") {
+        return;
+    }
+
+    var activeProvider = String(s.source || "").toLowerCase();
+    if (activeProvider !== effectiveProvider) { return; }
+
     var trackId = String(s.current_track_id || "").trim();
-    if (!trackId || trackId.indexOf("local:") === 0) { return; }
+    if (!trackId) { return; }
+
+    if (
+        effectiveProvider === "qobuz" &&
+        trackId.indexOf("qobuz:") !== 0
+    ) {
+        return;
+    }
+
+    if (
+        effectiveProvider === "tidal" &&
+        trackId.indexOf(":") !== -1
+    ) {
+        return;
+    }
+
     var queueLength = Number(s.queue_length || 0);
     var queueIndex = Number(s.queue_index || 0);
     if (!queueLength || queueIndex < queueLength - 1) { return; }
+
     var duration = Number(s.duration || currentDuration || 0);
     var position = Number(s.position || progressFill._elapsed || 0);
+
     position = stableResumeVisualPosition(
         position,
         s.track_id || s.current_track_id || currentPlayingId,
         !!s.playing
     );
+
     if (!duration || duration <= 0) { return; }
+
     var remaining = duration - position;
     if (remaining > 60) { return; }
 
-    var refillKey = trackId + "|" + queueIndex + "|" + queueLength;
+    var refillKey =
+        effectiveProvider + "|" +
+        trackId + "|" +
+        queueIndex + "|" +
+        queueLength;
+
     if (tidalInfinitePlayLastRefillKey === refillKey) { return; }
+
     tidalInfinitePlayLastRefillKey = refillKey;
     tidalInfinitePlayRefillInFlight = true;
 
-    fetch("/api/tidal/infinite-play/refill", {
+    fetch("/api/infinite-play/refill", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ seed_id: trackId, mode: tidalInfinitePlayMode, limit: 10 })
+        body: JSON.stringify({
+            seed_id: trackId,
+            mode: tidalInfinitePlayMode,
+            limit: 10
+        })
     })
-    .then(function(res) { return res.json().catch(function() { return {}; }); })
+    .then(function(res) {
+        return res.json().catch(function() { return {}; });
+    })
     .then(function(data) {
         if (!data || data.ok !== true) {
-            console.info("Infinite Play refill skipped:", (data && data.error) || "no recommendation seed");
+            console.info(
+                "Infinite Play refill skipped:",
+                (data && data.error) || "no recommendation seed"
+            );
             releaseTidalInfinitePlayRefillKey(refillKey);
             return;
         }
-        console.info("Infinite Play appended " + (data.added || 0) + " recommended tracks.");
+
+        console.info(
+            "Infinite Play appended " +
+            (data.added || 0) +
+            " recommended tracks from " +
+            (data.provider || effectiveProvider) +
+            "."
+        );
+
         if (queueView && queueView.style.display !== "none") {
             loadQueue();
         }
@@ -7321,10 +11723,32 @@ function pollStatus() {
             if (s.tidal_infinite_play_mode) {
                 tidalInfinitePlayMode = normalizeTidalInfinitePlayMode(s.tidal_infinite_play_mode);
             }
+            q10bSyncInfinitePlayTransitionFromStatus(s);
             updatePlayerInfinitePlayControl();
-            updateHomeHeroNowPlaying(s);
             var statusValid = s.current_track_valid !== false && s.playback_state !== "idle";
             var statusPlaying = !!s.playing;
+            var qobuzReplacementPending = !!s.qobuz_replacement_pending;
+
+            // Q10B: every pending Qobuz replacement snapshot is transitional.
+            // Some snapshots can still be valid but describe the outgoing
+            // track. Keep transport truth from /status, while the selected
+            // queue row supplies temporary target metadata only.
+            if (qobuzReplacementPending) {
+                playing = statusPlaying;
+                updatePlayPauseIcon();
+                updatePlayerInfinitePlayControl();
+                return;
+            }
+
+            /*
+             * P12: /status is the authoritative active-playback truth.
+             * Repaint SOURCE 03 only after a non-transitional snapshot has
+             * committed, so dual-provider identity follows playback rather
+             * than whichever provider page was last browsed.
+             */
+            applyStreamingProviderPresentation();
+
+            updateHomeHeroNowPlaying(s);
             if (!statusValid) {
                 resetTidalInfinitePlayGuard();
                 clearRadioIdleStandbyTimer();
@@ -7372,14 +11796,40 @@ function pollStatus() {
                 }
             }
             if (statusPlaying !== playing) {
-                playing = statusPlaying;
-                updatePlayPauseIcon();
+                if (
+                    statusPlaying &&
+                    String(s.source || "").toLowerCase() === "qobuz" &&
+                    !seekInFlight
+                ) {
+                    // Q10B: begin the visual clock only when backend transport
+                    // truth says this Qobuz track has actually started.
+                    applyPlaybackPosition(Number(s.position || 0), true);
+                } else {
+                    playing = statusPlaying;
+                    updatePlayPauseIcon();
+                }
                 if (playing) { playerBar.classList.remove("hidden"); }
             } else {
                 // Keep DOM icons honest on a fresh browser load, where the
                 // HTML fallback may not yet match the backend state.
                 updatePlayPauseIcon();
             }
+
+            /*
+             * Q10B JS6: release Infinite Play presentation freeze only after
+             * this committed Qobuz status has updated both player-bar source
+             * and frontend transport state. Every earlier repaint in this poll
+             * therefore sees the frozen pre-transition visibility.
+             */
+            if (
+                q10bInfinitePlayTransitionActive &&
+                q10bInfinitePlayTransitionReleaseReady
+            ) {
+                q10bClearInfinitePlayTransitionFreeze();
+                updatePlayerInfinitePlayControl();
+            }
+
+            syncQ9dProviderSelectors();
             if (s.repeat && s.repeat !== repeatMode) {
                 repeatMode = s.repeat;
                 updateRepeatIcon();
@@ -7404,7 +11854,12 @@ function pollStatus() {
                 lastTechText  = "";
                 lastTechClass = "hidden";
                 document.body.classList.remove("hires");
-                if (albumTechInfo)     { albumTechInfo.classList.add("hidden"); }
+                if (
+                    albumTechInfo &&
+                    !restoreOwnedAlbumDetailTechInfo()
+                ) {
+                    albumTechInfo.classList.add("hidden");
+                }
                 if (nowPlayingQuality) { nowPlayingQuality.textContent = ""; nowPlayingQuality.className = "hidden"; }
                 var _pmReset = document.getElementById("playerMeta");
                 if (_pmReset) {
@@ -7421,7 +11876,7 @@ function pollStatus() {
                     currentDuration          = meta.duration || 0;
                     totalTimeEl.textContent  = formatTime(meta.duration || 0);
                     playerBar.classList.remove("hidden");
-                    playing = true;
+                    playing = statusPlaying;
                     updatePlayPauseIcon();
                 } else if (s.title || s.artist || s.cover) {
                     playerArt.src            = s.cover    || "";
@@ -7437,6 +11892,9 @@ function pollStatus() {
             } else if (s.current_track_id) {
                 syncActiveTrackViews(false);
             }
+
+            updateNpHeart();
+
             if (typeof s.logged_in === "boolean") { updateLoginBtn(s.logged_in, {skipSettingsRefresh: true}); }
             updateDacStateFromStatus(s);
             var hiRes = (s.bit_depth && s.bit_depth >= 24) || (s.sample_rate && s.sample_rate > 48000);
@@ -7540,21 +11998,33 @@ function syncSrovaPlaybackVisualState() {
     }
 }
 
-function _setPlayIconButton(btn, isPlaying) {
+function _setPlayIconButton(btn, isPlaying, useStopPresentation) {
     if (!btn) { return; }
     var icon = btn.querySelector(".material-icons");
     if (!icon) { return; }
-    icon.textContent = isPlaying ? "pause" : "play_arrow";
+
+    var showStop = !!(isPlaying && useStopPresentation);
+    var activeLabel = showStop ? "Stop" : "Pause";
+
+    icon.textContent = showStop ? "stop" : (isPlaying ? "pause" : "play_arrow");
     btn.classList.toggle("is-playing", !!isPlaying);
     btn.classList.toggle("is-paused", !isPlaying);
-    btn.setAttribute("aria-label", isPlaying ? "Pause" : "Play");
-    btn.title = isPlaying ? "Pause" : "Play";
+    btn.setAttribute("aria-label", isPlaying ? activeLabel : "Play");
+    btn.title = isPlaying ? activeLabel : "Play";
 }
 
-function updatePlayPauseIcon() {
-    _setPlayIconButton(btnPlayPause, playing);
-    _setPlayIconButton(npBtnPlay, playing);
-    _setPlayIconButton(document.getElementById("vpbBtnPlay"), playing);
+function updatePlayPauseIcon(forceRadioStop) {
+    var s = lastKnownPlaybackStatus || {};
+    // Custom Internet Radio alone owns RADIO_MODE. Provider-generated
+    // TIDAL/Qobuz Radio remains finite-track playback and keeps Pause.
+    var radioStopPresentation = !!(
+        playing &&
+        (forceRadioStop === true || s.radio_mode === true)
+    );
+
+    _setPlayIconButton(btnPlayPause, playing, radioStopPresentation);
+    _setPlayIconButton(npBtnPlay, playing, radioStopPresentation);
+    _setPlayIconButton(document.getElementById("vpbBtnPlay"), playing, radioStopPresentation);
     if (playerBar) {
         playerBar.classList.toggle("srovaPlayerBarStandby", !playing && !currentPlayingId);
         syncSrovaPlaybackVisualState();
@@ -7639,7 +12109,7 @@ function updateTechInfo(sampleRate, bitDepth, codec) {
     }
     // Album view badge
     if (!albumTechInfo) { return; }
-    if (restoreLocalAlbumDetailTechInfo()) { return; }
+    if (restoreOwnedAlbumDetailTechInfo()) { return; }
     if (albumView.style.display === "none") {
         albumTechInfo.classList.add("hidden");
         return;
@@ -7703,10 +12173,12 @@ function stableResumeVisualPosition(serverPosition, trackId, isServerPlaying) {
 }
 
 function togglePlayPause() {
+    if (!requireNativePlaybackAvailable()) { return; }
     if (playing) {
         fetch("/tidal/pause").then(function() {
             playing = false;
             updatePlayPauseIcon();
+            syncQ9dProviderSelectors();
             if (lastKnownPlaybackStatus) {
                 lastKnownPlaybackStatus.playing = false;
                 lastKnownPlaybackStatus.playback_state = "paused";
@@ -7714,10 +12186,23 @@ function togglePlayPause() {
                 updateHomeHeroNowPlaying(lastKnownPlaybackStatus);
             }
             if (lastKnownPlaybackStatus && lastKnownPlaybackStatus.radio_mode) {
+                if (
+                    typeof loadQueue === "function" &&
+                    queueView &&
+                    queueView.style.display !== "none"
+                ) {
+                    loadQueue();
+                }
                 scheduleRadioIdleStandby();
             }
         });
     } else {
+        if (
+            lastKnownPlaybackStatus &&
+            lastKnownPlaybackStatus.qobuz_replacement_pending === true
+        ) {
+            return;
+        }
         if (
             lastKnownPlaybackStatus &&
             lastKnownPlaybackStatus.current_track_valid === false &&
@@ -7740,6 +12225,7 @@ function togglePlayPause() {
             }
             playing   = true;
             setPlayerHasActiveMedia(true);
+            syncQ9dProviderSelectors();
             var rawResumePos = (data && typeof data.position === "number") ? data.position : (progressFill._elapsed || 0);
             var resumePos = normalizeLocalCueUiPosition(rawResumePos, progressFill._elapsed || 0);
             startTime = Date.now() / 1000 - resumePos;
@@ -7770,27 +12256,61 @@ function handleTrackChangeResponse(res) {
 function _onTrackChange() {
     clearRadioIdleStandbyTimer();
     resetTidalInfinitePlayGuard();
-    // Immediately clear stale stream info so old colour/badge don't linger
-    startTime             = Date.now() / 1000;
-    progressFill._elapsed = 0;
-    playing               = true;   // assume playing so progress bar runs immediately
-    setPlayerHasActiveMedia(true);
-    updatePlayPauseIcon();
-    lastTechText  = "";
-    lastTechClass = "hidden";
-    document.body.classList.remove("hires");
-    if (albumTechInfo)     { albumTechInfo.classList.add("hidden"); }
-    if (nowPlayingQuality) { nowPlayingQuality.textContent = ""; nowPlayingQuality.className = "hidden"; }
-    var _pm = document.getElementById("playerMeta");
-    if (_pm) {
-        _pm.textContent = "";
-        _pm.className = "audioInfoBox audioInfoOff";
+    // Immediately clear stale stream info so old colour/badge don't linger.
+    // Q10B: a Qobuz track-change HTTP response means "scheduled", not "audio
+    // committed". Keep progress at zero until /status reports real playback.
+    var qobuzTransition = !!(
+        lastKnownPlaybackStatus &&
+        (
+            lastKnownPlaybackStatus.qobuz_replacement_pending === true ||
+            String(lastKnownPlaybackStatus.source || "").toLowerCase() === "qobuz"
+        )
+    );
+    if (qobuzTransition) {
+        /*
+         * Q10B atomic presentation:
+         * the backend has accepted a replacement but the new stream has not
+         * committed at hardware RUNNING yet. Freeze the last committed track
+         * metadata, artwork, progress and audio-format presentation. Only the
+         * transport icon follows the truthful transient stopped state.
+         */
+        q10bBeginInfinitePlayTransitionFreeze();
+        playing = false;
+        setPlayerHasActiveMedia(true);
+        updatePlayPauseIcon();
+    } else {
+        startTime             = Date.now() / 1000;
+        progressFill._elapsed = 0;
+        playing               = true;
+        setPlayerHasActiveMedia(true);
+        updatePlayPauseIcon();
+
+        lastTechText  = "";
+        lastTechClass = "hidden";
+        document.body.classList.remove("hires");
+        if (
+            albumTechInfo &&
+            !restoreOwnedAlbumDetailTechInfo()
+        ) {
+            albumTechInfo.classList.add("hidden");
+        }
+        if (nowPlayingQuality) {
+            nowPlayingQuality.textContent = "";
+            nowPlayingQuality.className = "hidden";
+        }
+        var _pm = document.getElementById("playerMeta");
+        if (_pm) {
+            _pm.textContent = "";
+            _pm.className = "audioInfoBox audioInfoOff";
+        }
+        syncDacNameDisplay();
     }
-    syncDacNameDisplay();
+
     _syncHomePlayingTiles();
     // Reset meta and lyrics panels so they reload for the new track
     metaLastTrackId   = null;
     lyricsLastTrackId = null;
+    lyricsRequestSerial += 1;
     _stopLyricsSync();
     if (lyricsPanel && lyricsPanel.classList.contains("open")) {
         closeLyricsPanel();
@@ -7866,6 +12386,7 @@ function normalizeLocalCueUiPosition(rawPosition, fallbackPosition) {
 }
 
 function prevTrack() {
+    if (!requireNativePlaybackAvailable()) { return; }
     var now     = Date.now();
     var elapsed = playing ? (now / 1000 - startTime) : (progressFill._elapsed || 0);
     var doubleTap = (now - _prevTapTime) < 2000;
@@ -7896,6 +12417,7 @@ function prevTrack() {
     }
 }
 function nextTrack() {
+    if (!requireNativePlaybackAvailable()) { return; }
     fetch("/tidal/next").then(handleTrackChangeResponse);
 }
 
@@ -8047,6 +12569,7 @@ function _cancelHomeSlotPolls() {
 }
 
 function playRadioStation(item) {
+    if (!requireNativePlaybackAvailable()) { return; }
     var radioClickAllowed = currentSourceSection === "radio" ||
         !!(lastKnownPlaybackStatus && lastKnownPlaybackStatus.radio_mode) ||
         !!(document.body && document.body.classList.contains("radioMode"));
@@ -8103,7 +12626,7 @@ function playRadioStation(item) {
                 },
                 radio_metadata: {}
             });
-            if (typeof updatePlayPauseIcon === "function") { updatePlayPauseIcon(); }
+            if (typeof updatePlayPauseIcon === "function") { updatePlayPauseIcon(true); }
             updateHomeHeroNowPlaying({
                 playing: true,
                 current_track_valid: true,
@@ -8891,6 +13414,12 @@ function attachPreparedRadioSource(result, requestId, appendShell) {
         }
     }
     _syncHomePlayingTiles(result.shell);
+    if (typeof refreshTidalRadioSourceSection === "function") {
+        refreshTidalRadioSourceSection(result.shell);
+    }
+    if (typeof refreshQobuzRadioSourceSection === "function") {
+        refreshQobuzRadioSourceSection(result.shell);
+    }
 
     if (!result.timedOut) {
         consumeRadioSourcePreparation(result.operation);
@@ -9076,6 +13605,10 @@ function buildRadioSourceShellFromStations(stations) {
         empty.textContent = "No radio stations configured.";
         body.appendChild(empty);
     }
+
+    ensureTidalRadioSourceSlot(shell);
+    ensureQobuzRadioSourceSlot(shell);
+
     return shell;
 }
 
@@ -9091,13 +13624,2682 @@ function buildRadioShelf(onReady) {
         .catch(function() { onReady(null); });
 }
 
+
+/*
+ * Q7H H2 — provider-native TIDAL Radio.
+ *
+ * SOURCE 01 is only an additional presentation surface. TIDAL's own
+ * "Personal radio stations" entries remain native Mix objects and route
+ * through the exact same /tidal/mix/<id> detail/playback path used by the
+ * TIDAL wall. Nothing here creates a custom Internet Radio station, enters
+ * RADIO_MODE, or participates in My Radio ordering/persistence.
+ */
+function ensureTidalRadioSourceSlot(shell) {
+    if (!shell || !shell.querySelector) {
+        return null;
+    }
+
+    var body =
+        shell.querySelector(
+            ".srovaSourcePageBody"
+        );
+
+    if (!body) {
+        return null;
+    }
+
+    var slot =
+        body.querySelector(
+            '[data-provider-radio="tidal"]'
+        );
+
+    if (slot) {
+        return slot;
+    }
+
+    slot =
+        document.createElement("div");
+
+    slot.className =
+        "providerRadioSourceSlot tidalProviderRadioSourceSlot";
+
+    slot.setAttribute(
+        "data-provider-radio",
+        "tidal"
+    );
+
+    slot.hidden =
+        true;
+
+    body.appendChild(slot);
+
+    return slot;
+}
+
+
+function clearTidalRadioSourceSection(shell) {
+    var slot =
+        ensureTidalRadioSourceSlot(shell);
+
+    if (!slot) {
+        return;
+    }
+
+    slot.innerHTML =
+        "";
+
+    slot.hidden =
+        true;
+}
+
+
+function tidalPersonalRadioSection(homeData) {
+    homeData =
+        Array.isArray(homeData)
+            ? homeData
+            : [];
+
+    for (
+        var i = 0;
+        i < homeData.length;
+        i += 1
+    ) {
+        var section =
+            homeData[i] || {};
+
+        var title =
+            String(
+                section.title || ""
+            )
+            .replace(/\s+/g, " ")
+            .trim()
+            .toLowerCase();
+
+        if (
+            title ===
+            "personal radio stations"
+        ) {
+            return section;
+        }
+    }
+
+    return null;
+}
+
+
+function tidalPersonalRadioItems(homeData) {
+    var section =
+        tidalPersonalRadioSection(
+            homeData
+        );
+
+    var items =
+        section &&
+        Array.isArray(section.items)
+            ? section.items
+            : [];
+
+    return items.filter(function(item) {
+        item = item || {};
+
+        return !!(
+            item.id &&
+            String(
+                item.type || ""
+            )
+            .trim()
+            .toLowerCase() ===
+                "mix"
+        );
+    });
+}
+
+
+function renderTidalRadioSourceSection(
+    shell,
+    items
+) {
+    var slot =
+        ensureTidalRadioSourceSlot(shell);
+
+    if (!slot) {
+        return;
+    }
+
+    slot.innerHTML =
+        "";
+
+    if (
+        !providerRadioEffectiveVisibility(
+            "tidal"
+        ) ||
+        !Array.isArray(items) ||
+        !items.length
+    ) {
+        slot.hidden =
+            true;
+
+        return;
+    }
+
+    var block =
+        buildScrollSection(
+            "TIDAL RADIO",
+            items,
+            function(
+                item,
+                e,
+                anchorEl
+            ) {
+                handleTidalWallItemClick(
+                    item,
+                    "radio",
+                    e,
+                    anchorEl
+                );
+            },
+            {
+                kind: "curated"
+            }
+        );
+
+    block.classList.add(
+        "providerRadioShelf",
+        "tidalProviderRadioShelf"
+    );
+
+    slot.appendChild(block);
+    slot.hidden = false;
+}
+
+
+function refreshTidalRadioSourceSection(shell) {
+    shell =
+        shell ||
+        _radioSourcePageCache;
+
+    if (!shell) {
+        return Promise.resolve();
+    }
+
+    var slot =
+        ensureTidalRadioSourceSlot(shell);
+
+    if (!slot) {
+        return Promise.resolve();
+    }
+
+    var requestId =
+        ++_tidalRadioSourceRequest;
+
+    /*
+     * Fail closed while the persisted preference and current provider
+     * authentication state are being resolved. This prevents a retained
+     * provider shelf remaining visible after sign-out.
+     */
+    slot.hidden =
+        true;
+
+    var settingsRequest =
+        providerRadioVisibilityState.loaded
+            ? Promise.resolve()
+            : loadProviderRadioVisibilitySettings()
+                .catch(function() {});
+
+    var authRequest =
+        refreshStreamingProviderPresentation()
+            .catch(function() {});
+
+    return Promise.all([
+        settingsRequest,
+        authRequest
+    ])
+    .then(function() {
+        if (
+            requestId !==
+            _tidalRadioSourceRequest
+        ) {
+            return null;
+        }
+
+        if (
+            shell !==
+            _radioSourcePageCache
+        ) {
+            return null;
+        }
+
+        if (
+            !providerRadioEffectiveVisibility(
+                "tidal"
+            )
+        ) {
+            clearTidalRadioSourceSection(
+                shell
+            );
+
+            return null;
+        }
+
+        return fetchWithTimeout(
+            "/tidal/home",
+            {},
+            5000
+        )
+        .then(function(response) {
+            if (!response.ok) {
+                throw new Error(
+                    "TIDAL Radio unavailable"
+                );
+            }
+
+            return response.json();
+        })
+        .then(function(homeData) {
+            if (
+                requestId !==
+                    _tidalRadioSourceRequest ||
+                shell !==
+                    _radioSourcePageCache
+            ) {
+                return;
+            }
+
+            renderTidalRadioSourceSection(
+                shell,
+                tidalPersonalRadioItems(
+                    homeData
+                )
+            );
+        });
+    })
+    .catch(function() {
+        if (
+            requestId ===
+                _tidalRadioSourceRequest &&
+            shell ===
+                _radioSourcePageCache
+        ) {
+            clearTidalRadioSourceSection(
+                shell
+            );
+        }
+    });
+}
+
+
+
+/*
+ * Q7H6 H6.3 -- provider-native contextual TIDAL Radio.
+ *
+ * Artist.get_radio() and Track.get_track_radio() return ordinary finite
+ * TIDAL tracks. Keep these contexts provider-native: normal duration,
+ * seek, Next/Previous, queue and quality behavior; never custom
+ * Internet Radio/live-stream behavior.
+ */
+function startTidalRadioFromSeed(
+    item,
+    seedKind,
+    returnView
+) {
+    if (!requireOnlineSource()) {
+        return;
+    }
+
+    item =
+        item || {};
+
+    seedKind =
+        seedKind === "track"
+            ? "track"
+            : "artist";
+
+    var nativeId =
+        String(
+            seedKind === "track"
+                ? (
+                    item.id ||
+                    item.provider_track_id ||
+                    ""
+                )
+                : (
+                    item.artist_id ||
+                    item.id ||
+                    ""
+                )
+        ).trim();
+
+    if (!nativeId) {
+        return;
+    }
+
+    var detailEndpoint =
+        "/tidal/radio/" +
+        seedKind +
+        "/" +
+        encodeURIComponent(
+            nativeId
+        );
+
+    var contextTitle =
+        String(
+            item.name ||
+            item.title ||
+            (
+                seedKind === "track"
+                    ? "TIDAL Track Radio"
+                    : "TIDAL Artist Radio"
+            )
+        );
+
+    var contextCover =
+        String(
+            item.image_url ||
+            item.cover ||
+            ""
+        );
+
+    previousView =
+        String(
+            returnView ||
+            (
+                seedKind === "artist"
+                    ? "artistpage"
+                    : "tidalsource"
+            )
+        );
+
+    currentViewEndpoint =
+        detailEndpoint;
+
+    currentContext = {
+        id:
+            nativeId,
+        cover:
+            contextCover,
+        title:
+            contextTitle,
+        artist:
+            "",
+        source:
+            "tidal",
+        context_type:
+            "tidal_radio_" +
+            seedKind
+    };
+
+    setAlbumViewKind(
+        "tidal-detail"
+    );
+
+    if (albumView) {
+        albumView.classList.add(
+            "providerRadioDetail"
+        );
+    }
+
+    showView(
+        "album"
+    );
+
+    albumArt.src =
+        contextCover;
+
+    albumTitle.textContent =
+        contextTitle;
+
+    albumArtist.textContent =
+        seedKind === "track"
+            ? "Track Radio \u00b7 TIDAL"
+            : "Artist Radio \u00b7 TIDAL";
+
+    albumArtist.style.cursor =
+        "";
+
+    albumArtist.onclick =
+        null;
+
+    albumTechInfo.textContent =
+        "";
+
+    albumTechInfo.className =
+        "hidden";
+
+    albumStatsLine.textContent =
+        "";
+
+    albumStatsLine.className =
+        "hidden";
+
+    originalTracks =
+        [];
+
+    shuffledTracks =
+        [];
+
+    currentViewTracks =
+        [];
+
+    trackList.innerHTML =
+        '<div class="trackListLoading">' +
+        'Loading TIDAL Radio\u2026' +
+        '</div>';
+
+    renderAlbumQueueBtn(
+        [],
+        ""
+    );
+
+    fetchWithTimeout(
+        detailEndpoint,
+        {
+            cache: "no-store"
+        },
+        7000
+    )
+    .then(function(response) {
+        if (!response.ok) {
+            throw new Error(
+                "TIDAL Radio request failed."
+            );
+        }
+
+        return response.json();
+    })
+    .then(function(data) {
+        if (
+            currentViewEndpoint !==
+            detailEndpoint
+        ) {
+            return;
+        }
+
+        var expectedType =
+            seedKind === "track"
+                ? "radio-track"
+                : "radio-artist";
+
+        if (
+            !data ||
+            data.ok === false ||
+            String(
+                data.source || ""
+            ).toLowerCase() !==
+                "tidal" ||
+            String(
+                data.type || ""
+            ) !==
+                expectedType ||
+            !Array.isArray(
+                data.tracks
+            )
+        ) {
+            throw new Error(
+                "Invalid TIDAL Radio response."
+            );
+        }
+
+        if (!data.tracks.length) {
+            throw new Error(
+                "TIDAL Radio returned no playable tracks."
+            );
+        }
+
+        originalTracks =
+            data.tracks;
+
+        shuffledTracks =
+            [];
+
+        currentViewTracks =
+            data.tracks;
+
+        renderTrackList(
+            data.tracks
+        );
+
+        /*
+         * Q10K: Provider Radio is a finite generated collection.
+         * Keep the compact header, but expose one collection-start
+         * control without inheriting generic album/mix-wide actions.
+         */
+        renderProviderRadioPlayAllBtn(
+            data.tracks,
+            function() {
+                playTrack(
+                    data.tracks[0],
+                    0
+                );
+            },
+            data.tracks.map(
+                function(track) {
+                    return buildTrackPayload(
+                        track,
+                        contextCover
+                    );
+                }
+            )
+        );
+
+        resetAlbumDetailScroll();
+    })
+    .catch(function(error) {
+        if (
+            currentViewEndpoint !==
+            detailEndpoint
+        ) {
+            return;
+        }
+
+        console.error(
+            "TIDAL Radio detail failed:",
+            error
+        );
+
+        trackList.innerHTML =
+            '<div class="unavailableMsg">' +
+            'Could not load TIDAL Radio.' +
+            '</div>';
+
+        renderAlbumQueueBtn(
+            [],
+            ""
+        );
+    });
+}
+
+
+function appendTidalStartRadioHeaderAction(
+    group,
+    item,
+    seedKind,
+    returnView
+) {
+    if (!group) {
+        return null;
+    }
+
+    item =
+        item || {};
+
+    seedKind =
+        seedKind === "track"
+            ? "track"
+            : "artist";
+
+    var nativeId =
+        String(
+            seedKind === "track"
+                ? (
+                    item.id ||
+                    item.provider_track_id ||
+                    ""
+                )
+                : (
+                    item.artist_id ||
+                    item.id ||
+                    ""
+                )
+        ).trim();
+
+    if (!nativeId) {
+        return null;
+    }
+
+    var radioBtn =
+        document.createElement(
+            "button"
+        );
+
+    radioBtn.className =
+        "albumQueueBtn";
+
+    radioBtn.innerHTML =
+        '<span class="material-icons">' +
+        'radio' +
+        '</span>';
+
+    radioBtn.title =
+        "Start Radio";
+
+    radioBtn.setAttribute(
+        "aria-label",
+        "Start Radio"
+    );
+
+    radioBtn.onclick =
+        function(e) {
+            e.stopPropagation();
+
+            startTidalRadioFromSeed(
+                item,
+                seedKind,
+                returnView
+            );
+        };
+
+    group.appendChild(
+        radioBtn
+    );
+
+    return radioBtn;
+}
+
+
+/*
+ * Q7H H3 — provider-native Qobuz Radio.
+ *
+ * Qobuz Radio is contextual rather than a provider-owned Radio home shelf.
+ * SOURCE 01 therefore exposes provider-native seeds from the authenticated
+ * Qobuz library. Saved artists are the primary seed surface; saved tracks
+ * are the fallback when no artist seeds are available.
+ *
+ * Selecting one seed requests Qobuz's existing radio_artist/radio_track
+ * operation and places the returned finite Qobuz tracks into SROVA's shared
+ * provider-aware queue. The queue tracks retain source=qobuz and canonical
+ * qobuz:<native-id> identity. SOURCE 01 never creates a custom Internet
+ * Radio station and never enters the custom live-stream playback model.
+ */
+function ensureQobuzRadioSourceSlot(shell) {
+    if (
+        !shell ||
+        !shell.querySelector
+    ) {
+        return null;
+    }
+
+    var body =
+        shell.querySelector(
+            ".srovaSourcePageBody"
+        );
+
+    if (!body) {
+        return null;
+    }
+
+    var slot =
+        body.querySelector(
+            '[data-provider-radio="qobuz"]'
+        );
+
+    if (slot) {
+        return slot;
+    }
+
+    slot =
+        document.createElement("div");
+
+    slot.className =
+        "providerRadioSourceSlot qobuzProviderRadioSourceSlot";
+
+    slot.setAttribute(
+        "data-provider-radio",
+        "qobuz"
+    );
+
+    slot.hidden =
+        true;
+
+    body.appendChild(slot);
+
+    return slot;
+}
+
+
+function clearQobuzRadioSourceSection(shell) {
+    var slot =
+        ensureQobuzRadioSourceSlot(
+            shell
+        );
+
+    if (!slot) {
+        return;
+    }
+
+    slot.innerHTML =
+        "";
+
+    slot.hidden =
+        true;
+}
+
+
+function qobuzRadioSeedPageItems(data) {
+    if (
+        !data ||
+        data.ok === false ||
+        !Array.isArray(data.items)
+    ) {
+        return [];
+    }
+
+    return data.items;
+}
+
+
+function qobuzRadioResponseTracks(data) {
+    if (
+        !data ||
+        String(
+            data.source || ""
+        ).toLowerCase() !==
+            "qobuz"
+    ) {
+        return [];
+    }
+
+    var tracks =
+        data.tracks;
+
+    if (Array.isArray(tracks)) {
+        return tracks;
+    }
+
+    if (
+        tracks &&
+        typeof tracks === "object" &&
+        Array.isArray(tracks.items)
+    ) {
+        return tracks.items;
+    }
+
+    return [];
+}
+
+
+function qobuzRadioSeedNativeId(
+    item,
+    seedKind
+) {
+    item =
+        item || {};
+
+    var raw =
+        item.qobuz_item &&
+        typeof item.qobuz_item ===
+            "object"
+            ? item.qobuz_item
+            : {};
+
+    seedKind =
+        seedKind === "track"
+            ? "track"
+            : (
+                seedKind === "album"
+                    ? "album"
+                    : "artist"
+            );
+
+    if (seedKind === "artist") {
+        return String(
+            raw.artist_id ||
+            item.artist_id ||
+            item.id ||
+            ""
+        ).trim();
+    }
+
+    if (seedKind === "album") {
+        var albumId =
+            String(
+                raw.album_id ||
+                item.album_id ||
+                item.id ||
+                ""
+            ).trim();
+
+        if (
+            albumId.indexOf(
+                "qobuz:album:"
+            ) === 0
+        ) {
+            albumId =
+                albumId.slice(12);
+        }
+
+        return albumId;
+    }
+
+    var nativeId =
+        String(
+            raw.provider_track_id ||
+            item.provider_track_id ||
+            item.id ||
+            ""
+        ).trim();
+
+    if (
+        nativeId.indexOf(
+            "qobuz:"
+        ) === 0
+    ) {
+        nativeId =
+            nativeId.slice(6);
+    }
+
+    return nativeId;
+}
+
+
+function qobuzRadioContextId(
+    seedKind,
+    nativeId
+) {
+    nativeId =
+        String(
+            nativeId || ""
+        ).trim();
+
+    if (!nativeId) {
+        return "";
+    }
+
+    if (seedKind === "track") {
+        return (
+            "qobuz:" +
+            nativeId
+        );
+    }
+
+    if (seedKind === "album") {
+        return (
+            "qobuz:album:" +
+            nativeId
+        );
+    }
+
+    return (
+        "qobuz:artist:" +
+        nativeId
+    );
+}
+
+
+function qobuzRadioTrackPayloads(
+    tracks
+) {
+    tracks =
+        Array.isArray(tracks)
+            ? tracks
+            : [];
+
+    return tracks
+        .map(function(track) {
+            return qobuzAlbumTrackPayload(
+                track,
+                {}
+            );
+        })
+        .filter(function(track) {
+            return !!(
+                track &&
+                track.source ===
+                    "qobuz" &&
+                track.provider_track_id &&
+                String(
+                    track.id || ""
+                ) ===
+                    (
+                        "qobuz:" +
+                        String(
+                            track.provider_track_id
+                        )
+                    )
+            );
+        });
+}
+
+
+function playQobuzRadioTracks(
+    tracks,
+    startIndex,
+    context
+) {
+    context =
+        context || {};
+
+    if (!requireOnlineSource()) {
+        return;
+    }
+
+    var payload =
+        qobuzRadioTrackPayloads(
+            tracks
+        );
+
+    if (!payload.length) {
+        return;
+    }
+
+    startIndex =
+        Math.max(
+            0,
+            Math.min(
+                Number(
+                    startIndex || 0
+                ),
+                payload.length - 1
+            )
+        );
+
+    var contextType =
+        String(
+            context.context_type ||
+            "qobuz_radio_artist"
+        );
+
+    var contextId =
+        String(
+            context.id || ""
+        );
+
+    var contextTitle =
+        String(
+            context.title ||
+            "Qobuz Radio"
+        );
+
+    clearRadioIdleStandbyTimer();
+    resetTidalInfinitePlayGuard();
+
+    _setPlaybackSource(
+        "qobuz",
+        contextId,
+        contextTitle
+    );
+
+    postTidalQueueReplace({
+        tracks: payload,
+        start_index: startIndex,
+        context_type: contextType,
+        context_id: contextId,
+        context_title: contextTitle
+    })
+    .then(function() {
+        payload.forEach(
+            function(track) {
+                trackMap[
+                    String(
+                        track.id
+                    )
+                ] = {
+                    title:
+                        track.title ||
+                        "",
+                    artist:
+                        track.artist ||
+                        "",
+                    cover:
+                        track.cover ||
+                        "",
+                    duration:
+                        track.duration ||
+                        0
+                };
+            }
+        );
+    })
+    .catch(function() {});
+}
+
+
+function renderQobuzRadioTracks(
+    tracks,
+    context
+) {
+    tracks =
+        Array.isArray(tracks)
+            ? tracks
+            : [];
+
+    context =
+        context || {};
+
+    trackList.innerHTML =
+        "";
+
+    /*
+     * Match the established TIDAL Mix/detail grid contract. Qobuz
+     * Radio contains mixed artists, so its artist column must use the
+     * same wide-list and wide-row classes as renderTrackList().
+     */
+    var hasArtist =
+        tracks.some(function(track) {
+            var payload =
+                qobuzAlbumTrackPayload(
+                    track,
+                    {}
+                );
+
+            return !!String(
+                payload.artist || ""
+            ).trim();
+        });
+
+    trackList.classList.toggle(
+        "trackListWide",
+        hasArtist
+    );
+
+    if (!tracks.length) {
+        var empty =
+            document.createElement(
+                "div"
+            );
+
+        empty.className =
+            "unavailableMsg";
+
+        empty.textContent =
+            "No tracks found.";
+
+        trackList.appendChild(
+            empty
+        );
+
+        renderAlbumQueueBtn(
+            [],
+            ""
+        );
+
+        return;
+    }
+
+    tracks.forEach(
+        function(track, idx) {
+            var payload =
+                qobuzAlbumTrackPayload(
+                    track,
+                    {}
+                );
+
+            if (
+                !payload.id ||
+                payload.id.indexOf(
+                    "qobuz:"
+                ) !== 0
+            ) {
+                return;
+            }
+
+            trackMap[
+                payload.id
+            ] = {
+                title:
+                    payload.title,
+                artist:
+                    payload.artist,
+                cover:
+                    payload.cover,
+                duration:
+                    payload.duration
+            };
+
+            var row =
+                document.createElement(
+                    "div"
+                );
+
+            row.className =
+                hasArtist
+                    ? "track trackWide"
+                    : "track";
+
+            row.setAttribute(
+                "data-track-id",
+                payload.id
+            );
+
+            var displayArtist =
+                String(
+                    payload.artist ||
+                    track.artist ||
+                    track.album ||
+                    ""
+                );
+
+            if (hasArtist) {
+                row.innerHTML =
+                    '<div class="track-num">' +
+                    (idx + 1) +
+                    '</div>' +
+                    '<div class="track-title">' +
+                    escapeHtml(
+                        payload.title
+                    ) +
+                    '</div>' +
+                    '<div class="track-artist">' +
+                    escapeHtml(
+                        displayArtist
+                    ) +
+                    '</div>' +
+                    '<div class="track-duration">' +
+                    formatTime(
+                        payload.duration
+                    ) +
+                    '</div>';
+            } else {
+                row.innerHTML =
+                    '<div class="track-num">' +
+                    (idx + 1) +
+                    '</div>' +
+                    '<div class="track-title">' +
+                    escapeHtml(
+                        payload.title
+                    ) +
+                    '</div>' +
+                    '<div class="track-duration">' +
+                    formatTime(
+                        payload.duration
+                    ) +
+                    '</div>';
+            }
+
+            appendQobuzTrackFavoriteHeart(
+                row,
+                payload
+            );
+
+            var add =
+                document.createElement(
+                    "button"
+                );
+
+            add.className =
+                "trackAddBtn";
+
+            add.innerHTML =
+                '<span class="material-icons">' +
+                'add</span>';
+
+            add.title =
+                "Add to queue";
+
+            add.setAttribute(
+                "aria-label",
+                "Add to queue"
+            );
+
+            add.onclick =
+                function(e) {
+                    e.stopPropagation();
+
+                    showQueuePopover(
+                        add,
+                        [payload],
+                        e
+                    );
+                };
+
+            row.appendChild(
+                add
+            );
+
+            row.onclick =
+                function() {
+                    playQobuzRadioTracks(
+                        tracks,
+                        idx,
+                        context
+                    );
+                };
+
+            trackList.appendChild(
+                row
+            );
+        }
+    );
+
+    /*
+     * Q10K: Qobuz Provider Radio is a finite generated collection.
+     * Expose Play All only and retain the existing canonical Qobuz
+     * payload / shared-Q5 queue path.
+     */
+    renderProviderRadioPlayAllBtn(
+        tracks,
+        function() {
+            playQobuzRadioTracks(
+                tracks,
+                0,
+                context
+            );
+        },
+        qobuzRadioTrackPayloads(
+            tracks
+        )
+    );
+
+    highlightCurrentTrack();
+}
+
+
+function showQobuzRadioDetail(
+    item,
+    seedKind,
+    nativeId,
+    data,
+    radioTracks,
+    detailEndpoint
+) {
+    item =
+        item || {};
+
+    data =
+        data || {};
+
+    seedKind =
+        seedKind === "track"
+            ? "track"
+            : (
+                seedKind === "album"
+                    ? "album"
+                    : "artist"
+            );
+
+    if (
+        currentViewEndpoint !==
+        detailEndpoint
+    ) {
+        return;
+    }
+
+    var contextType =
+        seedKind === "track"
+            ? "qobuz_radio_track"
+            : (
+                seedKind === "album"
+                    ? "qobuz_radio_album"
+                    : "qobuz_radio_artist"
+            );
+
+    var contextId =
+        qobuzRadioContextId(
+            seedKind,
+            nativeId
+        );
+
+    var contextTitle =
+        String(
+            data.title ||
+            item.name ||
+            "Qobuz Radio"
+        );
+
+    var firstTrack =
+        radioTracks.length
+            ? (
+                radioTracks[0] ||
+                {}
+            )
+            : {};
+
+    var cover =
+        String(
+            item.image_url ||
+            item.cover ||
+            firstTrack.artwork_url ||
+            firstTrack.image_url ||
+            SROVA_STANDBY_ART
+        );
+
+    currentContext = {
+        id:
+            contextId,
+        cover:
+            cover,
+        title:
+            contextTitle,
+        /*
+         * TIDAL Mix detail uses the compact header without a secondary
+         * provider/type subtitle. Keep Qobuz Radio visually aligned.
+         */
+        artist:
+            "",
+        source:
+            "qobuz",
+        context_type:
+            contextType
+    };
+
+    albumArt.src =
+        cover;
+
+    albumTitle.textContent =
+        contextTitle;
+
+    /*
+     * Q7H6 H6.2 — keep Provider Radio identity visible after the
+     * completed Qobuz Radio response replaces the loading state.
+     * Presentation only: currentContext remains unchanged.
+     */
+    albumArtist.textContent =
+        seedKind === "track"
+            ? "Track Radio · Qobuz"
+            : (
+                seedKind === "album"
+                    ? "Album Radio · Qobuz"
+                    : "Artist Radio · Qobuz"
+            );
+
+    albumArtist.style.cursor =
+        "";
+
+    albumArtist.onclick =
+        null;
+
+    albumTechInfo.textContent =
+        "";
+
+    albumTechInfo.className =
+        "hidden";
+
+    /*
+     * TIDAL Mix detail does not show album-style statistics. Qobuz
+     * provider Radio follows the same compact presentation.
+     */
+    albumStatsLine.textContent =
+        "";
+
+    albumStatsLine.className =
+        "hidden";
+
+    originalTracks =
+        radioTracks;
+
+    shuffledTracks =
+        [];
+
+    currentViewTracks =
+        radioTracks;
+
+    renderQobuzRadioTracks(
+        radioTracks,
+        currentContext
+    );
+
+    resetAlbumDetailScroll();
+}
+
+
+function startQobuzRadioFromSeed(
+    item,
+    seedKind,
+    returnView,
+    returnFn
+) {
+    if (!requireOnlineSource()) {
+        return;
+    }
+
+    item =
+        item || {};
+
+    seedKind =
+        seedKind === "track"
+            ? "track"
+            : (
+                seedKind === "album"
+                    ? "album"
+                    : "artist"
+            );
+
+    var nativeId =
+        qobuzRadioSeedNativeId(
+            item,
+            seedKind
+        );
+
+    if (!nativeId) {
+        return;
+    }
+
+    var operation =
+        seedKind === "track"
+            ? "radio_track"
+            : (
+                seedKind === "album"
+                    ? "radio_album"
+                    : "radio_artist"
+            );
+
+    var parameter =
+        seedKind === "track"
+            ? "track_id"
+            : (
+                seedKind === "album"
+                    ? "album_id"
+                    : "artist_id"
+            );
+
+    var detailEndpoint =
+        "qobuz:radio:" +
+        seedKind +
+        ":" +
+        nativeId;
+
+    previousView =
+        "radio";
+
+    _qobuzRadioReturnFn =
+        null;
+
+    if (
+        typeof returnFn ===
+            "function"
+    ) {
+        _qobuzRadioReturnFn =
+            returnFn;
+
+        previousView =
+            "qobuzradioorigin";
+    } else if (returnView) {
+        previousView =
+            String(returnView);
+    }
+
+    currentViewEndpoint =
+        detailEndpoint;
+
+    setAlbumViewKind(
+        "tidal-detail"
+    );
+
+    if (albumView) {
+        albumView.classList.add(
+            "providerRadioDetail"
+        );
+    }
+
+    showView(
+        "album"
+    );
+
+    albumArt.src =
+        String(
+            item.image_url ||
+            item.artwork_url ||
+            item.cover ||
+            SROVA_STANDBY_ART
+        );
+
+    albumTitle.textContent =
+        String(
+            item.name ||
+            item.title ||
+            "Qobuz Radio"
+        );
+
+    albumArtist.textContent =
+        seedKind === "track"
+            ? "Track Radio · Qobuz"
+            : (
+                seedKind === "album"
+                    ? "Album Radio · Qobuz"
+                    : "Artist Radio · Qobuz"
+            );
+
+    albumArtist.style.cursor =
+        "";
+
+    albumArtist.onclick =
+        null;
+
+    albumTechInfo.textContent =
+        "";
+
+    albumTechInfo.className =
+        "hidden";
+
+    albumStatsLine.textContent =
+        "";
+
+    albumStatsLine.className =
+        "hidden";
+
+    trackList.innerHTML =
+        '<div class="trackListLoading">' +
+        'Loading Qobuz Radio\u2026' +
+        '</div>';
+
+    renderAlbumQueueBtn(
+        [],
+        ""
+    );
+
+    resetAlbumDetailScroll();
+
+    var requestUrl =
+        "/qobuz/catalog?op=" +
+        encodeURIComponent(
+            operation
+        ) +
+        "&" +
+        encodeURIComponent(
+            parameter
+        ) +
+        "=" +
+        encodeURIComponent(
+            nativeId
+        );
+
+    fetchWithTimeout(
+        requestUrl,
+        {
+            cache: "no-store"
+        },
+        15000
+    )
+    .then(function(response) {
+        if (!response.ok) {
+            throw new Error(
+                "Qobuz Radio request failed."
+            );
+        }
+
+        return response.json();
+    })
+    .then(function(data) {
+        if (
+            currentViewEndpoint !==
+            detailEndpoint
+        ) {
+            return;
+        }
+
+        if (
+            !data ||
+            data.ok === false ||
+            String(
+                data.source || ""
+            ).toLowerCase() !==
+                "qobuz" ||
+            String(
+                data.type || ""
+            ).indexOf(
+                "radio-"
+            ) !== 0
+        ) {
+            throw new Error(
+                "Invalid Qobuz Radio response."
+            );
+        }
+
+        var radioTracks =
+            qobuzRadioResponseTracks(
+                data
+            );
+
+        var payload =
+            qobuzRadioTrackPayloads(
+                radioTracks
+            );
+
+        if (!payload.length) {
+            throw new Error(
+                "Qobuz Radio returned no playable tracks."
+            );
+        }
+
+        showQobuzRadioDetail(
+            item,
+            seedKind,
+            nativeId,
+            data,
+            radioTracks,
+            detailEndpoint
+        );
+    })
+    .catch(function(error) {
+        if (
+            currentViewEndpoint !==
+            detailEndpoint
+        ) {
+            return;
+        }
+
+        console.error(
+            "Qobuz Radio detail failed:",
+            error
+        );
+
+        trackList.innerHTML =
+            '<div class="unavailableMsg">' +
+            'Could not load Qobuz Radio.' +
+            '</div>';
+
+        renderAlbumQueueBtn(
+            [],
+            ""
+        );
+    });
+}
+
+
+function qobuzRadioSeedCards(
+    rawItems,
+    seedKind
+) {
+    rawItems =
+        Array.isArray(rawItems)
+            ? rawItems
+            : [];
+
+    seedKind =
+        seedKind === "track"
+            ? "track"
+            : "artist";
+
+    return rawItems
+        .map(function(raw) {
+            var adapted =
+                adaptQobuzWallItem(
+                    raw,
+                    seedKind
+                );
+
+            if (!adapted.id) {
+                return null;
+            }
+
+            if (seedKind === "artist") {
+                adapted.sub_title =
+                    "Artist Radio";
+            } else {
+                adapted.sub_title =
+                    String(
+                        raw.artist ||
+                        adapted.sub_title ||
+                        "Track"
+                    ) +
+                    " · Track Radio";
+            }
+
+            return adapted;
+        })
+        .filter(function(item) {
+            return !!item;
+        });
+}
+
+
+/*
+ * Q7H6 H6.1 — SOURCE 01 Qobuz Radio artwork parity.
+ *
+ * adaptQobuzWallItem() intentionally leaves artists without native
+ * provider artwork on the valid SROVA placeholder. SOURCE 03 then
+ * enriches only those missing artists from artist_page and resolves
+ * its existing artist -> release/album -> track artwork hierarchy via
+ * qobuzArtistPageFallbackArtwork().
+ *
+ * Apply the same optional presentation-only enrichment to Qobuz Radio
+ * artist seeds. Provider Radio identity, generation, queue and playback
+ * remain untouched.
+ */
+function enrichQobuzRadioArtistArtwork(
+    shell,
+    slot,
+    items
+) {
+    if (
+        !shell ||
+        !slot ||
+        !Array.isArray(items)
+    ) {
+        return;
+    }
+
+    var requestId =
+        Number(
+            slot._qobuzRadioRequest ||
+            0
+        );
+
+    var missing =
+        items.filter(function(item) {
+            return !!(
+                item &&
+                item.qobuz_artwork_missing === true &&
+                item.id
+            );
+        });
+
+    missing.forEach(function(item) {
+        scheduleQobuzWallFetch(
+            function() {
+                if (
+                    Number(
+                        slot._qobuzRadioRequest ||
+                        0
+                    ) !== requestId ||
+                    shell !==
+                        _radioSourcePageCache ||
+                    currentSourceSection !==
+                        "radio" ||
+                    !providerRadioEffectiveVisibility(
+                        "qobuz"
+                    )
+                ) {
+                    throw new Error(
+                        "Stale Qobuz Radio artist artwork request."
+                    );
+                }
+
+                return fetchWithTimeout(
+                    "/qobuz/catalog?op=artist_page" +
+                    "&artist_id=" +
+                    encodeURIComponent(
+                        String(item.id)
+                    ),
+                    {
+                        cache: "no-store"
+                    },
+                    7000
+                );
+            }
+        )
+        .then(function(response) {
+            return response.json();
+        })
+        .then(function(data) {
+            if (
+                Number(
+                    slot._qobuzRadioRequest ||
+                    0
+                ) !== requestId ||
+                shell !==
+                    _radioSourcePageCache ||
+                currentSourceSection !==
+                    "radio" ||
+                !providerRadioEffectiveVisibility(
+                    "qobuz"
+                ) ||
+                !data ||
+                data.ok === false
+            ) {
+                return;
+            }
+
+            var artwork =
+                qobuzArtistPageFallbackArtwork(
+                    data
+                );
+
+            if (!artwork) {
+                return;
+            }
+
+            item.image_url =
+                artwork;
+
+            item.qobuz_artwork_missing =
+                false;
+
+            slot.querySelectorAll(
+                '.album[data-id]'
+            ).forEach(function(card) {
+                if (
+                    card.getAttribute(
+                        "data-id"
+                    ) !== String(item.id)
+                ) {
+                    return;
+                }
+
+                var image =
+                    card.querySelector("img");
+
+                if (image) {
+                    image.src =
+                        artwork;
+                }
+            });
+        })
+        .catch(function() {
+            /*
+             * Keep the valid SROVA hero when Qobuz exposes no usable
+             * artist, release/album or track artwork.
+             */
+        });
+    });
+}
+
+
+function renderQobuzRadioSourceSection(
+    shell,
+    rawItems,
+    seedKind
+) {
+    var slot =
+        ensureQobuzRadioSourceSlot(
+            shell
+        );
+
+    if (!slot) {
+        return;
+    }
+
+    var items =
+        qobuzRadioSeedCards(
+            rawItems,
+            seedKind
+        );
+
+    slot.innerHTML =
+        "";
+
+    if (!items.length) {
+        slot.hidden =
+            true;
+
+        return;
+    }
+
+    var block =
+        buildScrollSection(
+            "QOBUZ RADIO",
+            items,
+            function(
+                item,
+                e
+            ) {
+                if (e) {
+                    e.stopPropagation();
+                }
+
+                startQobuzRadioFromSeed(
+                    item,
+                    seedKind
+                );
+            },
+            {
+                kind: "curated"
+            }
+        );
+
+    block.classList.add(
+        "providerRadioShelf",
+        "qobuzProviderRadioShelf"
+    );
+
+    slot.appendChild(block);
+
+    slot.hidden =
+        false;
+
+    if (seedKind === "artist") {
+        enrichQobuzRadioArtistArtwork(
+            shell,
+            slot,
+            items
+        );
+    }
+}
+
+
+function refreshQobuzRadioSourceSection(shell) {
+    shell =
+        shell ||
+        _radioSourcePageCache;
+
+    if (!shell) {
+        return Promise.resolve();
+    }
+
+    var slot =
+        ensureQobuzRadioSourceSlot(
+            shell
+        );
+
+    if (!slot) {
+        return Promise.resolve();
+    }
+
+    var requestId =
+        Number(
+            slot._qobuzRadioRequest ||
+            0
+        ) + 1;
+
+    slot._qobuzRadioRequest =
+        requestId;
+
+    slot.hidden =
+        true;
+
+    var settingsRequest =
+        providerRadioVisibilityState.loaded
+            ? Promise.resolve()
+            : loadProviderRadioVisibilitySettings()
+                .catch(function() {});
+
+    var authRequest =
+        refreshStreamingProviderPresentation()
+            .catch(function() {});
+
+    return Promise.all([
+        settingsRequest,
+        authRequest
+    ])
+    .then(function() {
+        if (
+            Number(
+                slot._qobuzRadioRequest ||
+                0
+            ) !== requestId
+        ) {
+            return null;
+        }
+
+        if (
+            shell !==
+            _radioSourcePageCache
+        ) {
+            return null;
+        }
+
+        if (
+            !providerRadioEffectiveVisibility(
+                "qobuz"
+            )
+        ) {
+            clearQobuzRadioSourceSection(
+                shell
+            );
+
+            return null;
+        }
+
+        return fetchWithTimeout(
+            "/qobuz/catalog?" +
+            "op=library_artists" +
+            "&limit=24" +
+            "&offset=0",
+            {
+                cache: "no-store"
+            },
+            7000
+        )
+        .then(function(response) {
+            if (!response.ok) {
+                return {};
+            }
+
+            return response.json();
+        })
+        .catch(function() {
+            return {};
+        })
+        .then(function(data) {
+            if (
+                Number(
+                    slot._qobuzRadioRequest ||
+                    0
+                ) !== requestId ||
+                shell !==
+                    _radioSourcePageCache
+            ) {
+                return null;
+            }
+
+            var artists =
+                qobuzRadioSeedPageItems(
+                    data
+                );
+
+            if (artists.length) {
+                renderQobuzRadioSourceSection(
+                    shell,
+                    artists,
+                    "artist"
+                );
+
+                return null;
+            }
+
+            /*
+             * Empty saved-artist libraries still have a provider-native
+             * SOURCE 01 path: use saved Qobuz tracks as radio_track seeds.
+             */
+            return fetchWithTimeout(
+                "/qobuz/catalog?" +
+                "op=library_tracks" +
+                "&limit=24" +
+                "&offset=0",
+                {
+                    cache: "no-store"
+                },
+                7000
+            )
+            .then(function(response) {
+                if (!response.ok) {
+                    return {};
+                }
+
+                return response.json();
+            })
+            .catch(function() {
+                return {};
+            })
+            .then(function(trackData) {
+                if (
+                    Number(
+                        slot._qobuzRadioRequest ||
+                        0
+                    ) !== requestId ||
+                    shell !==
+                        _radioSourcePageCache
+                ) {
+                    return null;
+                }
+
+                renderQobuzRadioSourceSection(
+                    shell,
+                    qobuzRadioSeedPageItems(
+                        trackData
+                    ),
+                    "track"
+                );
+
+                return null;
+            });
+        });
+    })
+    .catch(function() {
+        if (
+            Number(
+                slot._qobuzRadioRequest ||
+                0
+            ) === requestId &&
+            shell ===
+                _radioSourcePageCache
+        ) {
+            clearQobuzRadioSourceSection(
+                shell
+            );
+        }
+    });
+}
+
+
+var providerRadioVisibilityState = {
+    show_tidal_radio: false,
+    show_qobuz_radio: false,
+    loaded: false,
+    saveInFlight: false
+};
+
+function providerRadioPreferenceKey(provider) {
+    return provider === "qobuz"
+        ? "show_qobuz_radio"
+        : "show_tidal_radio";
+}
+
+function providerRadioDisplayName(provider) {
+    return provider === "qobuz"
+        ? "Qobuz"
+        : "TIDAL";
+}
+
+function providerRadioAuthenticated(provider) {
+    return (
+        provider === "qobuz"
+            ? streamingProviderAuthState.qobuz
+            : streamingProviderAuthState.tidal
+    ) === true;
+}
+
+function providerRadioStoredPreference(provider) {
+    return !!providerRadioVisibilityState[
+        providerRadioPreferenceKey(provider)
+    ];
+}
+
+function providerRadioEffectiveVisibility(provider) {
+    return !!(
+        providerRadioVisibilityState.loaded &&
+        providerRadioStoredPreference(provider) &&
+        providerRadioAuthenticated(provider)
+    );
+}
+
+function syncProviderRadioSettingsControls() {
+    ["tidal", "qobuz"].forEach(function(provider) {
+        var toggle = document.getElementById(
+            "settingsShow" +
+            (provider === "qobuz" ? "Qobuz" : "Tidal") +
+            "RadioToggle"
+        );
+
+        var sub = document.getElementById(
+            "settingsShow" +
+            (provider === "qobuz" ? "Qobuz" : "Tidal") +
+            "RadioSub"
+        );
+
+        if (!toggle || !sub) {
+            return;
+        }
+
+        var enabled =
+            providerRadioStoredPreference(provider);
+
+        var authenticated =
+            providerRadioAuthenticated(provider);
+
+        toggle.classList.toggle(
+            "active",
+            enabled
+        );
+
+        toggle.setAttribute(
+            "aria-pressed",
+            enabled ? "true" : "false"
+        );
+
+        var disabled = !!(
+            !providerRadioVisibilityState.loaded ||
+            providerRadioVisibilityState.saveInFlight ||
+            !authenticated
+        );
+
+        toggle.disabled = disabled;
+
+        toggle.setAttribute(
+            "aria-disabled",
+            disabled ? "true" : "false"
+        );
+
+        if (!providerRadioVisibilityState.loaded) {
+            sub.textContent = "Loading…";
+            return;
+        }
+
+        if (!authenticated) {
+            sub.textContent =
+                (enabled ? "Enabled" : "Disabled") +
+                " — sign in to " +
+                providerRadioDisplayName(provider) +
+                " to use";
+            return;
+        }
+
+        sub.textContent =
+            enabled ? "Enabled" : "Disabled";
+    });
+}
+
+function loadProviderRadioVisibilitySettings() {
+    providerRadioVisibilityState.loaded = false;
+    syncProviderRadioSettingsControls();
+
+    return fetchWithTimeout(
+        "/api/settings/provider-radio?_=" +
+            encodeURIComponent(String(Date.now())),
+        {
+            cache: "no-store"
+        },
+        4000
+    )
+    .then(function(response) {
+        if (!response.ok) {
+            throw new Error(
+                "Provider Radio settings unavailable"
+            );
+        }
+        return response.json();
+    })
+    .then(function(data) {
+        data = data || {};
+
+        providerRadioVisibilityState.show_tidal_radio =
+            data.show_tidal_radio === true;
+
+        providerRadioVisibilityState.show_qobuz_radio =
+            data.show_qobuz_radio === true;
+
+        providerRadioVisibilityState.loaded = true;
+
+        syncProviderRadioSettingsControls();
+
+        return data;
+    })
+    .catch(function(error) {
+        providerRadioVisibilityState.loaded = false;
+        syncProviderRadioSettingsControls();
+        throw error;
+    });
+}
+
+function saveProviderRadioVisibilitySetting(
+    provider,
+    enabled
+) {
+    if (
+        providerRadioVisibilityState.saveInFlight ||
+        !providerRadioVisibilityState.loaded ||
+        !providerRadioAuthenticated(provider)
+    ) {
+        return;
+    }
+
+    var key =
+        providerRadioPreferenceKey(provider);
+
+    var payload = {};
+    payload[key] = !!enabled;
+
+    providerRadioVisibilityState.saveInFlight = true;
+    syncProviderRadioSettingsControls();
+
+    fetchWithTimeout(
+        "/api/settings/provider-radio",
+        {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify(payload)
+        },
+        5000
+    )
+    .then(function(response) {
+        if (!response.ok) {
+            throw new Error(
+                "Could not save Provider Radio setting."
+            );
+        }
+
+        return response.json();
+    })
+    .then(function(data) {
+        if (
+            !data ||
+            data.ok === false ||
+            data.error
+        ) {
+            throw new Error(
+                (data && data.error) ||
+                "Could not save Provider Radio setting."
+            );
+        }
+
+        providerRadioVisibilityState.show_tidal_radio =
+            data.show_tidal_radio === true;
+
+        providerRadioVisibilityState.show_qobuz_radio =
+            data.show_qobuz_radio === true;
+
+        providerRadioVisibilityState.loaded = true;
+    })
+    .catch(function(error) {
+        showQueueActionToast(
+            (
+                error &&
+                error.message
+            ) ||
+                "Could not save Provider Radio setting.",
+            true
+        );
+    })
+    .then(function() {
+        providerRadioVisibilityState.saveInFlight = false;
+        syncProviderRadioSettingsControls();
+    });
+}
+
+
+var streamingProviderAuthState = {
+    tidal: null,
+    qobuz: null,
+    requestSerial: 0,
+    initialRefreshComplete: false
+};
+
+function streamingProviderPlaybackLabel(status) {
+    status = status || {};
+
+    if (
+        status.current_track_valid !== true ||
+        status.playback_state === "idle"
+    ) {
+        return "ONLINE";
+    }
+
+    /*
+     * P12: explicit provider identity wins for finite provider playback,
+     * including provider-generated Radio contexts. Internet Radio exposes
+     * source=radio and therefore remains the neutral ONLINE presentation.
+     */
+    var explicitSource =
+        String(status.source || "").toLowerCase();
+
+    if (explicitSource === "tidal") {
+        return "TIDAL";
+    }
+
+    if (explicitSource === "qobuz") {
+        return "QOBUZ";
+    }
+
+    /*
+     * Reuse the existing compatibility inference for older/partial status
+     * payloads rather than creating a second playback-provider truth.
+     */
+    var inferredSource =
+        inferStatusPlaybackSource(status);
+
+    if (inferredSource === "tidal") {
+        return "TIDAL";
+    }
+
+    if (inferredSource === "qobuz") {
+        return "QOBUZ";
+    }
+
+    return "ONLINE";
+}
+
+
+function streamingProviderPresentation() {
+    var tidalAuthenticated = (
+        streamingProviderAuthState.tidal === true
+    );
+
+    var qobuzAuthenticated = (
+        streamingProviderAuthState.qobuz === true
+    );
+
+    if (
+        tidalAuthenticated &&
+        qobuzAuthenticated
+    ) {
+        return {
+            label:
+                streamingProviderPlaybackLabel(
+                    lastKnownPlaybackStatus
+                ),
+            /*
+             * Navigation remains intentionally independent of playback.
+             * SOURCE 03 still opens whichever provider the user last chose.
+             */
+            handler: (
+                currentStreamingProvider === "qobuz" ?
+                "showQobuzSource()" :
+                "showTidalSource()"
+            ),
+            dual: true
+        };
+    }
+
+    if (
+        tidalAuthenticated &&
+        !qobuzAuthenticated
+    ) {
+        return {
+            label: "TIDAL",
+            handler: "showTidalSource()",
+            dual: false
+        };
+    }
+
+    if (
+        qobuzAuthenticated &&
+        !tidalAuthenticated
+    ) {
+        return {
+            label: "QOBUZ",
+            handler: "showQobuzSource()",
+            dual: false
+        };
+    }
+
+    /*
+     * P12 visible identity is provider-neutral when neither service is
+     * authenticated. Preserve the historical TIDAL entry handler so this
+     * presentation-only point does not alter signed-out navigation/auth UX.
+     */
+    return {
+        label: "ONLINE",
+        handler: "showTidalSource()",
+        dual: false
+    };
+}
+
+function applyStreamingProviderPresentation() {
+    var presentation =
+        streamingProviderPresentation();
+
+    document.querySelectorAll(
+        '.srovaSourceSwitchItem' +
+        '[data-source-switch="streaming"]'
+    ).forEach(function(button) {
+        button.textContent =
+            presentation.label;
+
+        button.setAttribute(
+            "onclick",
+            presentation.handler
+        );
+    });
+
+    var portal = document.querySelector(
+        '.srovaSourcePortal' +
+        '[data-home-source="streaming"]'
+    );
+
+    if (portal) {
+        portal.setAttribute(
+            "onclick",
+            presentation.handler
+        );
+
+        var portalTitle =
+            portal.querySelector(
+                ".srovaSourcePortalTitle"
+            );
+
+        if (portalTitle) {
+            portalTitle.textContent =
+                presentation.label;
+        }
+    }
+
+    document.querySelectorAll(
+        ".srovaStreamingProviderBar"
+    ).forEach(function(bar) {
+        bar.hidden =
+            !presentation.dual;
+    });
+}
+
+function refreshStreamingProviderPresentation() {
+    var requestSerial =
+        ++streamingProviderAuthState.requestSerial;
+
+    var tidalRequest =
+        fetchWithTimeout(
+            "/tidal/status?_=" +
+                encodeURIComponent(
+                    String(Date.now())
+                ),
+            {
+                cache: "no-store"
+            },
+            4000
+        )
+        .then(function(response) {
+            if (!response.ok) {
+                throw new Error(
+                    "TIDAL status unavailable"
+                );
+            }
+
+            return response.json();
+        })
+        .then(function(data) {
+            return !!(
+                data &&
+                data.logged_in === true
+            );
+        })
+        .catch(function() {
+            return null;
+        });
+
+    var qobuzRequest =
+        fetchWithTimeout(
+            "/qobuz/status?_=" +
+                encodeURIComponent(
+                    String(Date.now())
+                ),
+            {
+                cache: "no-store"
+            },
+            4000
+        )
+        .then(function(response) {
+            if (!response.ok) {
+                throw new Error(
+                    "Qobuz status unavailable"
+                );
+            }
+
+            return response.json();
+        })
+        .then(function(data) {
+            return !!(
+                data &&
+                data.authenticated === true
+            );
+        })
+        .catch(function() {
+            return null;
+        });
+
+    return Promise.all([
+        tidalRequest,
+        qobuzRequest
+    ])
+    .then(function(results) {
+        if (
+            requestSerial !==
+            streamingProviderAuthState.requestSerial
+        ) {
+            return streamingProviderPresentation();
+        }
+
+        if (results[0] !== null) {
+            streamingProviderAuthState.tidal =
+                results[0];
+        }
+
+        if (results[1] !== null) {
+            streamingProviderAuthState.qobuz =
+                results[1];
+
+            if (
+                results[1] ===
+                true
+            ) {
+                loadQobuzFavoriteIds(
+                    false
+                );
+            } else {
+                clearQobuzFavoriteIds();
+            }
+        }
+
+        streamingProviderAuthState.initialRefreshComplete =
+            true;
+
+        applyStreamingProviderPresentation();
+        syncProviderRadioSettingsControls();
+        syncQ9dProviderSelectors();
+
+        return streamingProviderPresentation();
+    });
+}
+
+function streamingProviderInitialHomePresentation() {
+    if (
+        streamingProviderAuthState.initialRefreshComplete
+    ) {
+        return streamingProviderPresentation();
+    }
+
+    return {
+        label: "\u00a0",
+        handler: "return false",
+        dual: false,
+        pending: true
+    };
+}
+
+function loadInitialHomeAfterStreamingProviderResolution(sessionReady) {
+    var providerCompleted = false;
+
+    var providerReady = new Promise(function(resolve) {
+        function finishProviderResolution() {
+            if (providerCompleted) { return; }
+
+            providerCompleted = true;
+
+            if (fallbackTimer) {
+                clearTimeout(fallbackTimer);
+            }
+
+            resolve();
+        }
+
+        var fallbackTimer =
+            setTimeout(
+                finishProviderResolution,
+                1800
+            );
+
+        refreshStreamingProviderPresentation()
+            .then(finishProviderResolution)
+            .catch(finishProviderResolution);
+    });
+
+    /*
+     * P7: do not construct the first Home from an unknown playback snapshot.
+     * /session is same-origin authoritative state; after it settles,
+     * updateHomeHeroNowPlaying() has cached the stable hero truth even though
+     * the Home DOM does not yet exist.
+     */
+    return Promise.all([
+        providerReady,
+        Promise.resolve(sessionReady).catch(function() {})
+    ]).then(function() {
+        loadHome();
+    });
+}
+
 function loadHome() {
     showView("home");
     setCurrentSourceSection("");
     setGlobalSearchVisible(true);
     refreshGlobalSearchAvailability();
     _cancelHomeSlotPolls();
+
+    var streamingPresentation =
+        streamingProviderPresentation();
+
+    if (
+        !streamingProviderAuthState.initialRefreshComplete
+    ) {
+        streamingPresentation =
+            streamingProviderInitialHomePresentation();
+    }
+
     if (!homeSections) { return; }
+
+    var initialHeroModel =
+        deriveHomeHeroNowPlayingModel(lastKnownHomeHeroStatus);
+    var initialHeroImage =
+        initialHeroModel.imageUrl || SROVA_STANDBY_ART;
+
     homeSections.innerHTML =
         '<section id="srovaGateway">' +
           '<div class="srovaGatewayBrand">' +
@@ -9118,32 +16320,88 @@ function loadHome() {
               '<span class="srovaSourcePortalTitle">MUSIC</span>' +
               '<span class="srovaSourcePortalSub">Owned Library</span>' +
             '</button>' +
-            '<button class="srovaSourcePortal srovaSourcePortalTidal" data-home-source="tidal" onclick="showTidalSource()">' +
+            '<button class="srovaSourcePortal srovaSourcePortalTidal" data-home-source="streaming" onclick="' + streamingPresentation.handler + '">' +
               '<span class="srovaSourcePortalIndex">03</span>' +
               '<span class="srovaSourcePortalIcon material-icons">graphic_eq</span>' +
-              '<span class="srovaSourcePortalTitle">TIDAL</span>' +
+              '<span class="srovaSourcePortalTitle">' + streamingPresentation.label + '</span>' +
               '<span class="srovaSourcePortalSub">Streaming Library</span>' +
             '</button>' +
           '</div>' +
         '</section>';
 
+    /*
+     * P7: the markup deliberately retains the safe standby fallback, but when
+     * authoritative current artwork is already known replace that src in the
+     * same synchronous Home-build task. No generic-first visual frame is
+     * required on source navigation or return to Home.
+     */
+    var initialHeroLogo =
+        document.getElementById("srovaGatewayLogo");
+
+    if (
+        initialHeroLogo &&
+        homeHeroArtworkIdentity(initialHeroImage) !==
+            homeHeroArtworkIdentity(
+                initialHeroLogo.getAttribute("src") ||
+                initialHeroLogo.src ||
+                SROVA_STANDBY_ART
+            )
+    ) {
+        initialHeroLogo.src = initialHeroImage;
+    }
+
     setHomeGatewayAppPanel(true);
     homeHeroNowPlayingStateKey = "";
-    updateHomeHeroNowPlaying(lastKnownPlaybackStatus);
+    updateHomeHeroNowPlaying(lastKnownHomeHeroStatus);
     applyOnlineSourceAvailability(onlineSourcesAvailable);
     refreshOnlineSourceState();
+    refreshStreamingProviderPresentation();
 }
 
 function buildSourceSwitcher(activeSource) {
+    var streamingPresentation =
+        streamingProviderPresentation();
+
     function item(key, label, handler) {
-        var active = (activeSource === key);
-        return '<button class="srovaSourceSwitchItem' + (active ? ' active' : '') + '" data-source-switch="' + key + '" onclick="' + handler + '">' + label + '</button>';
+        var active = (
+            activeSource === key
+        );
+
+        return '<button class="srovaSourceSwitchItem' +
+            (active ? ' active' : '') +
+            '" data-source-switch="' + key +
+            '" onclick="' + handler + '">' +
+            label +
+            '</button>';
     }
-    return '<nav class="srovaSourceSwitcher" aria-label="Switch source">' +
-        item("radio", "RADIO", "showRadioSource()") +
-        item("music", "MUSIC", "showLocalMusic()") +
-        item("tidal", "TIDAL", "showTidalSource()") +
-      '</nav>';
+
+    var streamingItem = item("streaming", "ONLINE", "showTidalSource()");
+
+    if (
+        !streamingPresentation.dual ||
+        currentStreamingProvider === "qobuz"
+    ) {
+        streamingItem = item(
+            "streaming",
+            streamingPresentation.label,
+            streamingPresentation.handler
+        );
+    }
+
+    return '<nav class="srovaSourceSwitcher" ' +
+        'aria-label="Switch source">' +
+        item(
+            "radio",
+            "RADIO",
+            "showRadioSource()"
+        ) +
+        item(
+            "music",
+            "MUSIC",
+            "showLocalMusic()"
+        ) +
+        streamingItem +
+        '</nav>';
 }
 
 function buildSourcePageShell(sourceClass, label, title, subTitle, activeSource) {
@@ -9161,6 +16419,9 @@ function buildSourcePageShell(sourceClass, label, title, subTitle, activeSource)
           '</div>' +
           buildSourceSwitcher(activeSource || "") +
         '</div>' +
+        ((activeSource || "") === "streaming" ?
+            buildStreamingProviderSelector(currentStreamingProvider) :
+            "") +
         '<div class="srovaSourcePageBody"></div>';
     return wrap;
 }
@@ -9271,9 +16532,7 @@ function requireSrovaRadioDac(onReady) {
         _srovaSetupGuardInFlight.radio = false;
         data = data || {};
 
-        var dacName = String(data.dac_name || "").trim();
-        var device = String(data.alsa_device || "").trim();
-        if (dacName && device) {
+        if (data.output_selected === true) {
             if (typeof onReady === "function") { onReady(); }
             return;
         }
@@ -9316,6 +16575,12 @@ function showRadioSource(preserveReorderMode, setupVerified) {
     if (_radioSourcePageCache) {
         if (_radioSourcePageCache.parentNode === homeSections) {
             _syncHomePlayingTiles(_radioSourcePageCache);
+            if (typeof refreshTidalRadioSourceSection === "function") {
+                refreshTidalRadioSourceSection(_radioSourcePageCache);
+            }
+            if (typeof refreshQobuzRadioSourceSection === "function") {
+                refreshQobuzRadioSourceSection(_radioSourcePageCache);
+            }
             return;
         }
 
@@ -9337,6 +16602,8 @@ function showRadioSource(preserveReorderMode, setupVerified) {
     var slot = document.createElement("div");
     slot.id = "homeRadioSlot";
     body.appendChild(slot);
+    ensureTidalRadioSourceSlot(shell);
+    ensureQobuzRadioSourceSlot(shell);
     homeSections.appendChild(shell);
 
     buildRadioShelf(function(block) {
@@ -9348,6 +16615,12 @@ function showRadioSource(preserveReorderMode, setupVerified) {
         }
         _radioSourcePageCache = shell;
         supersedeRadioSourcePreparation();
+        if (typeof refreshTidalRadioSourceSection === "function") {
+            refreshTidalRadioSourceSection(shell);
+        }
+        if (typeof refreshQobuzRadioSourceSection === "function") {
+            refreshQobuzRadioSourceSection(shell);
+        }
     });
 }
 
@@ -9394,7 +16667,15 @@ function setTidalSourceBackMode(searchActive) {
 
 function clearTidalSourceSearchAndLanding() {
     var input = document.getElementById("tidalSourceSearchInput");
+    var clearBtn =
+        document.getElementById("tidalSourceSearchClear");
+
     if (input) { input.value = ""; }
+
+    if (clearBtn) {
+        clearBtn.classList.add("hidden");
+    }
+
     currentTidalSourceSearchTab = "top";
     clearTidalSourceSearchState();
     setTidalSourceSearchStatus("");
@@ -9459,6 +16740,4742 @@ function isInsideTidalSourceSearch(el) {
 }
 
 
+
+
+// Q7G-G2 QOBUZ PROVIDER-LOCAL SEARCH FOUNDATION
+// Search is scoped strictly to Qobuz SOURCE 03 and the normalized Q7C
+// /qobuz/catalog gateway. Global Search remains intentionally untouched.
+
+function qobuzSourceSearchPage(
+    data,
+    key
+) {
+    data = data || {};
+
+    var page =
+        data[key];
+
+    if (
+        !page ||
+        typeof page !== "object" ||
+        !Array.isArray(page.items)
+    ) {
+        return {
+            items: [],
+            offset: 0,
+            limit: 0,
+            total: 0
+        };
+    }
+
+    return page;
+}
+
+
+function qobuzSourceSearchPayloadIsValid(
+    data
+) {
+    if (
+        !data ||
+        data.ok !== true
+    ) {
+        return false;
+    }
+
+    var keys = [
+        "tracks",
+        "albums",
+        "artists",
+        "playlists"
+    ];
+
+    for (
+        var i = 0;
+        i < keys.length;
+        i++
+    ) {
+        var page =
+            data[keys[i]];
+
+        if (
+            !page ||
+            typeof page !== "object" ||
+            !Array.isArray(page.items)
+        ) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
+function qobuzSourceSearchHasResults(
+    data
+) {
+    if (
+        !qobuzSourceSearchPayloadIsValid(
+            data
+        )
+    ) {
+        return false;
+    }
+
+    return !!(
+        qobuzSourceSearchPage(
+            data,
+            "tracks"
+        ).items.length ||
+        qobuzSourceSearchPage(
+            data,
+            "albums"
+        ).items.length ||
+        qobuzSourceSearchPage(
+            data,
+            "artists"
+        ).items.length ||
+        qobuzSourceSearchPage(
+            data,
+            "playlists"
+        ).items.length
+    );
+}
+
+
+function qobuzSourceSearchCategoryTotal(
+    data,
+    key
+) {
+    var page =
+        qobuzSourceSearchPage(
+            data,
+            key
+        );
+
+    var total =
+        Number(page.total);
+
+    if (
+        Number.isFinite(total) &&
+        total >= 0
+    ) {
+        return total;
+    }
+
+    return page.items.length;
+}
+
+
+function qobuzSourceSearchDisplayCount(
+    data,
+    key
+) {
+    var page =
+        qobuzSourceSearchPage(
+            data,
+            key
+        );
+
+    var loaded =
+        page.items.length;
+
+    var total =
+        qobuzSourceSearchCategoryTotal(
+            data,
+            key
+        );
+
+    /*
+     * Qobuz may expose a provider-side search total that is much
+     * larger than the bounded normalized page returned to SROVA.
+     * Do not present that provider value as an exact UI count.
+     *
+     * If more provider matches exist than the current bounded page,
+     * show the amount SROVA has positively received followed by "+".
+     */
+    if (
+        loaded > 0 &&
+        total > loaded
+    ) {
+        return (
+            String(loaded) +
+            "+"
+        );
+    }
+
+    return String(total);
+}
+
+
+function persistQobuzSourceSearchState(
+    query,
+    data
+) {
+    query =
+        String(
+            query ||
+            ""
+        ).trim();
+
+    if (!query) {
+        return;
+    }
+
+    if (
+        lastQobuzSourceSearchQuery &&
+        lastQobuzSourceSearchQuery !== query
+    ) {
+        lastQobuzSourceSearchPayload =
+            null;
+    }
+
+    lastQobuzSourceSearchQuery =
+        query;
+
+    if (
+        qobuzSourceSearchPayloadIsValid(
+            data
+        )
+    ) {
+        lastQobuzSourceSearchPayload =
+            data;
+    }
+
+    try {
+        sessionStorage.setItem(
+            "srovaQobuzSourceSearchQuery",
+            lastQobuzSourceSearchQuery
+        );
+
+        if (
+            lastQobuzSourceSearchPayload
+        ) {
+            sessionStorage.setItem(
+                "srovaQobuzSourceSearchPayload",
+                JSON.stringify(
+                    lastQobuzSourceSearchPayload
+                )
+            );
+        } else {
+            sessionStorage.removeItem(
+                "srovaQobuzSourceSearchPayload"
+            );
+        }
+    } catch (e) {}
+}
+
+
+function clearQobuzSourceSearchState() {
+    lastQobuzSourceSearchQuery = "";
+    lastQobuzSourceSearchPayload = null;
+
+    try {
+        sessionStorage.removeItem(
+            "srovaQobuzSourceSearchQuery"
+        );
+
+        sessionStorage.removeItem(
+            "srovaQobuzSourceSearchPayload"
+        );
+    } catch (e) {}
+}
+
+
+function getSavedQobuzSourceSearchQuery() {
+    var query =
+        String(
+            lastQobuzSourceSearchQuery ||
+            ""
+        ).trim();
+
+    if (query) {
+        return query;
+    }
+
+    try {
+        query =
+            String(
+                sessionStorage.getItem(
+                    "srovaQobuzSourceSearchQuery"
+                ) ||
+                ""
+            ).trim();
+    } catch (e) {}
+
+    if (query) {
+        lastQobuzSourceSearchQuery =
+            query;
+    }
+
+    return query;
+}
+
+
+function readSavedQobuzSourceSearchPayload() {
+    if (
+        qobuzSourceSearchPayloadIsValid(
+            lastQobuzSourceSearchPayload
+        )
+    ) {
+        return lastQobuzSourceSearchPayload;
+    }
+
+    try {
+        var raw =
+            sessionStorage.getItem(
+                "srovaQobuzSourceSearchPayload"
+            ) ||
+            "";
+
+        if (!raw) {
+            return null;
+        }
+
+        var parsed =
+            JSON.parse(raw);
+
+        if (
+            qobuzSourceSearchPayloadIsValid(
+                parsed
+            )
+        ) {
+            lastQobuzSourceSearchPayload =
+                parsed;
+
+            return parsed;
+        }
+    } catch (e) {}
+
+    return null;
+}
+
+
+function setQobuzSourceBackMode(
+    searchActive
+) {
+    var backBtn =
+        document.querySelector(
+            ".srovaQobuzSourcePage .srovaSourceBack"
+        );
+
+    if (!backBtn) {
+        return;
+    }
+
+    backBtn.onclick =
+        searchActive
+            ? function() {
+                clearQobuzSourceSearchAndLanding();
+            }
+            : function() {
+                loadHome();
+            };
+}
+
+
+function setQobuzSourceSearchStatus(
+    text
+) {
+    var status =
+        document.getElementById(
+            "qobuzSourceSearchStatus"
+        );
+
+    if (status) {
+        status.textContent =
+            text ||
+            "";
+    }
+}
+
+
+function setQobuzSourceSearchUiState(
+    state,
+    statusText
+) {
+    state =
+        String(
+            state ||
+            "idle"
+        );
+
+    var toolbar =
+        document.getElementById(
+            "qobuzSourceSearchToolbar"
+        );
+
+    var wrap =
+        document.getElementById(
+            "qobuzSourceSearchWrap"
+        );
+
+    if (toolbar) {
+        toolbar.setAttribute(
+            "data-state",
+            state
+        );
+    }
+
+    if (wrap) {
+        wrap.setAttribute(
+            "data-state",
+            state
+        );
+    }
+
+    setQobuzSourceSearchStatus(
+        statusText ||
+        ""
+    );
+}
+
+
+function clearQobuzSourceSearchAndLanding() {
+    qobuzSourceSearchRequestSerial += 1;
+
+    var input =
+        document.getElementById(
+            "qobuzSourceSearchInput"
+        );
+
+    if (input) {
+        input.value = "";
+    }
+
+    var clearBtn =
+        document.getElementById(
+            "qobuzSourceSearchClear"
+        );
+
+    if (clearBtn) {
+        clearBtn.classList.add(
+            "hidden"
+        );
+    }
+
+    currentQobuzSourceSearchTab =
+        "top";
+
+    clearQobuzSourceSearchState();
+
+    var results =
+        document.getElementById(
+            "qobuzSourceSearchResults"
+        );
+
+    if (results) {
+        results.innerHTML = "";
+    }
+
+    setQobuzSourceSearchUiState(
+        "idle",
+        ""
+    );
+
+    setQobuzSourceBackMode(
+        false
+    );
+}
+
+
+function captureQobuzSourceSearchStateFromDom() {
+    var input =
+        document.getElementById(
+            "qobuzSourceSearchInput"
+        );
+
+    var query =
+        input &&
+        input.value
+            ? input.value.trim()
+            : getSavedQobuzSourceSearchQuery();
+
+    persistQobuzSourceSearchState(
+        query,
+        lastQobuzSourceSearchPayload
+    );
+}
+
+
+function qobuzSourceSearchCategoryLabel(
+    key
+) {
+    var labels = {
+        tracks: "Tracks",
+        albums: "Albums",
+        artists: "Artists",
+        playlists: "Playlists"
+    };
+
+    return labels[key] ||
+        "";
+}
+
+
+
+/*
+ * ================================================================
+ * Q7G-G3 QOBUZ PROVIDER SEARCH RESULTS
+ * ================================================================
+ * Search remains provider-local and consumes only the normalized
+ * Q7C search_catalog payload already persisted by G2.
+ *
+ * Existing Q7D/Q7E/Q7F adapters and detail entry points are reused:
+ *   tracks/albums/artists -> adaptQobuzWallItem()
+ *   playlists             -> adaptQobuzUserPlaylist()
+ *
+ * No Qobuz search result introduces playlist mutation.
+ */
+
+function qobuzSourceSearchResultSeed(
+    item,
+    kind
+) {
+    item = item || {};
+    kind =
+        String(
+            kind ||
+            ""
+        ).toLowerCase();
+
+    if (kind === "playlist") {
+        return adaptQobuzUserPlaylist(
+            item
+        );
+    }
+
+    if (
+        kind === "track" ||
+        kind === "album" ||
+        kind === "artist"
+    ) {
+        return adaptQobuzWallItem(
+            item,
+            kind
+        );
+    }
+
+    return null;
+}
+
+
+function qobuzSourceSearchApplyQuality(
+    element,
+    seed
+) {
+    if (!element) {
+        return;
+    }
+
+    var quality =
+        qobuzLibraryQualityDataValue(
+            seed || {}
+        );
+
+    if (quality) {
+        element.setAttribute(
+            "data-q",
+            quality
+        );
+    }
+}
+
+
+function captureQobuzSourceSearchDetailReturn() {
+    captureQobuzSourceSearchStateFromDom();
+    captureDetailReturnScroll(
+        "qobuzsource"
+    );
+}
+
+
+function qobuzSourceSearchOpenAlbum(
+    item
+) {
+    var seed =
+        qobuzSourceSearchResultSeed(
+            item,
+            "album"
+        );
+
+    if (
+        !seed ||
+        !seed.id
+    ) {
+        return;
+    }
+
+    captureQobuzSourceSearchDetailReturn();
+
+    loadQobuzAlbumDetail(
+        seed.id,
+        seed,
+        "qobuzsourcesearch"
+    );
+}
+
+
+function qobuzSourceSearchOpenArtist(
+    item
+) {
+    var seed =
+        qobuzSourceSearchResultSeed(
+            item,
+            "artist"
+        );
+
+    if (
+        !seed ||
+        !seed.id
+    ) {
+        return;
+    }
+
+    captureQobuzSourceSearchDetailReturn();
+
+    loadQobuzArtistDetail(
+        seed.id,
+        seed.name || "",
+        seed.image_url || "",
+        "qobuzsourcesearch",
+        null
+    );
+}
+
+
+function qobuzSourceSearchOpenPlaylist(
+    item
+) {
+    var seed =
+        qobuzSourceSearchResultSeed(
+            item,
+            "playlist"
+        );
+
+    if (
+        !seed ||
+        !seed.id
+    ) {
+        return;
+    }
+
+    captureQobuzSourceSearchDetailReturn();
+
+    loadStreamingPlaylistDetail(
+        "qobuz",
+        seed,
+        "qobuzsourcesearch"
+    );
+}
+
+
+function qobuzSourceSearchPlayTrack(
+    item
+) {
+    var seed =
+        qobuzSourceSearchResultSeed(
+            item,
+            "track"
+        );
+
+    if (
+        !seed ||
+        !seed.id ||
+        String(seed.id).indexOf(
+            "qobuz:"
+        ) !== 0
+    ) {
+        return;
+    }
+
+    playQobuzWallTrackNow(
+        seed
+    );
+}
+
+
+function qobuzSourceSearchTrackMenu(
+    anchorEl,
+    item,
+    e
+) {
+    var seed =
+        qobuzSourceSearchResultSeed(
+            item,
+            "track"
+        );
+
+    if (
+        !seed ||
+        !seed.id ||
+        String(seed.id).indexOf(
+            "qobuz:"
+        ) !== 0
+    ) {
+        return;
+    }
+
+    captureQobuzSourceSearchStateFromDom();
+
+    showQobuzTrackArtworkMenu(
+        anchorEl,
+        seed,
+        e,
+        "qobuzsourcesearch"
+    );
+}
+
+
+function renderQobuzSourceSearchTopRow(
+    kind,
+    item
+) {
+    item = item || {};
+    kind =
+        String(
+            kind ||
+            ""
+        ).toLowerCase();
+
+    var seed =
+        qobuzSourceSearchResultSeed(
+            item,
+            kind
+        );
+
+    var row =
+        document.createElement(
+            "div"
+        );
+
+    row.className =
+        "srovaSearchTopRow " +
+        "qobuzSourceSearchTopRow";
+
+    row.setAttribute(
+        "data-search-kind",
+        kind
+    );
+
+    if (
+        kind === "track" ||
+        kind === "album"
+    ) {
+        qobuzSourceSearchApplyQuality(
+            row,
+            seed
+        );
+    }
+
+    var title = "";
+    var sub = "";
+    var meta = "";
+    var typeLabel = "";
+    var artwork = "";
+    var artistArtwork = false;
+
+    if (kind === "track") {
+        title =
+            seed &&
+            seed.name
+                ? seed.name
+                : String(
+                    item.title ||
+                    ""
+                );
+
+        sub =
+            seed &&
+            seed.sub_title
+                ? seed.sub_title
+                : String(
+                    item.artist ||
+                    ""
+                );
+
+        meta =
+            item.duration
+                ? formatTime(
+                    item.duration
+                )
+                : "";
+
+        typeLabel = "Track";
+
+        artwork =
+            seed &&
+            seed.image_url
+                ? seed.image_url
+                : SROVA_STANDBY_ART;
+
+        row.onclick =
+            function() {
+                qobuzSourceSearchPlayTrack(
+                    item
+                );
+            };
+    } else if (kind === "album") {
+        title =
+            seed &&
+            seed.name
+                ? seed.name
+                : String(
+                    item.title ||
+                    ""
+                );
+
+        sub =
+            seed &&
+            seed.sub_title
+                ? seed.sub_title
+                : String(
+                    item.artist ||
+                    ""
+                );
+
+        var releaseDate =
+            String(
+                item.release_date ||
+                item.release_date_original ||
+                item.release_date_stream ||
+                ""
+            );
+
+        meta =
+            releaseDate
+                ? releaseDate.slice(
+                    0,
+                    4
+                )
+                : "";
+
+        typeLabel = "Album";
+
+        artwork =
+            seed &&
+            seed.image_url
+                ? seed.image_url
+                : SROVA_STANDBY_ART;
+
+        row.onclick =
+            function() {
+                qobuzSourceSearchOpenAlbum(
+                    item
+                );
+            };
+    } else if (kind === "artist") {
+        title =
+            seed &&
+            seed.name
+                ? seed.name
+                : String(
+                    item.name ||
+                    ""
+                );
+
+        sub = "Artist";
+
+        if (
+            Number(
+                item.albums_count ||
+                0
+            ) > 0
+        ) {
+            meta =
+                String(
+                    Number(
+                        item.albums_count
+                    )
+                ) +
+                " albums";
+        }
+
+        typeLabel = "Artist";
+
+        artwork =
+            seed &&
+            seed.image_url
+                ? seed.image_url
+                : SROVA_STANDBY_ART;
+
+        artistArtwork = true;
+
+        row.onclick =
+            function() {
+                qobuzSourceSearchOpenArtist(
+                    item
+                );
+            };
+    } else if (kind === "playlist") {
+        title =
+            seed &&
+            seed.name
+                ? seed.name
+                : String(
+                    item.title ||
+                    item.name ||
+                    ""
+                );
+
+        sub =
+            String(
+                item.owner_name ||
+                (
+                    item.owner &&
+                    item.owner.name
+                ) ||
+                "Qobuz"
+            );
+
+        meta =
+            seed &&
+            seed.num_tracks
+                ? String(
+                    seed.num_tracks
+                ) +
+                  " tracks"
+                : "";
+
+        typeLabel = "Playlist";
+
+        artwork =
+            seed &&
+            seed.image_url
+                ? seed.image_url
+                : SROVA_STANDBY_ART;
+
+        row.onclick =
+            function() {
+                qobuzSourceSearchOpenPlaylist(
+                    item
+                );
+            };
+    }
+
+    row.innerHTML =
+        '<img class="srovaSearchTopArt' +
+        (
+            artistArtwork
+                ? ' artist'
+                : ''
+        ) +
+        '" src="' +
+        escapeHtml(
+            artwork ||
+            SROVA_STANDBY_ART
+        ) +
+        '" alt="">' +
+        '<div class="srovaSearchTopMeta">' +
+            '<div class="srovaSearchTopTitle">' +
+                escapeHtml(title) +
+            '</div>' +
+            '<div class="srovaSearchTopSub">' +
+                '<span class="srovaSearchTypePill">' +
+                    escapeHtml(typeLabel) +
+                '</span>' +
+                '<span>' +
+                    escapeHtml(sub) +
+                '</span>' +
+            '</div>' +
+        '</div>' +
+        '<div class="srovaSearchTopExtra">' +
+            escapeHtml(meta) +
+        '</div>';
+
+    var actions =
+        document.createElement(
+            "div"
+        );
+
+    actions.className =
+        "srovaSearchTopActions";
+
+    if (kind === "track") {
+        var actionBtn =
+            document.createElement(
+                "button"
+            );
+
+        actionBtn.className =
+            "srovaSearchActionBtn";
+
+        actionBtn.innerHTML =
+            '<span class="material-icons">' +
+            'add' +
+            '</span>';
+
+        actionBtn.title =
+            "Track actions";
+
+        actionBtn.setAttribute(
+            "aria-label",
+            "Track actions"
+        );
+
+        actionBtn.onclick =
+            function(e) {
+                e.stopPropagation();
+
+                qobuzSourceSearchTrackMenu(
+                    actionBtn,
+                    item,
+                    e
+                );
+            };
+
+        actions.appendChild(
+            actionBtn
+        );
+
+        appendQobuzSearchTrackFavoriteHeart(
+            actions,
+            seed
+        );
+    } else if (
+        kind === "album" ||
+        kind === "artist"
+    ) {
+        appendQobuzSearchEntityFavoriteHeart(
+            actions,
+            kind,
+            item
+        );
+    }
+
+    if (actions.children.length) {
+        row.appendChild(
+            actions
+        );
+    }
+
+    return row;
+}
+
+
+function renderQobuzSourceSearchTopPanel(
+    data,
+    panel
+) {
+    var list =
+        document.createElement(
+            "div"
+        );
+
+    list.className =
+        "srovaSearchTopList";
+
+    var added = 0;
+
+    [
+        "tracks",
+        "albums",
+        "artists",
+        "playlists"
+    ].forEach(
+        function(key) {
+            var kind =
+                key === "playlists"
+                    ? "playlist"
+                    : key.slice(
+                        0,
+                        -1
+                    );
+
+            qobuzSourceSearchPage(
+                data,
+                key
+            ).items.slice(
+                0,
+                2
+            ).forEach(
+                function(item) {
+                    list.appendChild(
+                        renderQobuzSourceSearchTopRow(
+                            kind,
+                            item
+                        )
+                    );
+
+                    added += 1;
+                }
+            );
+        }
+    );
+
+    if (!added) {
+        panel.appendChild(
+            globalSearchNotice(
+                "No top results found."
+            )
+        );
+
+        return;
+    }
+
+    panel.appendChild(
+        list
+    );
+}
+
+
+function renderQobuzSourceSearchTrackRow(
+    item,
+    index
+) {
+    item = item || {};
+
+    var seed =
+        qobuzSourceSearchResultSeed(
+            item,
+            "track"
+        );
+
+    var row =
+        document.createElement(
+            "div"
+        );
+
+    row.className =
+        "srovaSearchTrackRow " +
+        "qobuzSourceSearchTrackRow";
+
+    row.setAttribute(
+        "data-track-id",
+        seed && seed.id
+            ? seed.id
+            : ""
+    );
+
+    qobuzSourceSearchApplyQuality(
+        row,
+        seed
+    );
+
+    var title =
+        seed &&
+        seed.name
+            ? seed.name
+            : String(
+                item.title ||
+                ""
+            );
+
+    var artist =
+        seed &&
+        seed.sub_title
+            ? seed.sub_title
+            : String(
+                item.artist ||
+                ""
+            );
+
+    var album =
+        String(
+            item.album ||
+            ""
+        );
+
+    var artwork =
+        seed &&
+        seed.image_url
+            ? seed.image_url
+            : SROVA_STANDBY_ART;
+
+    row.innerHTML =
+        '<div class="srovaSearchTrackNum">' +
+            String(index) +
+        '</div>' +
+        '<img class="srovaSearchTrackArt" src="' +
+            escapeHtml(artwork) +
+        '" alt="">' +
+        '<div class="srovaSearchTrackTitleCell">' +
+            '<div class="srovaSearchTrackTitle">' +
+                escapeHtml(title) +
+            '</div>' +
+            '<div class="srovaSearchSourcePill">' +
+                'QOBUZ' +
+            '</div>' +
+        '</div>' +
+        '<div class="srovaSearchTrackArtist">' +
+            escapeHtml(artist) +
+        '</div>' +
+        '<div class="srovaSearchTrackAlbum">' +
+            escapeHtml(album) +
+        '</div>' +
+        '<div class="srovaSearchTrackTime">' +
+            formatTime(
+                item.duration ||
+                0
+            ) +
+        '</div>';
+
+    var actionBtn =
+        document.createElement(
+            "button"
+        );
+
+    actionBtn.className =
+        "srovaSearchActionBtn";
+
+    actionBtn.innerHTML =
+        '<span class="material-icons">' +
+        'add' +
+        '</span>';
+
+    actionBtn.title =
+        "Track actions";
+
+    actionBtn.setAttribute(
+        "aria-label",
+        "Track actions"
+    );
+
+    actionBtn.onclick =
+        function(e) {
+            e.stopPropagation();
+
+            qobuzSourceSearchTrackMenu(
+                actionBtn,
+                item,
+                e
+            );
+        };
+
+    row.appendChild(
+        actionBtn
+    );
+
+    row.onclick =
+        function() {
+            qobuzSourceSearchPlayTrack(
+                item
+            );
+        };
+
+    appendQobuzSearchTrackFavoriteHeart(
+        row,
+        seed
+    );
+
+    return row;
+}
+
+
+function renderQobuzSourceSearchTracksPanel(
+    data,
+    panel
+) {
+    var items =
+        qobuzSourceSearchPage(
+            data,
+            "tracks"
+        ).items;
+
+    if (!items.length) {
+        panel.appendChild(
+            globalSearchNotice(
+                "No track results found."
+            )
+        );
+
+        return;
+    }
+
+    var table =
+        document.createElement(
+            "div"
+        );
+
+    table.className =
+        "srovaSearchTrackTable " +
+        "qobuzSourceSearchTrackTable";
+
+    table.innerHTML =
+        '<div class="' +
+            'srovaSearchTrackHead ' +
+            'qobuzSourceSearchTrackHead' +
+        '">' +
+            '<span>#</span>' +
+            '<span></span>' +
+            '<span>Title</span>' +
+            '<span>Artist</span>' +
+            '<span>Album</span>' +
+            '<span>Time</span>' +
+            '<span></span>' +
+        '</div>';
+
+    items.forEach(
+        function(item, index) {
+            table.appendChild(
+                renderQobuzSourceSearchTrackRow(
+                    item,
+                    index + 1
+                )
+            );
+        }
+    );
+
+    panel.appendChild(
+        table
+    );
+}
+
+
+function renderQobuzSourceSearchAlbumCard(
+    item
+) {
+    item = item || {};
+
+    var seed =
+        qobuzSourceSearchResultSeed(
+            item,
+            "album"
+        );
+
+    var card =
+        document.createElement(
+            "div"
+        );
+
+    card.className =
+        "srovaSearchAlbumCard " +
+        "qobuzSourceSearchAlbumCard";
+
+    qobuzSourceSearchApplyQuality(
+        card,
+        seed
+    );
+
+    var releaseDate =
+        String(
+            item.release_date ||
+            item.release_date_original ||
+            item.release_date_stream ||
+            ""
+        );
+
+    var year =
+        releaseDate
+            ? releaseDate.slice(
+                0,
+                4
+            )
+            : "";
+
+    card.innerHTML =
+        '<img src="' +
+            escapeHtml(
+                (
+                    seed &&
+                    seed.image_url
+                ) ||
+                SROVA_STANDBY_ART
+            ) +
+        '" alt="">' +
+        '<div class="srovaSearchCardMeta">' +
+            '<div class="srovaSearchEyebrow">' +
+                'QOBUZ ALBUM' +
+            '</div>' +
+            '<div class="srovaSearchCardTitle">' +
+                escapeHtml(
+                    (
+                        seed &&
+                        seed.name
+                    ) ||
+                    item.title ||
+                    ""
+                ) +
+            '</div>' +
+            '<div class="srovaSearchCardSub">' +
+                escapeHtml(
+                    (
+                        seed &&
+                        seed.sub_title
+                    ) ||
+                    item.artist ||
+                    ""
+                ) +
+            '</div>' +
+            '<div class="srovaSearchAlbumFacts">' +
+                (
+                    year
+                        ? '<span>' +
+                          escapeHtml(year) +
+                          '</span>'
+                        : ''
+                ) +
+                (
+                    item.explicit
+                        ? '<span class="' +
+                          'srovaSearchExplicit' +
+                          '">E</span>'
+                        : ''
+                ) +
+            '</div>' +
+        '</div>';
+
+    var favoriteActions =
+        document.createElement(
+            "div"
+        );
+
+    favoriteActions.className =
+        "srovaSearchCardActions";
+
+    if (
+        appendQobuzSearchEntityFavoriteHeart(
+            favoriteActions,
+            "album",
+            item
+        )
+    ) {
+        card.appendChild(
+            favoriteActions
+        );
+    }
+
+    card.onclick =
+        function() {
+            qobuzSourceSearchOpenAlbum(
+                item
+            );
+        };
+
+    return card;
+}
+
+
+function renderQobuzSourceSearchAlbumsPanel(
+    data,
+    panel
+) {
+    var items =
+        qobuzSourceSearchPage(
+            data,
+            "albums"
+        ).items;
+
+    if (!items.length) {
+        panel.appendChild(
+            globalSearchNotice(
+                "No album results found."
+            )
+        );
+
+        return;
+    }
+
+    var header =
+        document.createElement(
+            "div"
+        );
+
+    header.className =
+        "artworkViewHeader " +
+        "srovaSearchArtworkHeader";
+
+    var title =
+        document.createElement(
+            "h2"
+        );
+
+    title.textContent =
+        "Albums";
+
+    header.appendChild(
+        title
+    );
+
+    appendArtworkViewToggle(
+        header
+    );
+
+    panel.appendChild(
+        header
+    );
+
+    var grid =
+        document.createElement(
+            "div"
+        );
+
+    grid.className =
+        "srovaSearchAlbumGrid " +
+        "qobuzSourceSearchAlbumGrid";
+
+    applyArtworkViewModeClass(
+        grid
+    );
+
+    items.forEach(
+        function(item) {
+            grid.appendChild(
+                renderQobuzSourceSearchAlbumCard(
+                    item
+                )
+            );
+        }
+    );
+
+    panel.appendChild(
+        grid
+    );
+}
+
+
+function renderQobuzSourceSearchArtistCard(
+    item
+) {
+    item = item || {};
+
+    var seed =
+        qobuzSourceSearchResultSeed(
+            item,
+            "artist"
+        );
+
+    var card =
+        document.createElement(
+            "div"
+        );
+
+    card.className =
+        "srovaSearchArtistCard " +
+        "qobuzSourceSearchArtistCard";
+
+    var albumsCount =
+        Number(
+            item.albums_count ||
+            0
+        );
+
+    card.innerHTML =
+        '<img src="' +
+            escapeHtml(
+                (
+                    seed &&
+                    seed.image_url
+                ) ||
+                SROVA_STANDBY_ART
+            ) +
+        '" alt="">' +
+        '<div class="srovaSearchCardMeta">' +
+            '<div class="srovaSearchEyebrow">' +
+                'QOBUZ' +
+            '</div>' +
+            '<div class="srovaSearchCardTitle">' +
+                escapeHtml(
+                    (
+                        seed &&
+                        seed.name
+                    ) ||
+                    item.name ||
+                    ""
+                ) +
+            '</div>' +
+            '<div class="srovaSearchCardSub">' +
+                (
+                    albumsCount > 0
+                        ? escapeHtml(
+                            String(
+                                albumsCount
+                            ) +
+                            " albums"
+                        )
+                        : "Artist"
+                ) +
+            '</div>' +
+        '</div>';
+
+    var favoriteActions =
+        document.createElement(
+            "div"
+        );
+
+    favoriteActions.className =
+        "srovaSearchCardActions";
+
+    if (
+        appendQobuzSearchEntityFavoriteHeart(
+            favoriteActions,
+            "artist",
+            item
+        )
+    ) {
+        card.appendChild(
+            favoriteActions
+        );
+    }
+
+    card.onclick =
+        function() {
+            qobuzSourceSearchOpenArtist(
+                item
+            );
+        };
+
+    return card;
+}
+
+
+function renderQobuzSourceSearchArtistsPanel(
+    data,
+    panel
+) {
+    var items =
+        qobuzSourceSearchPage(
+            data,
+            "artists"
+        ).items;
+
+    if (!items.length) {
+        panel.appendChild(
+            globalSearchNotice(
+                "No artist results found."
+            )
+        );
+
+        return;
+    }
+
+    var header =
+        document.createElement(
+            "div"
+        );
+
+    header.className =
+        "artworkViewHeader " +
+        "srovaSearchArtworkHeader";
+
+    var title =
+        document.createElement(
+            "h2"
+        );
+
+    title.textContent =
+        "Artists";
+
+    header.appendChild(
+        title
+    );
+
+    panel.appendChild(
+        header
+    );
+
+    var grid =
+        document.createElement(
+            "div"
+        );
+
+    grid.className =
+        "srovaSearchAlbumGrid " +
+        "srovaSearchArtistGrid " +
+        "qobuzSourceSearchArtistGrid";
+
+    items.forEach(
+        function(item) {
+            grid.appendChild(
+                renderQobuzSourceSearchArtistCard(
+                    item
+                )
+            );
+        }
+    );
+
+    panel.appendChild(
+        grid
+    );
+}
+
+
+function renderQobuzSourceSearchPlaylistCard(
+    item
+) {
+    item = item || {};
+
+    var seed =
+        qobuzSourceSearchResultSeed(
+            item,
+            "playlist"
+        );
+
+    var card =
+        document.createElement(
+            "div"
+        );
+
+    card.className =
+        "srovaSearchAlbumCard " +
+        "qobuzSourceSearchPlaylistCard";
+
+    var owner =
+        String(
+            item.owner_name ||
+            (
+                item.owner &&
+                item.owner.name
+            ) ||
+            "Qobuz"
+        );
+
+    var trackCount =
+        seed &&
+        seed.num_tracks
+            ? Number(
+                seed.num_tracks
+            )
+            : 0;
+
+    card.innerHTML =
+        '<img src="' +
+            escapeHtml(
+                (
+                    seed &&
+                    seed.image_url
+                ) ||
+                SROVA_STANDBY_ART
+            ) +
+        '" alt="">' +
+        '<div class="srovaSearchCardMeta">' +
+            '<div class="srovaSearchEyebrow">' +
+                'QOBUZ PLAYLIST' +
+            '</div>' +
+            '<div class="srovaSearchCardTitle">' +
+                escapeHtml(
+                    (
+                        seed &&
+                        seed.name
+                    ) ||
+                    item.title ||
+                    item.name ||
+                    ""
+                ) +
+            '</div>' +
+            '<div class="srovaSearchCardSub">' +
+                escapeHtml(
+                    owner
+                ) +
+            '</div>' +
+            '<div class="srovaSearchAlbumFacts">' +
+                (
+                    trackCount > 0
+                        ? '<span>' +
+                          escapeHtml(
+                            String(
+                                trackCount
+                            ) +
+                            " tracks"
+                          ) +
+                          '</span>'
+                        : ''
+                ) +
+            '</div>' +
+        '</div>';
+
+    card.onclick =
+        function() {
+            qobuzSourceSearchOpenPlaylist(
+                item
+            );
+        };
+
+    return card;
+}
+
+
+function renderQobuzSourceSearchPlaylistsPanel(
+    data,
+    panel
+) {
+    var items =
+        qobuzSourceSearchPage(
+            data,
+            "playlists"
+        ).items;
+
+    if (!items.length) {
+        panel.appendChild(
+            globalSearchNotice(
+                "No playlist results found."
+            )
+        );
+
+        return;
+    }
+
+    var header =
+        document.createElement(
+            "div"
+        );
+
+    header.className =
+        "artworkViewHeader " +
+        "srovaSearchArtworkHeader";
+
+    var title =
+        document.createElement(
+            "h2"
+        );
+
+    title.textContent =
+        "Playlists";
+
+    header.appendChild(
+        title
+    );
+
+    appendArtworkViewToggle(
+        header
+    );
+
+    panel.appendChild(
+        header
+    );
+
+    var grid =
+        document.createElement(
+            "div"
+        );
+
+    grid.className =
+        "srovaSearchAlbumGrid " +
+        "qobuzSourceSearchPlaylistGrid";
+
+    applyArtworkViewModeClass(
+        grid
+    );
+
+    items.forEach(
+        function(item) {
+            grid.appendChild(
+                renderQobuzSourceSearchPlaylistCard(
+                    item
+                )
+            );
+        }
+    );
+
+    panel.appendChild(
+        grid
+    );
+}
+
+
+function renderQobuzSourceSearchFoundationPanel(
+    data,
+    panel
+) {
+    if (!panel) {
+        return;
+    }
+
+    panel.innerHTML = "";
+
+    var tab =
+        currentQobuzSourceSearchTab ||
+        "top";
+
+    if (tab === "tracks") {
+        renderQobuzSourceSearchTracksPanel(
+            data,
+            panel
+        );
+
+        return;
+    }
+
+    if (tab === "albums") {
+        renderQobuzSourceSearchAlbumsPanel(
+            data,
+            panel
+        );
+
+        return;
+    }
+
+    if (tab === "artists") {
+        renderQobuzSourceSearchArtistsPanel(
+            data,
+            panel
+        );
+
+        return;
+    }
+
+    if (tab === "playlists") {
+        renderQobuzSourceSearchPlaylistsPanel(
+            data,
+            panel
+        );
+
+        return;
+    }
+
+    renderQobuzSourceSearchTopPanel(
+        data,
+        panel
+    );
+}
+
+
+function renderQobuzSourceSearchFoundationResults(
+    data
+) {
+    var results =
+        document.getElementById(
+            "qobuzSourceSearchResults"
+        );
+
+    if (!results) {
+        return;
+    }
+
+    results.innerHTML = "";
+
+    if (
+        !qobuzSourceSearchPayloadIsValid(
+            data
+        )
+    ) {
+        return;
+    }
+
+    setQobuzSourceBackMode(
+        true
+    );
+
+    if (
+        !qobuzSourceSearchHasResults(
+            data
+        )
+    ) {
+        setQobuzSourceSearchUiState(
+            "no-results",
+            ""
+        );
+
+        results.innerHTML =
+            '<div class="searchLoading">' +
+            'No Qobuz results found.' +
+            '</div>';
+
+        return;
+    }
+
+    setQobuzSourceSearchUiState(
+        "results",
+        ""
+    );
+
+    var shell =
+        document.createElement(
+            "div"
+        );
+
+    shell.className =
+        "srovaSearchShell qobuzSourceSearchFoundation";
+
+    var header =
+        document.createElement(
+            "div"
+        );
+
+    header.className =
+        "srovaSearchHeader";
+
+    var title =
+        document.createElement(
+            "div"
+        );
+
+    title.className =
+        "srovaGlobalSearchTitle";
+
+    title.textContent =
+        "Qobuz Search";
+
+    header.appendChild(
+        title
+    );
+
+    shell.appendChild(
+        header
+    );
+
+    var tabs =
+        document.createElement(
+            "div"
+        );
+
+    tabs.className =
+        "srovaSearchTabs";
+
+    var tabSpecs = [
+        ["top", "Top Results"],
+        ["tracks", "Tracks"],
+        ["albums", "Albums"],
+        ["artists", "Artists"],
+        ["playlists", "Playlists"]
+    ];
+
+    var panel =
+        document.createElement(
+            "div"
+        );
+
+    panel.className =
+        "srovaSearchPanel";
+
+    tabSpecs.forEach(
+        function(spec) {
+            var button =
+                document.createElement(
+                    "button"
+                );
+
+            button.type =
+                "button";
+
+            button.className =
+                "srovaSearchTab" +
+                (
+                    currentQobuzSourceSearchTab ===
+                    spec[0]
+                        ? " active"
+                        : ""
+                );
+
+            button.textContent =
+                spec[1];
+
+            button.onclick =
+                function() {
+                    currentQobuzSourceSearchTab =
+                        spec[0];
+
+                    var buttons =
+                        tabs.querySelectorAll(
+                            ".srovaSearchTab"
+                        );
+
+                    for (
+                        var i = 0;
+                        i < buttons.length;
+                        i++
+                    ) {
+                        buttons[i].classList.toggle(
+                            "active",
+                            buttons[i] === button
+                        );
+                    }
+
+                    renderQobuzSourceSearchFoundationPanel(
+                        data,
+                        panel
+                    );
+                };
+
+            tabs.appendChild(
+                button
+            );
+        }
+    );
+
+    shell.appendChild(
+        tabs
+    );
+
+    shell.appendChild(
+        panel
+    );
+
+    results.appendChild(
+        shell
+    );
+
+    renderQobuzSourceSearchFoundationPanel(
+        data,
+        panel
+    );
+}
+
+
+function renderQobuzSourceSearchError(
+    query,
+    message
+) {
+    var results =
+        document.getElementById(
+            "qobuzSourceSearchResults"
+        );
+
+    if (!results) {
+        return;
+    }
+
+    results.innerHTML = "";
+
+    setQobuzSourceBackMode(
+        true
+    );
+
+    setQobuzSourceSearchUiState(
+        "error",
+        ""
+    );
+
+    var wrap =
+        document.createElement(
+            "div"
+        );
+
+    wrap.className =
+        "qobuzSourceSearchError";
+
+    var text =
+        document.createElement(
+            "div"
+        );
+
+    text.className =
+        "qobuzSourceSearchErrorText";
+
+    text.textContent =
+        message ||
+        "Qobuz search is unavailable. Please try again.";
+
+    var retry =
+        document.createElement(
+            "button"
+        );
+
+    retry.type =
+        "button";
+
+    retry.className =
+        "qobuzSourceSearchRetry";
+
+    retry.textContent =
+        "Retry";
+
+    retry.onclick =
+        function() {
+            runQobuzSourceSearch(
+                query
+            );
+        };
+
+    wrap.appendChild(
+        text
+    );
+
+    wrap.appendChild(
+        retry
+    );
+
+    results.appendChild(
+        wrap
+    );
+}
+
+
+function runQobuzSourceSearch(
+    query
+) {
+    query =
+        String(
+            query ||
+            ""
+        ).trim();
+
+    if (!query) {
+        clearQobuzSourceSearchAndLanding();
+        return;
+    }
+
+    persistQobuzSourceSearchState(
+        query,
+        null
+    );
+
+    if (!requireOnlineSource()) {
+        renderQobuzSourceSearchError(
+            query,
+            ONLINE_SOURCE_OFFLINE_MESSAGE
+        );
+
+        return;
+    }
+
+    if (
+        !isQobuzSourcePageVisible()
+    ) {
+        return;
+    }
+
+    var results =
+        document.getElementById(
+            "qobuzSourceSearchResults"
+        );
+
+    if (!results) {
+        return;
+    }
+
+    var requestSerial =
+        ++qobuzSourceSearchRequestSerial;
+
+    var sourceGeneration =
+        qobuzSourceUiGeneration;
+
+    setQobuzSourceSearchUiState(
+        "loading",
+        "Searching Qobuz..."
+    );
+
+    results.innerHTML =
+        '<div class="searchLoading">' +
+        'Searching Qobuz...' +
+        '</div>';
+
+    var url =
+        "/qobuz/catalog?" +
+        "op=search_catalog" +
+        "&q=" +
+        encodeURIComponent(query) +
+        "&limit=" +
+        encodeURIComponent(
+            String(
+                QOBUZ_SOURCE_SEARCH_LIMIT
+            )
+        ) +
+        "&offset=0";
+
+    fetchWithTimeout(
+        url,
+        {
+            cache: "no-store"
+        },
+        7000
+    )
+    .then(function(response) {
+        if (!response.ok) {
+            throw new Error(
+                "Qobuz search request failed."
+            );
+        }
+
+        return response.json();
+    })
+    .then(function(data) {
+        if (
+            requestSerial !==
+                qobuzSourceSearchRequestSerial ||
+            sourceGeneration !==
+                qobuzSourceUiGeneration ||
+            !isQobuzSourcePageVisible()
+        ) {
+            return;
+        }
+
+        if (
+            !qobuzSourceSearchPayloadIsValid(
+                data
+            )
+        ) {
+            throw new Error(
+                "Invalid Qobuz search response."
+            );
+        }
+
+        persistQobuzSourceSearchState(
+            query,
+            data
+        );
+
+        renderQobuzSourceSearchFoundationResults(
+            data
+        );
+    })
+    .catch(function() {
+        if (
+            requestSerial !==
+                qobuzSourceSearchRequestSerial ||
+            sourceGeneration !==
+                qobuzSourceUiGeneration ||
+            !isQobuzSourcePageVisible()
+        ) {
+            return;
+        }
+
+        refreshOnlineSourceState();
+
+        renderQobuzSourceSearchError(
+            query,
+            "Qobuz search is unavailable. Please try again."
+        );
+    });
+}
+
+
+function restoreQobuzSourceSearchIntoCurrentPage() {
+    var input =
+        document.getElementById(
+            "qobuzSourceSearchInput"
+        );
+
+    var query =
+        getSavedQobuzSourceSearchQuery();
+
+    if (
+        input &&
+        query
+    ) {
+        input.value =
+            query;
+    }
+
+    var payload =
+        readSavedQobuzSourceSearchPayload();
+
+    if (
+        payload &&
+        qobuzSourceSearchPayloadIsValid(
+            payload
+        )
+    ) {
+        lastQobuzSourceSearchPayload =
+            payload;
+
+        renderQobuzSourceSearchFoundationResults(
+            payload
+        );
+
+        return;
+    }
+
+    if (query) {
+        runQobuzSourceSearch(
+            query
+        );
+    }
+}
+
+
+function attachQobuzSourceSearch(
+    body,
+    restoreSearch
+) {
+    if (!body) {
+        return;
+    }
+
+    setQobuzSourceBackMode(
+        false
+    );
+
+    var toolbar =
+        document.createElement(
+            "div"
+        );
+
+    toolbar.id =
+        "qobuzSourceSearchToolbar";
+
+    toolbar.setAttribute(
+        "data-state",
+        "idle"
+    );
+
+    toolbar.innerHTML =
+        '<div id="qobuzSourceSearchBox">' +
+          '<span class="material-icons">search</span>' +
+          '<input id="qobuzSourceSearchInput" ' +
+            'type="text" ' +
+            'placeholder="Search Qobuz tracks, albums, artists, playlists..." ' +
+            'autocomplete="off">' +
+          '<button id="qobuzSourceSearchClear" class="srovaInlineSearchClear hidden" type="button" aria-label="Clear Qobuz search" title="Clear search">' +
+            '<span class="material-icons">close</span>' +
+          '</button>' +
+        '</div>' +
+        '<div id="qobuzSourceSearchStatus"></div>';
+
+    var stickyControls =
+        document.createElement(
+            "div"
+        );
+
+    stickyControls.className =
+        "srovaStreamingStickyControls";
+
+    stickyControls.appendChild(
+        toolbar
+    );
+
+    var providerBar =
+        body.parentNode
+            ? body.parentNode.querySelector(
+                ".srovaStreamingProviderBar"
+            )
+            : null;
+
+    if (providerBar) {
+        stickyControls.appendChild(
+            providerBar
+        );
+    }
+
+    body.appendChild(
+        stickyControls
+    );
+
+    var wrap =
+        document.createElement(
+            "div"
+        );
+
+    wrap.id =
+        "qobuzSourceSearchWrap";
+
+    wrap.setAttribute(
+        "data-state",
+        "idle"
+    );
+
+    wrap.innerHTML =
+        '<div id="qobuzSourceSearchResults"></div>';
+
+    body.appendChild(
+        wrap
+    );
+
+    var input =
+        toolbar.querySelector(
+            "#qobuzSourceSearchInput"
+        );
+
+    if (!input) {
+        return;
+    }
+
+    var timer =
+        null;
+
+    var clearBtn =
+        toolbar.querySelector(
+            "#qobuzSourceSearchClear"
+        );
+
+    if (clearBtn) {
+        clearBtn.onclick =
+            function() {
+                clearTimeout(
+                    timer
+                );
+
+                clearQobuzSourceSearchAndLanding();
+                input.focus();
+            };
+    }
+
+    input.oninput =
+        function() {
+            if (clearBtn) {
+                clearBtn.classList.toggle(
+                    "hidden",
+                    !input.value
+                );
+            }
+
+            var query =
+                input.value.trim();
+
+            clearTimeout(
+                timer
+            );
+
+            if (!query) {
+                clearQobuzSourceSearchAndLanding();
+                return;
+            }
+
+            currentQobuzSourceSearchTab =
+                "top";
+
+            persistQobuzSourceSearchState(
+                query,
+                null
+            );
+
+            setQobuzSourceSearchUiState(
+                "typing",
+                "Searching when you pause..."
+            );
+
+            timer =
+                setTimeout(
+                    function() {
+                        runQobuzSourceSearch(
+                            query
+                        );
+                    },
+                    300
+                );
+        };
+
+    input.onkeydown =
+        function(e) {
+            if (e.key === "Escape") {
+                clearTimeout(
+                    timer
+                );
+
+                clearQobuzSourceSearchAndLanding();
+                return;
+            }
+
+            if (e.key === "Enter") {
+                clearTimeout(
+                    timer
+                );
+
+                var query =
+                    input.value.trim();
+
+                if (!query) {
+                    clearQobuzSourceSearchAndLanding();
+                    return;
+                }
+
+                currentQobuzSourceSearchTab =
+                    "top";
+
+                runQobuzSourceSearch(
+                    query
+                );
+            }
+        };
+
+    if (restoreSearch) {
+        restoreQobuzSourceSearchIntoCurrentPage();
+    }
+
+    if (clearBtn) {
+        clearBtn.classList.toggle(
+            "hidden",
+            !input.value
+        );
+    }
+
+    applyOnlineSourceAvailability(
+        onlineSourcesAvailable
+    );
+}
+
+
+// Q7D_QOBUZ_SOURCE_WALL
+// First production Qobuz browsing surface for SOURCE 03.
+// Scope is deliberately limited to provider switching plus the initial
+// library/discover wall. Q7E owns detail navigation; Q7F+ own playlists,
+// search, Radio and Settings/auth UI.
+
+var QOBUZ_WALL_PAGE_LIMIT = 24;
+var QOBUZ_LIBRARY_FULL_MAX_PAGES = 500;
+
+var QOBUZ_WALL_SECTION_SPECS = [
+    {
+        key: "my-albums",
+        title: "MY ALBUMS",
+        op: "library_albums",
+        itemType: "album",
+        sectionKind: "library",
+        pageMode: "total",
+        emptyText: "No Qobuz albums found.",
+        params: {}
+    },
+    {
+        key: "my-tracks",
+        title: "MY TRACKS",
+        op: "library_tracks",
+        itemType: "track",
+        sectionKind: "library",
+        pageMode: "total",
+        emptyText: "No Qobuz tracks found.",
+        params: {}
+    },
+    {
+        key: "my-artists",
+        title: "MY ARTISTS",
+        op: "library_artists",
+        itemType: "artist",
+        sectionKind: "library",
+        pageMode: "total",
+        emptyText: "No Qobuz artists found.",
+        params: {}
+    },
+    {
+        key: "new-releases",
+        title: "NEW RELEASES",
+        op: "discover_albums",
+        itemType: "album",
+        sectionKind: "curated",
+        pageMode: "has_more",
+        emptyText: "No new Qobuz releases found.",
+        params: {
+            endpoint: "/discover/newReleases"
+        }
+    },
+    {
+        key: "qobuzissime",
+        title: "QOBUZISSIME",
+        op: "discover_albums",
+        itemType: "album",
+        sectionKind: "curated",
+        pageMode: "has_more",
+        emptyText: "No Qobuzissime releases found.",
+        params: {
+            endpoint: "/discover/qobuzissims"
+        }
+    },
+    {
+        key: "most-streamed",
+        title: "MOST STREAMED",
+        op: "featured_albums",
+        itemType: "album",
+        sectionKind: "curated",
+        pageMode: "total",
+        emptyText: "No most-streamed Qobuz releases found.",
+        params: {
+            featured_type: "most-streamed"
+        }
+    },
+    {
+        key: "press-awards",
+        title: "PRESS AWARDS",
+        op: "featured_albums",
+        itemType: "album",
+        sectionKind: "curated",
+        pageMode: "total",
+        emptyText: "No Qobuz press-award releases found.",
+        params: {
+            featured_type: "press-awards"
+        }
+    }
+];
+
+
+function buildStreamingProviderSelector(activeProvider) {
+    activeProvider = (
+        String(activeProvider || "tidal").toLowerCase()
+        === "qobuz"
+    ) ? "qobuz" : "tidal";
+
+    var presentation =
+        streamingProviderPresentation();
+
+    function providerButton(key, label, handler) {
+        var active =
+            activeProvider === key;
+
+        return '<button class="srovaSourceSwitchItem ' +
+            'srovaStreamingProviderItem' +
+            (active ? ' active' : '') +
+            '" data-streaming-provider="' + key +
+            '" onclick="' + handler + '">' +
+            label +
+            '</button>';
+    }
+
+    return '<div class="srovaStreamingProviderBar"' +
+        (presentation.dual ? "" : " hidden") +
+        ' role="group" ' +
+        'aria-label="Streaming provider">' +
+        providerButton(
+            "tidal",
+            "TIDAL",
+            "showTidalSource()"
+        ) +
+        providerButton(
+            "qobuz",
+            "QOBUZ",
+            "showQobuzSource()"
+        ) +
+        '</div>';
+}
+
+
+var QOBUZ_WALL_FETCH_CONCURRENCY = 4;
+var qobuzWallFetchActive = 0;
+var qobuzWallFetchQueue = [];
+
+
+function drainQobuzWallFetchQueue() {
+    while (
+        qobuzWallFetchActive <
+            QOBUZ_WALL_FETCH_CONCURRENCY &&
+        qobuzWallFetchQueue.length
+    ) {
+        var task =
+            qobuzWallFetchQueue.shift();
+
+        qobuzWallFetchActive += 1;
+
+        Promise.resolve()
+            .then(task.work)
+            .then(
+                function(value) {
+                    qobuzWallFetchActive -= 1;
+
+                    /*
+                     * Drain work that was already queued before
+                     * resolving the completed caller. This keeps
+                     * the seven initial wall sections ahead of
+                     * optional artist-artwork enrichment.
+                     */
+                    drainQobuzWallFetchQueue();
+
+                    task.resolve(value);
+                },
+                function(error) {
+                    qobuzWallFetchActive -= 1;
+
+                    drainQobuzWallFetchQueue();
+
+                    task.reject(error);
+                }
+            );
+    }
+}
+
+
+function scheduleQobuzWallFetch(work) {
+    return new Promise(
+        function(resolve, reject) {
+            qobuzWallFetchQueue.push({
+                work: work,
+                resolve: resolve,
+                reject: reject
+            });
+
+            drainQobuzWallFetchQueue();
+        }
+    );
+}
+
+
+function qobuzCatalogUrl(spec, offset) {
+    var parts = [
+        "op=" + encodeURIComponent(spec.op),
+        "limit=" + encodeURIComponent(
+            String(QOBUZ_WALL_PAGE_LIMIT)
+        ),
+        "offset=" + encodeURIComponent(
+            String(offset || 0)
+        )
+    ];
+
+    var params = spec.params || {};
+
+    Object.keys(params).forEach(function(key) {
+        var value = params[key];
+
+        if (value === null || value === undefined || value === "") {
+            return;
+        }
+
+        parts.push(
+            encodeURIComponent(key) +
+            "=" +
+            encodeURIComponent(String(value))
+        );
+    });
+
+    return "/qobuz/catalog?" + parts.join("&");
+}
+
+
+function qobuzLibrarySpecByKey(key) {
+    key = String(key || "");
+
+    for (
+        var i = 0;
+        i < QOBUZ_WALL_SECTION_SPECS.length;
+        i++
+    ) {
+        if (
+            QOBUZ_WALL_SECTION_SPECS[i].key ===
+            key
+        ) {
+            return QOBUZ_WALL_SECTION_SPECS[i];
+        }
+    }
+
+    return null;
+}
+
+
+function qobuzLibraryQualityDataValue(item) {
+    var quality =
+        String(
+            (
+                item &&
+                item.quality
+            ) ||
+            ""
+        ).toUpperCase();
+
+    if (
+        quality === "HI-RES" ||
+        quality === "HIRES"
+    ) {
+        return "hires";
+    }
+
+    if (
+        quality === "CD" ||
+        quality === "LOSSLESS"
+    ) {
+        return "cd";
+    }
+
+    return "";
+}
+
+
+function fetchAllQobuzLibraryItems(spec) {
+    if (
+        !spec ||
+        spec.sectionKind !== "library"
+    ) {
+        return Promise.reject(
+            new Error(
+                "Invalid Qobuz library section."
+            )
+        );
+    }
+
+    var items = [];
+    var offset = 0;
+    var expectedTotal = null;
+    var pageCount = 0;
+
+    function fetchPage() {
+        if (
+            pageCount >=
+            QOBUZ_LIBRARY_FULL_MAX_PAGES
+        ) {
+            return Promise.reject(
+                new Error(
+                    "Qobuz library exceeds the safe page limit."
+                )
+            );
+        }
+
+        pageCount += 1;
+
+        return fetchWithTimeout(
+            qobuzCatalogUrl(
+                spec,
+                offset
+            ),
+            {
+                cache: "no-store"
+            },
+            7000
+        )
+        .then(function(response) {
+            if (!response.ok) {
+                throw new Error(
+                    "Qobuz library request failed."
+                );
+            }
+
+            return response.json();
+        })
+        .then(function(data) {
+            if (
+                !data ||
+                data.ok === false ||
+                !Array.isArray(data.items)
+            ) {
+                throw new Error(
+                    "Invalid Qobuz library response."
+                );
+            }
+
+            if (expectedTotal === null) {
+                var total =
+                    Number(data.total);
+
+                if (
+                    Number.isFinite(total) &&
+                    total >= 0
+                ) {
+                    expectedTotal =
+                        total;
+                }
+            }
+
+            var page =
+                data.items;
+
+            items =
+                items.concat(page);
+
+            offset +=
+                page.length;
+
+            if (!page.length) {
+                return items;
+            }
+
+            if (
+                expectedTotal !== null &&
+                offset >= expectedTotal
+            ) {
+                return items;
+            }
+
+            if (
+                page.length <
+                QOBUZ_WALL_PAGE_LIMIT
+            ) {
+                return items;
+            }
+
+            /*
+             * Q7C normally supplies a validated finite total.
+             * Without it, deliberately stop after one bounded page
+             * rather than beginning an open-ended provider loop.
+             */
+            if (expectedTotal === null) {
+                return items;
+            }
+
+            if (
+                pageCount >=
+                QOBUZ_LIBRARY_FULL_MAX_PAGES
+            ) {
+                throw new Error(
+                    "Qobuz library exceeds the safe page limit."
+                );
+            }
+
+            return fetchPage();
+        });
+    }
+
+    return fetchPage();
+}
+
+
+function qobuzWallQualityLabel(item) {
+    var quality = item && item.quality;
+
+    if (!quality) {
+        return "";
+    }
+
+    if (typeof quality === "string") {
+        var text = quality.toUpperCase();
+
+        if (
+            text === "HI-RES" ||
+            text === "HIRES" ||
+            text === "MASTER"
+        ) {
+            return "HI-RES";
+        }
+
+        if (
+            text === "CD" ||
+            text === "LOSSLESS"
+        ) {
+            return "CD";
+        }
+
+        return "";
+    }
+
+    if (typeof quality !== "object") {
+        return "";
+    }
+
+    var rate = Number(
+        quality.maximum_sampling_rate_khz || 0
+    );
+
+    var bits = Number(
+        quality.maximum_bit_depth || 0
+    );
+
+    if (
+        quality.hires === true ||
+        quality.hires_streamable === true ||
+        rate > 48 ||
+        bits > 16
+    ) {
+        return "HI-RES";
+    }
+
+    if (rate > 0 || bits > 0) {
+        return "CD";
+    }
+
+    return "";
+}
+
+
+
+function qobuzArtistPageFallbackArtwork(page) {
+    page = page || {};
+
+    if (
+        typeof page.artwork_url === "string" &&
+        page.artwork_url.trim()
+    ) {
+        return page.artwork_url.trim();
+    }
+
+    var lastRelease =
+        page.last_release;
+
+    if (
+        lastRelease &&
+        typeof lastRelease.artwork_url === "string" &&
+        lastRelease.artwork_url.trim()
+    ) {
+        return lastRelease.artwork_url.trim();
+    }
+
+    var releaseGroups =
+        Array.isArray(page.release_groups) ?
+        page.release_groups :
+        [];
+
+    for (
+        var groupIndex = 0;
+        groupIndex < releaseGroups.length;
+        groupIndex += 1
+    ) {
+        var group =
+            releaseGroups[groupIndex] || {};
+
+        var releases =
+            Array.isArray(group.items) ?
+            group.items :
+            [];
+
+        for (
+            var releaseIndex = 0;
+            releaseIndex < releases.length;
+            releaseIndex += 1
+        ) {
+            var release =
+                releases[releaseIndex] || {};
+
+            if (
+                typeof release.artwork_url === "string" &&
+                release.artwork_url.trim()
+            ) {
+                return release.artwork_url.trim();
+            }
+        }
+    }
+
+    var topTracks =
+        Array.isArray(page.top_tracks) ?
+        page.top_tracks :
+        [];
+
+    for (
+        var trackIndex = 0;
+        trackIndex < topTracks.length;
+        trackIndex += 1
+    ) {
+        var track =
+            topTracks[trackIndex] || {};
+
+        var trackArtwork = (
+            track.artwork_url ||
+            track.album_artwork_url ||
+            ""
+        );
+
+        if (
+            typeof trackArtwork === "string" &&
+            trackArtwork.trim()
+        ) {
+            return trackArtwork.trim();
+        }
+    }
+
+    return "";
+}
+
+function enrichQobuzArtistWallArtwork(
+    slot,
+    generation
+) {
+    if (!slot) {
+        return;
+    }
+
+    var items =
+        Array.isArray(
+            slot._qobuzWallItems
+        ) ?
+        slot._qobuzWallItems :
+        [];
+
+    var missing = items.filter(
+        function(item) {
+            return !!(
+                item &&
+                item.qobuz_artwork_missing === true &&
+                item.id
+            );
+        }
+    );
+
+    missing.forEach(function(item) {
+        scheduleQobuzWallFetch(
+            function() {
+                if (
+                    generation !==
+                        qobuzSourceUiGeneration ||
+                    !isQobuzSourcePageVisible()
+                ) {
+                    throw new Error(
+                        "Stale Qobuz artist artwork request."
+                    );
+                }
+
+                return fetchWithTimeout(
+                    "/qobuz/catalog?op=artist_page" +
+                    "&artist_id=" +
+                    encodeURIComponent(
+                        String(item.id)
+                    ),
+                    {
+                        cache: "no-store"
+                    },
+                    7000
+                );
+            }
+        )
+        .then(function(response) {
+            return response.json();
+        })
+        .then(function(data) {
+            if (
+                generation !==
+                    qobuzSourceUiGeneration ||
+                !isQobuzSourcePageVisible() ||
+                !data ||
+                data.ok === false
+            ) {
+                return;
+            }
+
+            var artwork =
+                qobuzArtistPageFallbackArtwork(
+                    data
+                );
+
+            if (!artwork) {
+                return;
+            }
+
+            item.image_url =
+                artwork;
+
+            item.qobuz_artwork_missing =
+                false;
+
+            slot.querySelectorAll(
+                '.album[data-id]'
+            ).forEach(function(card) {
+                if (
+                    card.getAttribute(
+                        "data-id"
+                    ) !== String(item.id)
+                ) {
+                    return;
+                }
+
+                var image =
+                    card.querySelector("img");
+
+                if (image) {
+                    image.src =
+                        artwork;
+                }
+            });
+        })
+        .catch(function() {
+            /*
+             * Leave the valid SROVA placeholder.
+             * Missing optional provider artwork must
+             * never become a broken image tile.
+             */
+        });
+    });
+}
+
+function adaptQobuzWallItem(item, itemType) {
+    item = item || {};
+    itemType = String(itemType || "album").toLowerCase();
+
+    var adapted = {
+        id: "",
+        type: "",
+        name: "",
+        sub_title: "",
+        image_url: "",
+        quality: qobuzWallQualityLabel(item),
+        qobuz_item: item
+    };
+
+    if (itemType === "artist") {
+        adapted.id = String(
+            item.artist_id ||
+            item.id ||
+            ""
+        );
+
+        adapted.type = "Artist";
+        adapted.name = String(
+            item.name ||
+            item.artist ||
+            ""
+        );
+
+        adapted.sub_title = "Artist";
+
+        var artistArtwork = String(
+            item.artwork_url ||
+            item.image_url ||
+            ""
+        );
+
+        adapted.qobuz_artwork_missing =
+            !artistArtwork;
+
+        adapted.image_url = (
+            artistArtwork ||
+            SROVA_STANDBY_ART
+        );
+
+        adapted.quality = "";
+
+        return adapted;
+    }
+
+    if (itemType === "track") {
+        adapted.id = String(
+            item.id ||
+            (
+                item.provider_track_id ?
+                "qobuz:" + item.provider_track_id :
+                ""
+            )
+        );
+
+        adapted.type = "Track";
+
+        adapted.name = String(
+            item.title ||
+            item.name ||
+            ""
+        );
+
+        adapted.sub_title = String(
+            item.artist ||
+            item.artist_name ||
+            item.performer ||
+            item.album_title ||
+            ""
+        );
+
+        adapted.image_url = String(
+            item.artwork_url ||
+            item.image_url ||
+            item.album_artwork_url ||
+            ""
+        );
+
+        return adapted;
+    }
+
+    adapted.id = String(
+        item.album_id ||
+        item.id ||
+        ""
+    );
+
+    adapted.type = "Album";
+
+    adapted.name = String(
+        item.title ||
+        item.name ||
+        ""
+    );
+
+    adapted.sub_title = String(
+        item.artist ||
+        item.artist_name ||
+        ""
+    );
+
+    adapted.image_url = String(
+        item.artwork_url ||
+        item.image_url ||
+        ""
+    );
+
+    return adapted;
+}
+
+
+
+
+
+
+function qobuzAlbumTrackPayload(track, album) {
+    track = track || {};
+    album = album || {};
+    var nativeId = String(track.provider_track_id || "").trim();
+    var id = String(track.id || "").trim();
+    if (!nativeId && id.indexOf("qobuz:") === 0) {
+        nativeId = id.slice(6);
+    }
+    if (nativeId && id.indexOf("qobuz:") !== 0) {
+        id = "qobuz:" + nativeId;
+    }
+    return {
+        id: id,
+        source: "qobuz",
+        provider_track_id: nativeId,
+        title: String(track.title || ""),
+        artist: String(track.artist || album.artist || ""),
+        cover: String(
+            track.artwork_url ||
+            album.artwork_url ||
+            SROVA_STANDBY_ART
+        ),
+        duration: Number(track.duration || 0),
+        quality: ""
+    };
+}
+
+function streamingAlbumStatsText(tracks) {
+    tracks = Array.isArray(tracks) ? tracks : [];
+
+    var bits = [];
+
+    if (tracks.length) {
+        bits.push(
+            tracks.length +
+            (tracks.length === 1 ? " track" : " tracks")
+        );
+    }
+
+    var duration = tracks.reduce(function(sum, track) {
+        return sum + Number(track && track.duration || 0);
+    }, 0);
+
+    if (duration) {
+        bits.push(formatDuration(duration));
+    }
+
+    return bits.join(" · ");
+}
+
+function qobuzAlbumCatalogTech(album) {
+    album = album || {};
+
+    var quality =
+        album.quality &&
+        typeof album.quality === "object"
+            ? album.quality
+            : {};
+
+    var bitDepth =
+        Number(
+            quality.maximum_bit_depth ||
+            0
+        );
+
+    var sampleRate =
+        Number(
+            quality.maximum_sampling_rate_khz ||
+            0
+        );
+
+    if (!bitDepth && !sampleRate) {
+        return {
+            text: "",
+            className: "hidden"
+        };
+    }
+
+    var bits = [];
+
+    if (bitDepth) {
+        bits.push(bitDepth + "-bit");
+    }
+
+    if (sampleRate) {
+        bits.push(
+            (
+                Math.round(sampleRate) === sampleRate
+                    ? String(Math.round(sampleRate))
+                    : String(sampleRate)
+            ) +
+            " kHz"
+        );
+    }
+
+    var hiRes =
+        bitDepth >= 24 ||
+        sampleRate > 48;
+
+    return {
+        text: bits.join(" · "),
+        className:
+            "qobuzAlbumTechInfo " +
+            (
+                hiRes
+                    ? "qobuzAlbumTechInfoHiRes"
+                    : "qobuzAlbumTechInfoCd"
+            )
+    };
+}
+
+function qobuzPlayAlbumTracks(tracks, startIndex, context) {
+    tracks = Array.isArray(tracks) ? tracks : [];
+    if (!tracks.length || !requireOnlineSource()) { return; }
+
+    var payload = tracks.map(function(track) {
+        return qobuzAlbumTrackPayload(track, context || {});
+    });
+
+    startIndex = Math.max(
+        0,
+        Math.min(Number(startIndex || 0), payload.length - 1)
+    );
+
+    clearRadioIdleStandbyTimer();
+    resetTidalInfinitePlayGuard();
+
+    _setPlaybackSource(
+        "album",
+        String(context && context.album_id || ""),
+        String(context && context.title || "")
+    );
+
+    postTidalQueueReplace({
+        tracks: payload,
+        start_index: startIndex,
+        context_type: "album",
+        context_id: String(context && context.album_id || ""),
+        context_title: String(context && context.title || "")
+    }).catch(function() {});
+}
+
+function appendQobuzStartRadioHeaderAction(
+    group,
+    item,
+    seedKind,
+    returnView,
+    returnFn,
+    beforeNode
+) {
+    if (!group) {
+        return null;
+    }
+
+    var nativeId =
+        qobuzRadioSeedNativeId(
+            item,
+            seedKind
+        );
+
+    if (!nativeId) {
+        return null;
+    }
+
+    var radioBtn =
+        document.createElement("button");
+
+    radioBtn.className =
+        "albumQueueBtn";
+
+    radioBtn.innerHTML =
+        '<span class="material-icons">radio</span>';
+
+    radioBtn.title =
+        "Start Radio";
+
+    radioBtn.setAttribute(
+        "aria-label",
+        "Start Radio"
+    );
+
+    radioBtn.onclick =
+        function(e) {
+            e.stopPropagation();
+
+            startQobuzRadioFromSeed(
+                item,
+                seedKind,
+                returnView,
+                returnFn
+            );
+        };
+
+    if (
+        beforeNode &&
+        beforeNode.parentNode ===
+            group
+    ) {
+        group.insertBefore(
+            radioBtn,
+            beforeNode
+        );
+    } else {
+        group.appendChild(
+            radioBtn
+        );
+    }
+
+    return radioBtn;
+}
+
+
+function renderQobuzAlbumActions(tracks, album) {
+    var old = document.getElementById("albumQueueBtnGroup");
+    if (old && old.parentNode) { old.parentNode.removeChild(old); }
+
+    if (!tracks || !tracks.length) { return; }
+
+    var header = document.getElementById("albumHeader");
+    if (!header) { return; }
+
+    var group = document.createElement("div");
+    group.id = "albumQueueBtnGroup";
+    group.className = "albumQueueBtnGroup";
+
+    var favorite =
+        makeQobuzFavoriteHeart(
+            "album",
+            (
+                album.album_id ||
+                album.id ||
+                ""
+            ),
+            "albumQueueBtn",
+            "Favorite album"
+        );
+
+    if (favorite) {
+        favorite.id =
+            "albumHeaderHeart";
+
+        group.appendChild(
+            favorite
+        );
+    }
+
+    var play = document.createElement("button");
+    play.className = "albumQueueBtn";
+    play.innerHTML = '<span class="material-icons">play_arrow</span>';
+    play.title = "Play Album";
+    play.setAttribute("aria-label", "Play Album");
+    play.onclick = function(e) {
+        e.stopPropagation();
+        qobuzPlayAlbumTracks(tracks, 0, album);
+    };
+    group.appendChild(play);
+
+    var add = document.createElement("button");
+    add.className = "albumQueueBtn";
+    add.innerHTML = '<span class="material-icons">playlist_add</span>';
+    add.title = "Add album to queue";
+    add.setAttribute("aria-label", "Add album to queue");
+    add.onclick = function(e) {
+        e.stopPropagation();
+        showQueuePopover(
+            add,
+            tracks.map(function(track) {
+                return qobuzAlbumTrackPayload(track, album);
+            }),
+            e
+        );
+    };
+    group.appendChild(add);
+
+    var albumRadioId =
+        qobuzRadioSeedNativeId(
+            album,
+            "album"
+        );
+
+    if (albumRadioId) {
+        var albumReturnView =
+            previousView;
+
+        appendQobuzStartRadioHeaderAction(
+            group,
+            album,
+            "album",
+            "",
+            function() {
+                loadQobuzAlbumDetail(
+                    albumRadioId,
+                    album,
+                    albumReturnView
+                );
+            }
+        );
+    }
+
+    header.appendChild(group);
+}
+
+function renderQobuzAlbumTracks(tracks, album) {
+    trackList.innerHTML = "";
+    trackList.classList.remove("trackListWide");
+
+    if (!tracks.length) {
+        var empty = document.createElement("div");
+        empty.className = "unavailableMsg";
+        empty.textContent = "No tracks found.";
+        trackList.appendChild(empty);
+        renderQobuzAlbumActions([], album);
+        return;
+    }
+
+    tracks.forEach(function(track, idx) {
+        var payload = qobuzAlbumTrackPayload(track, album);
+
+        trackMap[payload.id] = {
+            title: payload.title,
+            artist: payload.artist,
+            cover: payload.cover,
+            duration: payload.duration
+        };
+
+        var row = document.createElement("div");
+        row.className = "track";
+        row.setAttribute("data-track-id", payload.id);
+        row.innerHTML =
+            '<div class="track-num">' + (idx + 1) + '</div>' +
+            '<div class="track-title">' + escapeHtml(payload.title) + '</div>' +
+            '<div class="track-duration">' +
+            formatTime(payload.duration) +
+            '</div>';
+
+        appendQobuzTrackFavoriteHeart(
+            row,
+            payload
+        );
+
+        var add = document.createElement("button");
+        add.className = "trackAddBtn";
+        add.innerHTML = '<span class="material-icons">add</span>';
+        add.title = "Add to queue";
+        add.setAttribute("aria-label", "Add to queue");
+        add.onclick = function(e) {
+            e.stopPropagation();
+            showQueuePopover(add, [payload], e);
+        };
+        row.appendChild(add);
+
+        row.onclick = function() {
+            qobuzPlayAlbumTracks(tracks, idx, album);
+        };
+
+        trackList.appendChild(row);
+    });
+
+    renderQobuzAlbumActions(tracks, album);
+    highlightCurrentTrack();
+}
+
+function loadQobuzAlbumDetail(
+    albumId,
+    seed,
+    fromView
+) {
+    albumId = String(albumId || "").trim();
+    seed = seed || {};
+    if (!albumId || !requireOnlineSource()) { return; }
+
+    qobuzAlbumCatalogTechState = {
+        text: "",
+        className: "hidden"
+    };
+
+    previousView = "qobuzsource";
+    if (fromView) { previousView = fromView; }
+    currentViewEndpoint = "qobuz:album:" + albumId;
+    setAlbumViewKind("qobuz-album");
+    showView("album");
+
+    albumArt.src = String(
+        seed.image_url ||
+        seed.cover ||
+        SROVA_STANDBY_ART
+    );
+    albumTitle.textContent = String(seed.name || seed.title || "Qobuz Album");
+    albumArtist.textContent = String(seed.sub_title || seed.artist || "Qobuz");
+    albumArtist.style.cursor = "";
+    albumArtist.onclick = null;
+    albumTechInfo.textContent = "";
+    albumTechInfo.className = "hidden";
+    albumStatsLine.textContent = "";
+    albumStatsLine.className = "hidden";
+    trackList.innerHTML =
+        '<div class="trackListLoading">Loading album\u2026</div>';
+
+    renderQobuzAlbumActions([], {});
+    resetAlbumDetailScroll();
+
+    var endpoint = currentViewEndpoint;
+    fetchWithTimeout(
+        "/qobuz/catalog?op=album&album_id=" +
+        encodeURIComponent(albumId),
+        {cache: "no-store"},
+        8000
+    )
+    .then(function(res) {
+        if (!res.ok) { throw new Error("Qobuz album request failed"); }
+        return res.json();
+    })
+    .then(function(album) {
+        if (currentViewEndpoint !== endpoint) { return; }
+        album = album || {};
+        if (String(album.source || "") !== "qobuz") {
+            throw new Error("Invalid Qobuz album response");
+        }
+
+        var tracks = Array.isArray(album.tracks) ? album.tracks : [];
+        currentContext = {
+            id: String(album.album_id || albumId),
+            cover: String(album.artwork_url || SROVA_STANDBY_ART),
+            title: String(album.title || "Qobuz Album"),
+            artist: String(album.artist || ""),
+            artist_id: String(album.artist_id || ""),
+            source: "qobuz"
+        };
+
+        albumArt.src = currentContext.cover;
+        albumArtist.textContent =
+            currentContext.artist;
+
+        albumTitle.textContent =
+            currentContext.title +
+            (album.version ? " — " + String(album.version) : "");
+
+        albumArtist.style.cursor = "";
+        albumArtist.onclick = null;
+        wireQobuzAlbumArtistClick(albumId);
+
+        var catalogTech =
+            qobuzAlbumCatalogTech(album);
+
+        qobuzAlbumCatalogTechState = {
+            text: catalogTech.text,
+            className: catalogTech.className
+        };
+
+        restoreQobuzAlbumCatalogTechInfo();
+
+        var qobuzStats =
+            streamingAlbumStatsText(tracks);
+
+        albumStatsLine.textContent =
+            qobuzStats;
+
+        albumStatsLine.className =
+            qobuzStats
+                ? "streamingAlbumStatsLine"
+                : "hidden";
+
+        originalTracks = tracks;
+        shuffledTracks = [];
+        currentViewTracks = tracks;
+
+        renderQobuzAlbumTracks(tracks, album);
+        resetAlbumDetailScroll();
+    })
+    .catch(function(err) {
+        if (currentViewEndpoint !== endpoint) { return; }
+        console.error("loadQobuzAlbumDetail failed:", err);
+        trackList.innerHTML =
+            '<div class="unavailableMsg">Could not load Qobuz album.</div>';
+        renderQobuzAlbumActions([], {});
+    });
+}
+
+
+function loadQobuzTrackDetail(
+    trackId,
+    seed,
+    fromView
+) {
+    seed = seed || {};
+
+    var rawTrackId =
+        String(
+            trackId ||
+            seed.provider_track_id ||
+            seed.id ||
+            ""
+        ).trim();
+
+    var nativeId =
+        rawTrackId.indexOf("qobuz:") === 0
+            ? rawTrackId.slice(6)
+            : rawTrackId;
+
+    if (!nativeId || !requireOnlineSource()) {
+        return;
+    }
+
+    previousView = fromView || "qobuzsource";
+    currentViewEndpoint =
+        "qobuz:track:" + nativeId;
+
+    setAlbumViewKind("qobuz-track");
+    showView("album");
+
+    albumArt.src = String(
+        seed.image_url ||
+        seed.artwork_url ||
+        seed.cover ||
+        SROVA_STANDBY_ART
+    );
+
+    albumTitle.textContent = String(
+        seed.name ||
+        seed.title ||
+        "Qobuz Track"
+    );
+
+    albumArtist.textContent = String(
+        seed.sub_title ||
+        seed.artist ||
+        ""
+    );
+
+    albumArtist.style.cursor = "";
+    albumArtist.onclick = null;
+
+    albumTechInfo.textContent = "";
+    albumTechInfo.className = "hidden";
+
+    if (albumStatsLine) {
+        albumStatsLine.textContent = "";
+        albumStatsLine.className = "hidden";
+    }
+
+    trackList.innerHTML =
+        '<div class="trackListLoading">' +
+        'Loading track\\u2026</div>';
+
+    renderAlbumQueueBtn([], "");
+    resetAlbumDetailScroll();
+
+    var viewEndpoint =
+        currentViewEndpoint;
+
+    fetchWithTimeout(
+        "/qobuz/catalog?op=track&track_id=" +
+        encodeURIComponent(nativeId),
+        {
+            cache: "no-store"
+        },
+        8000
+    )
+    .then(function(res) {
+        if (!res.ok) {
+            throw new Error(
+                "Qobuz track request failed"
+            );
+        }
+
+        return res.json();
+    })
+    .then(function(track) {
+        if (
+            currentViewEndpoint !==
+            viewEndpoint
+        ) {
+            return;
+        }
+
+        track = track || {};
+
+        var providerTrackId =
+            String(
+                track.provider_track_id ||
+                ""
+            ).trim();
+
+        var canonicalId =
+            "qobuz:" + nativeId;
+
+        if (
+            track.ok === false ||
+            String(track.source || "") !==
+                "qobuz" ||
+            providerTrackId !== nativeId ||
+            String(track.id || "") !==
+                canonicalId
+        ) {
+            throw new Error(
+                "Invalid Qobuz track response"
+            );
+        }
+
+        var detailTrack =
+            qobuzAlbumTrackPayload(
+                track,
+                {}
+            );
+
+        if (
+            detailTrack.id !==
+                canonicalId ||
+            detailTrack.source !==
+                "qobuz" ||
+            detailTrack.provider_track_id !==
+                nativeId
+        ) {
+            throw new Error(
+                "Invalid Qobuz track identity"
+            );
+        }
+
+        var cover = String(
+            track.artwork_url ||
+            detailTrack.cover ||
+            seed.image_url ||
+            SROVA_STANDBY_ART
+        );
+
+        var title = String(
+            track.title ||
+            detailTrack.title ||
+            "Qobuz Track"
+        );
+
+        var artist = String(
+            track.artist ||
+            detailTrack.artist ||
+            ""
+        );
+
+        currentContext = {
+            id: canonicalId,
+            provider_track_id: nativeId,
+            cover: cover,
+            title: title,
+            artist: artist,
+            album: String(
+                track.album || ""
+            ),
+            album_id: String(
+                track.album_id || ""
+            ),
+            artist_id: String(
+                track.artist_id || ""
+            ),
+            source: "qobuz",
+            type: "track"
+        };
+
+        albumArt.src =
+            currentContext.cover;
+
+        albumTitle.textContent =
+            currentContext.title +
+            (
+                track.version
+                    ? " — " +
+                      String(track.version)
+                    : ""
+            );
+
+        albumArtist.textContent =
+            currentContext.artist;
+
+        albumArtist.style.cursor = "";
+        albumArtist.onclick = null;
+
+        var catalogTech =
+            qobuzAlbumCatalogTech(
+                track
+            );
+
+        albumTechInfo.textContent =
+            catalogTech.text;
+
+        albumTechInfo.className =
+            catalogTech.className;
+
+        var detailStats = [];
+
+        if (currentContext.album) {
+            detailStats.push(
+                currentContext.album
+            );
+        }
+
+        if (detailTrack.duration) {
+            detailStats.push(
+                formatDuration(
+                    detailTrack.duration
+                )
+            );
+        }
+
+        if (albumStatsLine) {
+            albumStatsLine.textContent =
+                detailStats.join(" · ");
+
+            albumStatsLine.className =
+                detailStats.length
+                    ? "streamingAlbumStatsLine"
+                    : "hidden";
+        }
+
+        originalTracks = [
+            detailTrack
+        ];
+
+        shuffledTracks = [];
+
+        currentViewTracks =
+            originalTracks;
+
+        renderTrackList(
+            originalTracks
+        );
+
+        resetAlbumDetailScroll();
+    })
+    .catch(function(err) {
+        if (
+            currentViewEndpoint !==
+            viewEndpoint
+        ) {
+            return;
+        }
+
+        console.error(
+            "loadQobuzTrackDetail failed:",
+            err
+        );
+
+        originalTracks = [];
+        shuffledTracks = [];
+        currentViewTracks = [];
+
+        trackList.innerHTML =
+            '<div class="unavailableMsg">' +
+            'Could not load Qobuz track.' +
+            '</div>';
+
+        renderAlbumQueueBtn([], "");
+    });
+}
+
+function buildQobuzWallTrackPayload(item) {
+    item = item || {};
+
+    var raw =
+        item.qobuz_item &&
+        typeof item.qobuz_item === "object"
+            ? item.qobuz_item
+            : {};
+
+    var canonicalId =
+        String(
+            item.id ||
+            raw.id ||
+            ""
+        ).trim();
+
+    var providerTrackId =
+        String(
+            raw.provider_track_id ||
+            ""
+        ).trim();
+
+    if (
+        !providerTrackId &&
+        canonicalId.indexOf("qobuz:") === 0
+    ) {
+        providerTrackId =
+            canonicalId.slice(6);
+    }
+
+    if (
+        canonicalId &&
+        canonicalId.indexOf("qobuz:") !== 0
+    ) {
+        if (!providerTrackId) {
+            providerTrackId = canonicalId;
+        }
+
+        canonicalId =
+            "qobuz:" + providerTrackId;
+    }
+
+    if (
+        !canonicalId &&
+        providerTrackId
+    ) {
+        canonicalId =
+            "qobuz:" + providerTrackId;
+    }
+
+    return {
+        id: canonicalId,
+        provider_track_id:
+            providerTrackId,
+        source: "qobuz",
+        title:
+            item.name ||
+            item.title ||
+            raw.title ||
+            "",
+        artist:
+            item.sub_title ||
+            item.artist ||
+            raw.artist ||
+            "",
+        album:
+            raw.album ||
+            item.album ||
+            "",
+        album_id:
+            raw.album_id ||
+            item.album_id ||
+            "",
+        artist_id:
+            raw.artist_id ||
+            item.artist_id ||
+            "",
+        cover:
+            item.image_url ||
+            item.cover ||
+            raw.artwork_url ||
+            "",
+        duration:
+            Number(
+                item.duration ||
+                raw.duration ||
+                0
+            ) || 0,
+        quality:
+            raw.quality ||
+            item.quality ||
+            ""
+    };
+}
+
+
+function playQobuzWallTrackNow(item) {
+    if (!requireOnlineSource()) {
+        return;
+    }
+
+    var track =
+        buildQobuzWallTrackPayload(item);
+
+    if (
+        !track.id ||
+        track.id.indexOf("qobuz:") !== 0
+    ) {
+        return;
+    }
+
+    clearRadioIdleStandbyTimer();
+    resetTidalInfinitePlayGuard();
+
+    _setPlaybackSource(
+        "track",
+        track.id,
+        track.title
+    );
+
+    postTidalQueueReplace({
+        tracks: [track],
+        start_index: 0,
+        context_type: "track",
+        context_id: track.id,
+        context_title: track.title
+    })
+    .then(function() {
+        trackMap[String(track.id)] = {
+            title: track.title || "",
+            artist: track.artist || "",
+            cover: track.cover || "",
+            duration: track.duration || 0
+        };
+    })
+    .catch(function() {});
+}
+
+
+function showQobuzTrackArtworkMenu(
+    anchorEl,
+    item,
+    e,
+    fromView
+) {
+    if (e) {
+        e.stopPropagation();
+    }
+
+    if (!requireOnlineSource()) {
+        return;
+    }
+
+    var track =
+        buildQobuzWallTrackPayload(item);
+
+    if (
+        !track.id ||
+        track.id.indexOf("qobuz:") !== 0
+    ) {
+        return;
+    }
+
+    closeActivePopover();
+
+    var payload = [track];
+
+    var detailFromView =
+        String(
+            fromView ||
+            "qobuzsource"
+        );
+
+    var popover =
+        document.createElement("div");
+
+    /*
+     * Reuse the established TIDAL single-track menu geometry.
+     * Q8D adds only provider-native Qobuz Add to Playlist.
+     */
+    popover.className =
+        "queuePopover tidalTrackArtworkMenu";
+
+    function addMenuButton(
+        icon,
+        label,
+        onClick
+    ) {
+        var btn =
+            document.createElement("button");
+
+        btn.className =
+            "queuePopoverBtn";
+
+        btn.innerHTML =
+            '<span class="material-icons">' +
+            icon +
+            '</span> ' +
+            label;
+
+        btn.onclick = function(ev) {
+            ev.stopPropagation();
+            closeActivePopover();
+            onClick();
+        };
+
+        popover.appendChild(btn);
+    }
+
+    addMenuButton(
+        "play_arrow",
+        "Play Now",
+        function() {
+            playQobuzWallTrackNow(item);
+        }
+    );
+
+    addMenuButton(
+        "queue_play_next",
+        "Play Next",
+        function() {
+            submitQueueTracks(
+                payload,
+                "next"
+            );
+        }
+    );
+
+    addMenuButton(
+        "add_to_queue",
+        "Add to Queue",
+        function() {
+            submitQueueTracks(
+                payload,
+                "queue"
+            );
+        }
+    );
+
+    var qobuzPlaylistTracks =
+        normalizeQobuzPlaylistTracks(
+            payload
+        );
+
+    if (
+        qobuzPlaylistTracks.length ===
+        payload.length
+    ) {
+        addMenuButton(
+            "playlist_add",
+            "Add to Playlist",
+            function() {
+                showAddToQobuzPlaylistModal(
+                    qobuzPlaylistTracks
+                );
+            }
+        );
+    }
+
+    addMenuButton(
+        "info",
+        "Track Details",
+        function() {
+            captureDetailReturnScroll(
+                "qobuzsource"
+            );
+
+            loadQobuzTrackDetail(
+                track.id,
+                item,
+                detailFromView
+            );
+        }
+    );
+
+    addMenuButton(
+        "radio",
+        "Start Radio",
+        function() {
+            startQobuzRadioFromSeed(
+                track,
+                "track",
+                detailFromView
+            );
+        }
+    );
+
+    positionQueuePopover(
+        anchorEl,
+        popover
+    );
+}
+
+
+function handleQobuzWallItemClick(
+    item,
+    e,
+    anchorEl
+) {
+    item = item || {};
+    var type = String(item.type || "").toLowerCase();
+    var result = {
+        source: "qobuz",
+        type: type,
+        id: String(item.id || ""),
+        item: item.qobuz_item || null
+    };
+
+    if (type === "album" && result.id) {
+        captureDetailReturnScroll("qobuzsource");
+        loadQobuzAlbumDetail(result.id, item);
+    }
+
+    if (type === "track" && result.id) {
+        showQobuzTrackArtworkMenu(
+            anchorEl,
+            item,
+            e
+        );
+    }
+
+    return result;
+}
+
+
+function createQobuzWallActionButton(
+    label,
+    handler
+) {
+    var button = document.createElement("button");
+
+    button.type = "button";
+    button.className =
+        "srovaSourceSwitchItem srovaQobuzActionButton";
+
+    button.textContent = label;
+    button.onclick = handler;
+
+    return button;
+}
+
+
+function renderQobuzWallState(
+    slot,
+    spec,
+    state,
+    message
+) {
+    slot.innerHTML = "";
+
+    var wrap = document.createElement("div");
+
+    wrap.className =
+        "srovaQobuzWallState " +
+        "srovaQobuzWallState-" +
+        state;
+
+    var text = document.createElement("div");
+
+    text.className = "srovaQobuzWallStateText";
+    text.textContent = message || "";
+
+    wrap.appendChild(text);
+
+    if (state === "error") {
+        wrap.appendChild(
+            createQobuzWallActionButton(
+                "RETRY",
+                function() {
+                    loadQobuzWallSection(
+                        slot,
+                        spec
+                    );
+                }
+            )
+        );
+    }
+
+    slot.appendChild(wrap);
+}
+
+
+function renderQobuzWallSection(
+    slot,
+    spec
+) {
+    var items = slot._qobuzWallItems || [];
+
+    if (!items.length) {
+        renderQobuzWallState(
+            slot,
+            spec,
+            "empty",
+            spec.emptyText
+        );
+        return;
+    }
+
+    slot.innerHTML = "";
+
+    var section = buildScrollSection(
+        spec.title,
+        items,
+        function(item, e, anchorEl) {
+            var result =
+                handleQobuzWallItemClick(
+                    item,
+                    e,
+                    anchorEl
+                );
+
+            if (
+                result &&
+                result.type === "artist" &&
+                result.id
+            ) {
+                captureDetailReturnScroll("qobuzsource");
+                loadQobuzArtistDetail(
+                    result.id,
+                    item.name || "",
+                    item.image_url || "",
+                    "qobuzsource",
+                    null
+                );
+            }
+        },
+        {
+            kind: spec.sectionKind
+        }
+    );
+
+    var sectionTitle =
+        section.querySelector("h2");
+
+    if (
+        sectionTitle &&
+        (
+            spec.key === "my-albums" ||
+            spec.key === "my-tracks"
+        )
+    ) {
+        sectionTitle.style.cursor =
+            "pointer";
+
+        sectionTitle.title =
+            "See all";
+
+        sectionTitle.onclick =
+            spec.key === "my-albums"
+                ? showQobuzMyAlbums
+                : showQobuzMyTracks;
+    }
+
+    slot.appendChild(section);
+}
+
+
+function isQobuzSourcePageVisible() {
+    return (
+        currentSourceSection === "streaming" &&
+        currentStreamingProvider === "qobuz" &&
+        homeView &&
+        homeView.style.display !== "none" &&
+        !!document.querySelector(
+            "#homeSections .srovaQobuzSourcePage"
+        )
+    );
+}
+
+
+function loadQobuzWallSection(
+    slot,
+    spec
+) {
+    if (!slot || !spec) {
+        return Promise.resolve();
+    }
+
+    var generation = qobuzSourceUiGeneration;
+
+    slot._qobuzWallItems = [];
+    slot._qobuzWallLoading = true;
+
+    renderQobuzWallState(
+        slot,
+        spec,
+        "loading",
+        "Loading " + spec.title.toLowerCase() + "..."
+    );
+
+    return scheduleQobuzWallFetch(
+        function() {
+            if (
+                generation !== qobuzSourceUiGeneration ||
+                !isQobuzSourcePageVisible()
+            ) {
+                throw new Error(
+                    "Stale Qobuz wall request."
+                );
+            }
+
+            return fetchWithTimeout(
+                qobuzCatalogUrl(
+                    spec,
+                    0
+                ),
+                {
+                    cache: "no-store"
+                },
+                7000
+            );
+        }
+    )
+    .then(function(response) {
+        return response.json();
+    })
+    .then(function(data) {
+        if (
+            generation !== qobuzSourceUiGeneration ||
+            !isQobuzSourcePageVisible()
+        ) {
+            return;
+        }
+
+        if (
+            !data ||
+            data.ok === false
+        ) {
+            throw new Error(
+                (
+                    data &&
+                    (
+                        data.message ||
+                        data.error
+                    )
+                ) ||
+                "Qobuz section could not be loaded."
+            );
+        }
+
+        if (!Array.isArray(data.items)) {
+            throw new Error(
+                "Qobuz section returned an invalid item list."
+            );
+        }
+
+        slot._qobuzWallItems = data.items.map(
+            function(item) {
+                return adaptQobuzWallItem(
+                    item,
+                    spec.itemType
+                );
+            }
+        );
+
+        slot._qobuzWallLoading = false;
+
+        renderQobuzWallSection(
+            slot,
+            spec
+        );
+
+        if (
+            spec.itemType === "artist"
+        ) {
+            enrichQobuzArtistWallArtwork(
+                slot,
+                generation
+            );
+        }
+    })
+    .catch(function(error) {
+        if (
+            generation !== qobuzSourceUiGeneration ||
+            !isQobuzSourcePageVisible()
+        ) {
+            return;
+        }
+
+        slot._qobuzWallLoading = false;
+
+        renderQobuzWallState(
+            slot,
+            spec,
+            "error",
+            (
+                error &&
+                error.message
+            ) ||
+            "Qobuz section could not be loaded."
+        );
+    });
+}
+
+
+function showQobuzSource(opts) {
+    opts = opts || {};
+
+    if (!requireOnlineSource()) {
+        return;
+    }
+
+    /*
+     * Preserve the locked Q7D provider-selector callback exactly as
+     * showQobuzSource(). Detect an actual TIDAL -> Qobuz SOURCE 03
+     * switch before replacing the TIDAL DOM, so Qobuz can restore
+     * only its own persisted provider-local search state.
+     */
+    var switchingFromTidalSource =
+        currentSourceSection === "streaming" &&
+        currentStreamingProvider === "tidal" &&
+        !!document.querySelector(
+            "#homeSections .srovaTidalSourcePage"
+        );
+
+    var restoreSourceSearch =
+        !!opts.restoreSearch ||
+        switchingFromTidalSource;
+
+    showView("home");
+    setHomeGatewayAppPanel(false);
+
+    setCurrentStreamingProvider("qobuz");
+
+    qobuzSourceUiGeneration += 1;
+
+    setCurrentSourceSection("streaming");
+    setGlobalSearchVisible(false);
+
+    homeSections.innerHTML = "";
+
+    _cancelHomeSlotPolls();
+
+    var shell = buildSourcePageShell(
+        "srovaQobuzSourcePage",
+        "SOURCE 03",
+        "Qobuz",
+        "Streaming Library",
+        "streaming"
+    );
+
+    var body = shell.querySelector(
+        ".srovaSourcePageBody"
+    );
+
+    homeSections.appendChild(shell);
+    refreshStreamingProviderPresentation();
+
+    attachQobuzSourceSearch(
+        body,
+        restoreSourceSearch
+    );
+
+    QOBUZ_WALL_SECTION_SPECS.forEach(
+        function(spec, index) {
+            var slot = document.createElement("div");
+
+            slot.className = "srovaQobuzWallSlot";
+
+            slot.setAttribute(
+                "data-qobuz-section",
+                spec.key
+            );
+
+            body.appendChild(slot);
+
+            /*
+             * Queue every section immediately. The shared H5B
+             * scheduler bounds Qobuz wall traffic to four
+             * concurrent requests while preserving section
+             * order and independent loading/error state.
+             */
+            loadQobuzWallSection(
+                slot,
+                spec
+            );
+        }
+    );
+}
+
+
 function showTidalSource(opts) {
     opts = opts || {};
     if (opts.srovaSetupVerified !== true) {
@@ -9473,17 +21490,38 @@ function showTidalSource(opts) {
         return;
     }
     if (!requireOnlineSource()) { return; }
-    var restoreSourceSearch = !!opts.restoreSearch;
+
+    /*
+     * Q7G-G4 provider-switch search-state parity.
+     * Preserve the locked provider-selector callback as
+     * showTidalSource(), but when SOURCE 03 is switching from
+     * an existing Qobuz wall, restore only the persisted TIDAL
+     * provider-local query/results.
+     */
+    var switchingFromQobuzSource =
+        currentSourceSection === "streaming" &&
+        currentStreamingProvider === "qobuz" &&
+        !!document.querySelector(
+            "#homeSections .srovaQobuzSourcePage"
+        );
+
+    var restoreSourceSearch =
+        !!opts.restoreSearch ||
+        switchingFromQobuzSource;
+
     showView("home");
     setHomeGatewayAppPanel(false);
-    setCurrentSourceSection("tidal");
+    qobuzSourceUiGeneration += 1;
+    setCurrentStreamingProvider("tidal");
+    setCurrentSourceSection("streaming");
     setGlobalSearchVisible(false);
     homeSections.innerHTML = "";
     _cancelHomeSlotPolls();
 
-    var shell = buildSourcePageShell("srovaTidalSourcePage", "SOURCE 03", "Tidal", "Streaming Library", "tidal");
+    var shell = buildSourcePageShell("srovaTidalSourcePage", "SOURCE 03", "Tidal", "Streaming Library", "streaming");
     var body = shell.querySelector(".srovaSourcePageBody");
     homeSections.appendChild(shell);
+    refreshStreamingProviderPresentation();
     attachTidalSourceSearch(body, restoreSourceSearch);
 
     var libraryGeneration = tidalLibraryUiGeneration;
@@ -9505,6 +21543,19 @@ function showTidalSource(opts) {
     // My Songs / My Albums / Featured slots are placed but empty -- they fill in async.
     function _renderFast() {
         if (!tidalDone || !hiresDone) { return; }
+
+        var providerBar =
+            shell.querySelector(
+                ".srovaStreamingProviderBar"
+            );
+
+        if (providerBar) {
+            shell.insertBefore(
+                providerBar,
+                body
+            );
+        }
+
         body.innerHTML = "";
         attachTidalSourceSearch(body, restoreSourceSearch);
 
@@ -9586,9 +21637,38 @@ function attachTidalSourceSearch(body, restoreSearch) {
         '<div id="tidalSourceSearchBox">' +
           '<span class="material-icons">search</span>' +
           '<input id="tidalSourceSearchInput" type="text" placeholder="Search Tidal songs, albums, artists..." autocomplete="off">' +
+          '<button id="tidalSourceSearchClear" class="srovaInlineSearchClear hidden" type="button" aria-label="Clear TIDAL search" title="Clear search">' +
+            '<span class="material-icons">close</span>' +
+          '</button>' +
         '</div>' +
         '<div id="tidalSourceSearchStatus"></div>';
-    body.appendChild(toolbar);
+
+    var stickyControls =
+        document.createElement("div");
+
+    stickyControls.className =
+        "srovaStreamingStickyControls";
+
+    stickyControls.appendChild(
+        toolbar
+    );
+
+    var providerBar =
+        body.parentNode
+            ? body.parentNode.querySelector(
+                ".srovaStreamingProviderBar"
+            )
+            : null;
+
+    if (providerBar) {
+        stickyControls.appendChild(
+            providerBar
+        );
+    }
+
+    body.appendChild(
+        stickyControls
+    );
 
     var wrap = document.createElement("div");
     wrap.id = "tidalSourceSearchWrap";
@@ -9597,8 +21677,30 @@ function attachTidalSourceSearch(body, restoreSearch) {
 
     var input = toolbar.querySelector("#tidalSourceSearchInput");
     if (!input) { return; }
+
+    var clearBtn =
+        toolbar.querySelector(
+            "#tidalSourceSearchClear"
+        );
+
     var timer = null;
+
+    if (clearBtn) {
+        clearBtn.onclick = function() {
+            clearTimeout(timer);
+            clearTidalSourceSearchAndLanding();
+            input.focus();
+        };
+    }
+
     input.oninput = function() {
+        if (clearBtn) {
+            clearBtn.classList.toggle(
+                "hidden",
+                !input.value
+            );
+        }
+
         var query = input.value.trim();
         clearTimeout(timer);
         timer = setTimeout(function() {
@@ -9619,6 +21721,14 @@ function attachTidalSourceSearch(body, restoreSearch) {
     if (restoreSearch) {
         restoreTidalSourceSearchIntoCurrentPage();
     }
+
+    if (clearBtn) {
+        clearBtn.classList.toggle(
+            "hidden",
+            !input.value
+        );
+    }
+
     applyOnlineSourceAvailability(onlineSourcesAvailable);
 }
 
@@ -9821,6 +21931,9 @@ function renderLocalMusicShell() {
             '<div id="localMusicSearchBox">' +
               '<span class="material-icons">search</span>' +
               '<input id="localMusicSearchInput" type="text" placeholder="Search local songs, albums, artists..." autocomplete="off">' +
+              '<button id="localMusicSearchClear" class="srovaInlineSearchClear hidden" type="button" aria-label="Clear local search" title="Clear search">' +
+                '<span class="material-icons">close</span>' +
+              '</button>' +
             '</div>' +
             '<div id="localMusicSortControls" aria-label="Album sort controls">' +
               '<button id="localMusicDateSortBtn" class="localMusicSortBtn" type="button"></button>' +
@@ -9837,7 +21950,24 @@ function renderLocalMusicShell() {
     var input = document.getElementById("localMusicSearchInput");
     if (input) {
         var timer = null;
+        var clearBtn =
+            document.getElementById("localMusicSearchClear");
+
+        if (clearBtn) {
+            clearBtn.onclick = function() {
+                clearTimeout(timer);
+                clearLocalMusicSearchAndBrowse();
+                input.focus();
+            };
+        }
+
         input.oninput = function() {
+            if (clearBtn) {
+                clearBtn.classList.toggle(
+                    "hidden",
+                    !input.value
+                );
+            }
             if (isLocalLibraryMaintenance()) {
                 renderLocalMusicMaintenanceLockout();
                 return;
@@ -9928,6 +22058,17 @@ function restoreLocalMusicSearchResults() {
     var browse = document.getElementById("localMusicBrowse");
 
     if (input && query) { input.value = query; }
+
+    var clearBtn =
+        document.getElementById("localMusicSearchClear");
+
+    if (clearBtn) {
+        clearBtn.classList.toggle(
+            "hidden",
+            !query
+        );
+    }
+
     if (browse) { browse.innerHTML = ""; }
     setLocalMusicStatus("");
 
@@ -9945,7 +22086,14 @@ function restoreLocalMusicSearchResults() {
 
 function clearLocalMusicSearchAndBrowse() {
     var input = document.getElementById("localMusicSearchInput");
+    var clearBtn =
+        document.getElementById("localMusicSearchClear");
+
     if (input) { input.value = ""; }
+    if (clearBtn) {
+        clearBtn.classList.add("hidden");
+    }
+
     currentLocalMusicSearchTab = "top";
     lastLocalMusicSearchQuery = "";
     lastLocalMusicSearchPayload = null;
@@ -10700,6 +22848,7 @@ function loadLocalArtist(artist, artistCover, artistAlbumArtwork) {
 }
 
 function playLocalLibraryTrack(track, indexInContext) {
+    if (!requireNativePlaybackAvailable()) { return; }
     if (isLocalLibraryMaintenance()) {
         showQueueActionToast("Local Music is rebuilding", true);
         return;
@@ -10803,6 +22952,7 @@ function buildLocalTrackPayload(track, ctxCover) {
 function sourceLabelForTrack(track) {
     var source = String((track && track.source) || "").toLowerCase();
     var id = track && track.id != null ? String(track.id) : "";
+    if (id.indexOf("qobuz:") === 0) { return "QOBUZ"; }
     if (source === "local" || id.indexOf("local:") === 0) { return "LOCAL"; }
     if (source === "radio") { return "RADIO"; }
     return "TIDAL";
@@ -11054,6 +23204,220 @@ function renderLibraryViewToggle(mountId) {
 
 // --- My Albums full page ---
 
+
+function renderQobuzSavedAlbumsGrid(
+    container,
+    items
+) {
+    container.innerHTML = "";
+
+    if (
+        !items ||
+        items.length === 0
+    ) {
+        container.innerHTML =
+            '<div class="libraryLoading">' +
+            'Nothing here yet.' +
+            '</div>';
+
+        return;
+    }
+
+    var grid =
+        document.createElement(
+            "div"
+        );
+
+    grid.className =
+        "libraryGrid tidalArtworkGrid qobuzLibraryGrid";
+
+    applyArtworkViewModeClass(
+        grid
+    );
+
+    items.forEach(
+        function(item) {
+            var card =
+                document.createElement(
+                    "div"
+                );
+
+            card.className =
+                "libraryCard";
+
+            var quality =
+                qobuzLibraryQualityDataValue(
+                    item
+                );
+
+            if (quality) {
+                card.setAttribute(
+                    "data-q",
+                    quality
+                );
+            }
+
+            card.innerHTML =
+                '<img src="' +
+                (item.image_url || "") +
+                '" class="libraryCardImg">' +
+                '<div class="libraryCardTitle">' +
+                (item.name || "") +
+                '</div>' +
+                '<div class="libraryCardSub">' +
+                (item.sub_title || "") +
+                '</div>';
+
+            if (item.id) {
+                card.onclick =
+                    function() {
+                        loadQobuzAlbumDetail(
+                            item.id,
+                            item,
+                            "home"
+                        );
+                    };
+            }
+
+            grid.appendChild(
+                card
+            );
+        }
+    );
+
+    container.appendChild(
+        grid
+    );
+}
+
+
+function showQobuzMyAlbums() {
+    if (!requireOnlineSource()) {
+        return;
+    }
+
+    qobuzLibraryFullViewGeneration += 1;
+
+    var generation =
+        qobuzLibraryFullViewGeneration;
+
+    setCurrentStreamingProvider(
+        "qobuz"
+    );
+
+    setCurrentSourceSection(
+        "streaming"
+    );
+
+    showView(
+        "myalbums"
+    );
+
+    var grid =
+        document.getElementById(
+            "myAlbumsGrid"
+        );
+
+    if (!grid) {
+        return;
+    }
+
+    var title =
+        myAlbumsView &&
+        myAlbumsView.querySelector(
+            ".libraryViewTitle"
+        );
+
+    if (title) {
+        title.textContent =
+            "My Albums";
+    }
+
+    renderLibraryViewToggle(
+        "myAlbumsViewToggleMount"
+    );
+
+    var cached =
+        window._qobuzMyAlbumsData ||
+        [];
+
+    if (cached.length) {
+        renderQobuzSavedAlbumsGrid(
+            grid,
+            cached
+        );
+
+        return;
+    }
+
+    grid.innerHTML =
+        '<div class="libraryLoading">' +
+        'Loading...</div>';
+
+    var spec =
+        qobuzLibrarySpecByKey(
+            "my-albums"
+        );
+
+    if (!spec) {
+        grid.innerHTML =
+            '<div class="libraryLoading">' +
+            'Could not load albums.' +
+            '</div>';
+
+        return;
+    }
+
+    fetchAllQobuzLibraryItems(
+        spec
+    )
+    .then(function(items) {
+        if (
+            generation !==
+                qobuzLibraryFullViewGeneration ||
+            currentSrovaView !==
+                "myalbums" ||
+            currentStreamingProvider !==
+                "qobuz"
+        ) {
+            return;
+        }
+
+        window._qobuzMyAlbumsData =
+            items.map(
+                function(item) {
+                    return adaptQobuzWallItem(
+                        item,
+                        "album"
+                    );
+                }
+            );
+
+        renderQobuzSavedAlbumsGrid(
+            grid,
+            window._qobuzMyAlbumsData
+        );
+    })
+    .catch(function() {
+        if (
+            generation !==
+                qobuzLibraryFullViewGeneration ||
+            currentSrovaView !==
+                "myalbums" ||
+            currentStreamingProvider !==
+                "qobuz"
+        ) {
+            return;
+        }
+
+        grid.innerHTML =
+            '<div class="libraryLoading">' +
+            'Could not load albums.' +
+            '</div>';
+    });
+}
+
+
 function showMyAlbums() {
     if (!requireOnlineSource()) { return; }
     showView("myalbums");
@@ -11085,8 +23449,236 @@ function showMyAlbums() {
 
 // --- My Songs full page ---
 
+
+function renderQobuzSavedTracksList(
+    container,
+    items
+) {
+    container.innerHTML = "";
+
+    if (
+        !items ||
+        items.length === 0
+    ) {
+        container.innerHTML =
+            '<div class="libraryLoading">' +
+            'Nothing here yet.' +
+            '</div>';
+
+        return;
+    }
+
+    var list =
+        document.createElement(
+            "div"
+        );
+
+    /*
+     * Reuse the established My Songs geometry while keeping its
+     * historical TIDAL renderer completely untouched.
+     */
+    list.className =
+        "librarySongList tidalSongList qobuzSavedTracksList";
+
+    applyArtworkViewModeClass(
+        list
+    );
+
+    items.forEach(
+        function(item) {
+            var row =
+                document.createElement(
+                    "div"
+                );
+
+            row.className =
+                "librarySongRow";
+
+            var quality =
+                qobuzLibraryQualityDataValue(
+                    item
+                );
+
+            if (quality) {
+                row.setAttribute(
+                    "data-q",
+                    quality
+                );
+            }
+
+            row.innerHTML =
+                '<img src="' +
+                (item.image_url || "") +
+                '" class="librarySongThumb">' +
+                '<div class="librarySongMeta">' +
+                    '<div class="librarySongTitle">' +
+                    (item.name || "") +
+                    '</div>' +
+                    '<div class="librarySongSub">' +
+                    (item.sub_title || "") +
+                    '</div>' +
+                '</div>' +
+                '<div class="librarySongDur">' +
+                formatTime(
+                    item.duration || 0
+                ) +
+                '</div>';
+
+            row.onclick =
+                function(e) {
+                    showQobuzTrackArtworkMenu(
+                        row,
+                        item,
+                        e
+                    );
+                };
+
+            list.appendChild(
+                row
+            );
+        }
+    );
+
+    container.appendChild(
+        list
+    );
+}
+
+
+function showQobuzMyTracks() {
+    if (!requireOnlineSource()) {
+        return;
+    }
+
+    qobuzLibraryFullViewGeneration += 1;
+
+    var generation =
+        qobuzLibraryFullViewGeneration;
+
+    setCurrentStreamingProvider(
+        "qobuz"
+    );
+
+    setCurrentSourceSection(
+        "streaming"
+    );
+
+    showView(
+        "mysongs"
+    );
+
+    var grid =
+        document.getElementById(
+            "mySongsGrid"
+        );
+
+    if (!grid) {
+        return;
+    }
+
+    var title =
+        mySongsView &&
+        mySongsView.querySelector(
+            ".libraryViewTitle"
+        );
+
+    if (title) {
+        title.textContent =
+            "My Tracks";
+    }
+
+    renderLibraryViewToggle(
+        "mySongsViewToggleMount"
+    );
+
+    var cached =
+        window._qobuzMyTracksData ||
+        [];
+
+    if (cached.length) {
+        renderQobuzSavedTracksList(
+            grid,
+            cached
+        );
+
+        return;
+    }
+
+    grid.innerHTML =
+        '<div class="libraryLoading">' +
+        'Loading...</div>';
+
+    var spec =
+        qobuzLibrarySpecByKey(
+            "my-tracks"
+        );
+
+    if (!spec) {
+        grid.innerHTML =
+            '<div class="libraryLoading">' +
+            'Could not load tracks.' +
+            '</div>';
+
+        return;
+    }
+
+    fetchAllQobuzLibraryItems(
+        spec
+    )
+    .then(function(items) {
+        if (
+            generation !==
+                qobuzLibraryFullViewGeneration ||
+            currentSrovaView !==
+                "mysongs" ||
+            currentStreamingProvider !==
+                "qobuz"
+        ) {
+            return;
+        }
+
+        window._qobuzMyTracksData =
+            items.map(
+                function(item) {
+                    return adaptQobuzWallItem(
+                        item,
+                        "track"
+                    );
+                }
+            );
+
+        renderQobuzSavedTracksList(
+            grid,
+            window._qobuzMyTracksData
+        );
+    })
+    .catch(function() {
+        if (
+            generation !==
+                qobuzLibraryFullViewGeneration ||
+            currentSrovaView !==
+                "mysongs" ||
+            currentStreamingProvider !==
+                "qobuz"
+        ) {
+            return;
+        }
+
+        grid.innerHTML =
+            '<div class="libraryLoading">' +
+            'Could not load tracks.' +
+            '</div>';
+    });
+}
+
+
 function showMySongs() {
     if (!requireOnlineSource()) { return; }
+
+    var title = mySongsView &&
+        mySongsView.querySelector(".libraryViewTitle");
+    if (title) { title.textContent = "My Songs"; }
+
     showView("mysongs");
     var grid = document.getElementById("mySongsGrid");
     if (!grid) { return; }
@@ -11200,6 +23792,980 @@ function postJson(url, body) {
         });
     });
 }
+
+function postCreateQobuzPlaylist(name, description) {
+    return postJson("/qobuz/playlist/create", {
+        name: name,
+        description: description || "",
+        is_public: false
+    });
+}
+
+
+function postDeleteQobuzPlaylist(playlistId) {
+    return postJson(
+        "/qobuz/playlist/delete",
+        {
+            playlist_id:
+                String(
+                    playlistId || ""
+                ).trim()
+        }
+    );
+}
+
+function postRenameQobuzPlaylist(
+    playlistId,
+    name
+) {
+    return postJson(
+        "/qobuz/playlist/rename",
+        {
+            playlist_id:
+                String(
+                    playlistId || ""
+                ).trim(),
+            name:
+                String(
+                    name || ""
+                ).trim()
+        }
+    );
+}
+
+
+
+function normalizeQobuzPlaylistTracks(items) {
+    if (!Array.isArray(items) || !items.length) {
+        return [];
+    }
+
+    var normalized = [];
+
+    for (var i = 0; i < items.length; i++) {
+        var item = items[i];
+
+        if (!item || typeof item !== "object") {
+            return [];
+        }
+
+        var source = String(
+            item.source || ""
+        ).trim().toLowerCase();
+
+        var canonicalId = String(
+            item.id || ""
+        ).trim();
+
+        var providerTrackId = String(
+            item.provider_track_id || ""
+        ).trim();
+
+        if (
+            source !== "qobuz" ||
+            !providerTrackId ||
+            !/^[0-9]+$/.test(providerTrackId) ||
+            /^0+$/.test(providerTrackId) ||
+            canonicalId !== "qobuz:" + providerTrackId
+        ) {
+            return [];
+        }
+
+        normalized.push({
+            source: "qobuz",
+            id: canonicalId,
+            provider_track_id: providerTrackId
+        });
+    }
+
+    return normalized;
+}
+
+function postAddTracksToQobuzPlaylist(
+    playlistId,
+    tracks
+) {
+    var normalized =
+        normalizeQobuzPlaylistTracks(
+            tracks
+        );
+
+    if (
+        !normalized.length ||
+        normalized.length !== (
+            Array.isArray(tracks)
+                ? tracks.length
+                : 0
+        )
+    ) {
+        return Promise.reject(
+            new Error(
+                "No valid Qobuz track id"
+            )
+        );
+    }
+
+    return postJson(
+        "/qobuz/playlist/add_tracks",
+        {
+            playlist_id:
+                String(
+                    playlistId || ""
+                ).trim(),
+            tracks: normalized
+        }
+    );
+}
+
+function normalizeQobuzPlaylistRemoveTracks(
+    items
+) {
+    if (
+        !Array.isArray(items) ||
+        !items.length
+    ) {
+        return [];
+    }
+
+    var catalogTracks =
+        normalizeQobuzPlaylistTracks(
+            items
+        );
+
+    if (
+        catalogTracks.length
+        !== items.length
+    ) {
+        return [];
+    }
+
+    var normalized = [];
+
+    for (
+        var i = 0;
+        i < items.length;
+        i++
+    ) {
+        var occurrenceId = String(
+            items[i].playlist_track_id
+            || ""
+        ).trim();
+
+        if (
+            !occurrenceId ||
+            !/^[0-9]+$/.test(
+                occurrenceId
+            ) ||
+            /^0+$/.test(
+                occurrenceId
+            )
+        ) {
+            return [];
+        }
+
+        normalized.push({
+            source:
+                "qobuz",
+            id:
+                catalogTracks[i].id,
+            provider_track_id:
+                catalogTracks[i]
+                    .provider_track_id,
+            playlist_track_id:
+                occurrenceId
+        });
+    }
+
+    return normalized;
+}
+
+function postRemoveTracksFromQobuzPlaylist(
+    playlistId,
+    tracks
+) {
+    var normalized =
+        normalizeQobuzPlaylistRemoveTracks(
+            tracks
+        );
+
+    if (
+        !normalized.length ||
+        normalized.length !== (
+            Array.isArray(tracks)
+                ? tracks.length
+                : 0
+        )
+    ) {
+        return Promise.reject(
+            new Error(
+                "No valid Qobuz playlist occurrence"
+            )
+        );
+    }
+
+    return postJson(
+        "/qobuz/playlist/remove_tracks",
+        {
+            playlist_id:
+                String(
+                    playlistId || ""
+                ).trim(),
+            tracks:
+                normalized
+        }
+    );
+}
+
+
+function fetchQobuzPlaylistsForPicker() {
+    return fetchWithTimeout(
+        "/qobuz/catalog?op=playlists",
+        {
+            cache: "no-store"
+        },
+        8000
+    )
+    .then(function(res) {
+        if (!res.ok) {
+            throw new Error(
+                "Could not load Qobuz playlists."
+            );
+        }
+
+        return res.json();
+    })
+    .then(function(items) {
+        if (!Array.isArray(items)) {
+            throw new Error(
+                "Qobuz playlist list is invalid"
+            );
+        }
+
+        return items
+            .map(adaptQobuzUserPlaylist)
+            .filter(function(playlist) {
+                return !!(
+                    playlist &&
+                    playlist.id &&
+                    playlist.playlist_editable === true
+                );
+            });
+    });
+}
+
+function updateQobuzPlaylistTrackCountLocal(
+    playlistId,
+    total
+) {
+    playlistId =
+        String(
+            playlistId || ""
+        ).trim();
+
+    total = Number(total);
+
+    if (
+        !playlistId ||
+        !isFinite(total) ||
+        total < 0
+    ) {
+        return;
+    }
+
+    qobuzPlaylists.forEach(function(item) {
+        if (
+            String(
+                (item || {}).id || ""
+            ) !== playlistId
+        ) {
+            return;
+        }
+
+        item.num_tracks = total;
+        item.sub_title =
+            total
+                ? String(total) + " tracks"
+                : "";
+    });
+
+    document.querySelectorAll(
+        '.playlistRow[data-playlist-id]'
+    ).forEach(function(row) {
+        if (
+            String(
+                row.getAttribute(
+                    "data-playlist-id"
+                ) || ""
+            ) !== playlistId
+        ) {
+            return;
+        }
+
+        var sub =
+            row.querySelector(
+                ".playlistSub"
+            );
+
+        if (sub) {
+            sub.textContent =
+                total
+                    ? String(total) + " tracks"
+                    : "";
+        }
+    });
+}
+
+function updateQobuzPlaylistNameInUi(
+    playlistId,
+    name
+) {
+    playlistId =
+        String(
+            playlistId || ""
+        ).trim();
+
+    name =
+        String(
+            name || ""
+        ).trim();
+
+    if (
+        !playlistId ||
+        !name
+    ) {
+        return;
+    }
+
+    qobuzPlaylists.forEach(
+        function(item) {
+            if (
+                String(
+                    (
+                        item ||
+                        {}
+                    ).id ||
+                    ""
+                ) !== playlistId
+            ) {
+                return;
+            }
+
+            item.name =
+                name;
+        }
+    );
+
+    document.querySelectorAll(
+        '.playlistRow[data-playlist-provider="qobuz"][data-playlist-id]'
+    ).forEach(function(row) {
+        if (
+            String(
+                row.getAttribute(
+                    "data-playlist-id"
+                ) || ""
+            ) !== playlistId
+        ) {
+            return;
+        }
+
+        var rowName =
+            row.querySelector(
+                ".playlistName"
+            );
+
+        if (rowName) {
+            rowName.textContent =
+                name;
+        }
+    });
+
+    document.querySelectorAll(
+        '.tidalPlaylistPickerRow[data-playlist-provider="qobuz"][data-playlist-id]'
+    ).forEach(function(row) {
+        if (
+            String(
+                row.getAttribute(
+                    "data-playlist-id"
+                ) || ""
+            ) !== playlistId
+        ) {
+            return;
+        }
+
+        var pickerName =
+            row.querySelector(
+                ".tidalPlaylistPickerName"
+            );
+
+        if (pickerName) {
+            pickerName.textContent =
+                name;
+        }
+    });
+
+    if (
+        currentContext &&
+        currentContext.source ===
+            "qobuz" &&
+        currentContext.type ===
+            "playlist" &&
+        String(
+            currentContext.id ||
+            ""
+        ) === playlistId
+    ) {
+        currentContext.title =
+            name;
+
+        albumTitle.textContent =
+            name;
+    }
+}
+
+
+function showAddToQobuzPlaylistModal(
+    tracks,
+    options
+) {
+    options = options || {};
+
+    tracks =
+        normalizeQobuzPlaylistTracks(
+            tracks
+        );
+
+    if (!tracks.length) {
+        showQueueActionToast(
+            "No valid Qobuz track id",
+            true
+        );
+        return;
+    }
+
+    var existing =
+        document.getElementById(
+            "qobuzPlaylistModal"
+        );
+
+    if (existing) {
+        closeQobuzPlaylistModal(
+            existing
+        );
+    }
+
+    var modal =
+        document.createElement("div");
+
+    modal.id =
+        "qobuzPlaylistModal";
+
+    modal.className =
+        "tidalPlaylistModal";
+
+    modal.setAttribute(
+        "role",
+        "dialog"
+    );
+
+    modal.setAttribute(
+        "aria-modal",
+        "true"
+    );
+
+    var card =
+        document.createElement("div");
+
+    card.className =
+        "tidalPlaylistCard tidalPlaylistPickerCard";
+
+    var title =
+        document.createElement("div");
+
+    title.className =
+        "tidalPlaylistTitle";
+
+    title.textContent =
+        options.title ||
+        "Add to Playlist";
+
+    var status =
+        document.createElement("div");
+
+    status.className =
+        "tidalPlaylistStatus";
+
+    status.textContent =
+        "Loading playlists...";
+
+    var controls =
+        document.createElement("div");
+
+    controls.className =
+        "tidalPlaylistPickerControls";
+
+    var searchInput =
+        document.createElement("input");
+
+    searchInput.className =
+        "tidalPlaylistInput tidalPlaylistPickerSearch";
+
+    searchInput.type =
+        "search";
+
+    searchInput.placeholder =
+        "Search playlists";
+
+    var sortWrap =
+        document.createElement("div");
+
+    sortWrap.className =
+        "tidalPlaylistPickerSort";
+
+    var sortAzBtn =
+        document.createElement("button");
+
+    sortAzBtn.className =
+        "tidalPlaylistSortBtn";
+
+    sortAzBtn.type =
+        "button";
+
+    sortAzBtn.textContent =
+        "A-Z";
+
+    var sortLatestBtn =
+        document.createElement("button");
+
+    sortLatestBtn.className =
+        "tidalPlaylistSortBtn";
+
+    sortLatestBtn.type =
+        "button";
+
+    sortLatestBtn.textContent =
+        "Latest";
+
+    sortWrap.appendChild(
+        sortAzBtn
+    );
+
+    sortWrap.appendChild(
+        sortLatestBtn
+    );
+
+    controls.appendChild(
+        searchInput
+    );
+
+    controls.appendChild(
+        sortWrap
+    );
+
+    var list =
+        document.createElement("div");
+
+    list.className =
+        "tidalPlaylistPickerList";
+
+    var actions =
+        document.createElement("div");
+
+    actions.className =
+        "tidalPlaylistActions";
+
+    var cancelBtn =
+        document.createElement("button");
+
+    cancelBtn.className =
+        "settingsBtn";
+
+    cancelBtn.type =
+        "button";
+
+    cancelBtn.textContent =
+        "Cancel";
+
+    actions.appendChild(
+        cancelBtn
+    );
+
+    function setStatus(
+        text,
+        isError
+    ) {
+        status.textContent =
+            text || "";
+
+        status.className =
+            "tidalPlaylistStatus" +
+            (
+                isError
+                    ? " error"
+                    : ""
+            );
+    }
+
+    function setBusy(busy) {
+        var buttons =
+            card.querySelectorAll(
+                "button"
+            );
+
+        for (
+            var i = 0;
+            i < buttons.length;
+            i++
+        ) {
+            buttons[i].disabled =
+                busy;
+        }
+
+        searchInput.disabled =
+            busy;
+    }
+
+    function addToPlaylist(
+        playlistId,
+        playlistName
+    ) {
+        setBusy(true);
+
+        setStatus(
+            "Adding tracks...",
+            false
+        );
+
+        postAddTracksToQobuzPlaylist(
+            playlistId,
+            tracks
+        )
+        .then(function(data) {
+            if (
+                !data ||
+                data.ok !== true ||
+                data.confirmed !== true
+            ) {
+                throw new Error(
+                    (
+                        data &&
+                        (
+                            data.message ||
+                            data.error
+                        )
+                    ) ||
+                    "Could not add to playlist"
+                );
+            }
+
+            updateQobuzPlaylistTrackCountLocal(
+                playlistId,
+                data.total_after
+            );
+
+            closeQobuzPlaylistModal(
+                modal
+            );
+
+            var added =
+                Number(
+                    data.items_added ||
+                    0
+                );
+
+            var skipped =
+                Number(
+                    data.duplicates_skipped ||
+                    0
+                );
+
+            if (
+                added === 0 &&
+                skipped > 0
+            ) {
+                showQueueActionToast(
+                    "Already in " +
+                    (
+                        playlistName ||
+                        "playlist"
+                    ),
+                    false
+                );
+            } else {
+                showQueueActionToast(
+                    "Added " +
+                    added +
+                    " to " +
+                    (
+                        playlistName ||
+                        "playlist"
+                    ),
+                    false
+                );
+            }
+
+            if (
+                typeof options.onSuccess
+                === "function"
+            ) {
+                options.onSuccess(
+                    data
+                );
+            }
+        })
+        .catch(function(err) {
+            setBusy(false);
+
+            setStatus(
+                err &&
+                err.message
+                    ? err.message
+                    : "Could not add to playlist.",
+                true
+            );
+        });
+    }
+
+    var pickerPlaylists = [];
+
+    var pickerSortMode =
+        getPlaylistPickerSortMode();
+
+    function updateSortButtons() {
+        sortAzBtn.className =
+            "tidalPlaylistSortBtn" +
+            (
+                pickerSortMode === "az"
+                    ? " active"
+                    : ""
+            );
+
+        sortLatestBtn.className =
+            "tidalPlaylistSortBtn" +
+            (
+                pickerSortMode === "latest"
+                    ? " active"
+                    : ""
+            );
+    }
+
+    function renderPlaylists() {
+        list.innerHTML = "";
+
+        if (!pickerPlaylists.length) {
+            setStatus(
+                "No editable Qobuz playlists found.",
+                false
+            );
+            return;
+        }
+
+        var q =
+            searchInput.value
+            .trim()
+            .toLowerCase();
+
+        var filtered =
+            pickerPlaylists.filter(
+                function(playlist) {
+                    return (
+                        !q ||
+                        String(
+                            (
+                                playlist &&
+                                playlist.name
+                            ) ||
+                            ""
+                        )
+                        .toLowerCase()
+                        .indexOf(q)
+                        !== -1
+                    );
+                }
+            );
+
+        if (!filtered.length) {
+            setStatus(
+                "No matching playlists.",
+                false
+            );
+            return;
+        }
+
+        setStatus(
+            "",
+            false
+        );
+
+        sortPlaylistsForPicker(
+            filtered,
+            pickerSortMode
+        )
+        .forEach(function(playlist) {
+            var row =
+                document.createElement(
+                    "button"
+                );
+
+            row.type =
+                "button";
+
+            row.className =
+                "tidalPlaylistPickerRow";
+
+            row.setAttribute(
+                "data-playlist-id",
+                String(
+                    playlist.id ||
+                    ""
+                )
+            );
+
+            row.setAttribute(
+                "data-playlist-provider",
+                "qobuz"
+            );
+
+            row.innerHTML =
+                '<span class="material-icons">playlist_play</span>' +
+                '<span class="tidalPlaylistPickerMeta">' +
+                    '<span class="tidalPlaylistPickerName">' +
+                        escapeHtml(
+                            playlist.name ||
+                            "Untitled Playlist"
+                        ) +
+                    '</span>' +
+                    '<span class="tidalPlaylistPickerSub">' +
+                        escapeHtml(
+                            playlist.sub_title ||
+                            ""
+                        ) +
+                    '</span>' +
+                '</span>';
+
+            row.onclick =
+                function() {
+                    addToPlaylist(
+                        playlist.id,
+                        playlist.name ||
+                        "playlist"
+                    );
+                };
+
+            list.appendChild(
+                row
+            );
+        });
+    }
+
+    sortAzBtn.onclick =
+        function() {
+            pickerSortMode =
+                setPlaylistPickerSortMode(
+                    "az"
+                );
+
+            updateSortButtons();
+            renderPlaylists();
+        };
+
+    sortLatestBtn.onclick =
+        function() {
+            pickerSortMode =
+                setPlaylistPickerSortMode(
+                    "latest"
+                );
+
+            updateSortButtons();
+            renderPlaylists();
+        };
+
+    searchInput.oninput =
+        renderPlaylists;
+
+    cancelBtn.onclick =
+        function() {
+            closeQobuzPlaylistModal(
+                modal
+            );
+        };
+
+    modal.addEventListener(
+        "click",
+        function(event) {
+            if (
+                event.target ===
+                modal
+            ) {
+                closeQobuzPlaylistModal(
+                    modal
+                );
+            }
+        }
+    );
+
+    card.appendChild(
+        title
+    );
+
+    card.appendChild(
+        status
+    );
+
+    card.appendChild(
+        controls
+    );
+
+    card.appendChild(
+        list
+    );
+
+    card.appendChild(
+        actions
+    );
+
+    modal.appendChild(
+        card
+    );
+
+    document.body.appendChild(
+        modal
+    );
+
+    updateSortButtons();
+
+    fetchQobuzPlaylistsForPicker()
+        .then(function(playlists) {
+            pickerPlaylists =
+                playlists.map(
+                    function(
+                        playlist,
+                        index
+                    ) {
+                        playlist =
+                            playlist ||
+                            {};
+
+                        playlist[
+                            "_pickerIndex"
+                        ] = index;
+
+                        return playlist;
+                    }
+                );
+
+            renderPlaylists();
+        })
+        .catch(function(err) {
+            setStatus(
+                err &&
+                err.message
+                    ? err.message
+                    : "Could not load playlists.",
+                true
+            );
+        });
+}
+
 
 function postCreateTidalPlaylist(name, description) {
     return postJson("/tidal/playlist/create", {
@@ -11441,6 +25007,629 @@ function showCreateTidalPlaylistModal(options) {
     modal.appendChild(card);
     document.body.appendChild(modal);
     setTimeout(function() { nameInput.focus(); }, 0);
+}
+
+
+function isQobuzPlaylistDeleteTombstoned(
+    playlistId
+) {
+    playlistId =
+        String(
+            playlistId || ""
+        ).trim();
+
+    return !!(
+        playlistId &&
+        qobuzDeletedPlaylistIds[
+            playlistId
+        ] === true
+    );
+}
+
+function removeQobuzPlaylistLocal(
+    playlistId
+) {
+    playlistId =
+        String(
+            playlistId || ""
+        ).trim();
+
+    if (!playlistId) {
+        return;
+    }
+
+    qobuzDeletedPlaylistIds[
+        playlistId
+    ] = true;
+
+    qobuzPlaylists =
+        qobuzPlaylists.filter(
+            function(item) {
+                return (
+                    String(
+                        (
+                            item ||
+                            {}
+                        ).id ||
+                        ""
+                    ) !== playlistId
+                );
+            }
+        );
+
+    qobuzPlaylistsLoaded = true;
+
+    if (
+        currentPlaylistsProvider
+        === "qobuz"
+    ) {
+        renderPlaylistsList(
+            qobuzPlaylists
+        );
+    }
+}
+
+function reconcileQobuzPlaylistsAfterDelete(
+    playlistId,
+    attempt
+) {
+    playlistId =
+        String(
+            playlistId || ""
+        ).trim();
+
+    attempt =
+        Number(
+            attempt || 0
+        );
+
+    if (
+        !playlistId ||
+        !isFinite(attempt) ||
+        attempt < 0
+    ) {
+        return;
+    }
+
+    var delays = [
+        3000,
+        10000,
+        30000
+    ];
+
+    if (
+        attempt >=
+        delays.length
+    ) {
+        return;
+    }
+
+    setTimeout(
+        function() {
+            fetch(
+                "/qobuz/catalog?op=playlists",
+                {
+                    cache:
+                        "no-store"
+                }
+            )
+            .then(function(res) {
+                if (!res.ok) {
+                    throw new Error(
+                        "Qobuz playlist reconciliation failed"
+                    );
+                }
+
+                return res.json();
+            })
+            .then(function(raw) {
+                raw =
+                    Array.isArray(raw)
+                        ? raw
+                        : [];
+
+                var adapted =
+                    raw.map(
+                        adaptQobuzUserPlaylist
+                    );
+
+                var stillPresent =
+                    adapted.some(
+                        function(item) {
+                            return (
+                                String(
+                                    (
+                                        item ||
+                                        {}
+                                    ).id ||
+                                    ""
+                                ) ===
+                                playlistId
+                            );
+                        }
+                    );
+
+                if (stillPresent) {
+                    reconcileQobuzPlaylistsAfterDelete(
+                        playlistId,
+                        attempt + 1
+                    );
+                    return;
+                }
+
+                delete qobuzDeletedPlaylistIds[
+                    playlistId
+                ];
+
+                qobuzPlaylists =
+                    adapted.filter(
+                        function(item) {
+                            return !isQobuzPlaylistDeleteTombstoned(
+                                (
+                                    item ||
+                                    {}
+                                ).id
+                            );
+                        }
+                    );
+
+                qobuzPlaylistsLoaded =
+                    true;
+
+                if (
+                    currentPlaylistsProvider
+                    === "qobuz"
+                ) {
+                    renderPlaylistsList(
+                        qobuzPlaylists
+                    );
+                }
+            })
+            .catch(function() {
+                reconcileQobuzPlaylistsAfterDelete(
+                    playlistId,
+                    attempt + 1
+                );
+            });
+        },
+        delays[attempt]
+    );
+}
+
+function closeQobuzPlaylistModal(modal) {
+    if (
+        modal &&
+        modal.parentNode
+    ) {
+        modal.parentNode.removeChild(
+            modal
+        );
+    }
+}
+
+function showCreateQobuzPlaylistModal(options) {
+    options = options || {};
+
+    var mode =
+        options.mode ||
+        "empty";
+
+    if (
+        mode === "rename" &&
+        options.editable !== true
+    ) {
+        showQueueActionToast(
+            "This Qobuz playlist cannot be renamed",
+            true
+        );
+        return;
+    }
+
+    var existing =
+        document.getElementById(
+            "qobuzPlaylistModal"
+        );
+
+    if (existing) {
+        closeQobuzPlaylistModal(
+            existing
+        );
+    }
+
+    var modal =
+        document.createElement("div");
+
+    modal.id =
+        "qobuzPlaylistModal";
+
+    modal.className =
+        "tidalPlaylistModal";
+
+    modal.setAttribute(
+        "role",
+        "dialog"
+    );
+
+    modal.setAttribute(
+        "aria-modal",
+        "true"
+    );
+
+    var card =
+        document.createElement("div");
+
+    card.className =
+        "tidalPlaylistCard";
+
+    var title =
+        document.createElement("div");
+
+    title.className =
+        "tidalPlaylistTitle";
+
+    title.textContent =
+        options.title ||
+        "Create Playlist";
+
+    var body =
+        document.createElement("div");
+
+    body.className =
+        "tidalPlaylistBody";
+
+    var nameInput =
+        document.createElement("input");
+
+    nameInput.className =
+        "tidalPlaylistInput";
+
+    nameInput.type =
+        "text";
+
+    nameInput.placeholder =
+        "Playlist name";
+
+    nameInput.value =
+        options.defaultName ||
+        "";
+
+    var descInput =
+        document.createElement("textarea");
+
+    descInput.className =
+        "tidalPlaylistInput tidalPlaylistTextarea";
+
+    descInput.placeholder =
+        "Description";
+
+    descInput.value =
+        options.defaultDescription ||
+        "";
+
+    if (
+        options.hideDescription
+    ) {
+        descInput.classList.add(
+            "hidden"
+        );
+    }
+
+    var status =
+        document.createElement("div");
+
+    status.className =
+        "tidalPlaylistStatus";
+
+    var actions =
+        document.createElement("div");
+
+    actions.className =
+        "tidalPlaylistActions";
+
+    var cancelBtn =
+        document.createElement("button");
+
+    cancelBtn.className =
+        "settingsBtn";
+
+    cancelBtn.type =
+        "button";
+
+    cancelBtn.textContent =
+        "Cancel";
+
+    var createBtn =
+        document.createElement("button");
+
+    createBtn.className =
+        "settingsBtn settingsBtnPrimary";
+
+    createBtn.type =
+        "button";
+
+    createBtn.textContent =
+        options.submitLabel ||
+        "Create";
+
+    function setBusy(busy) {
+        createBtn.disabled =
+            busy;
+
+        cancelBtn.disabled =
+            busy;
+
+        nameInput.disabled =
+            busy;
+
+        descInput.disabled =
+            busy;
+
+        createBtn.textContent =
+            busy
+                ? (
+                    options.busyLabel ||
+                    "Creating..."
+                )
+                : (
+                    options.submitLabel ||
+                    "Create"
+                );
+    }
+
+    function submit() {
+        var name =
+            nameInput.value.trim();
+
+        var description =
+            descInput.value.trim();
+
+        if (!name) {
+            status.textContent =
+                "Enter a playlist name.";
+
+            status.className =
+                "tidalPlaylistStatus error";
+
+            nameInput.focus();
+            return;
+        }
+
+        setBusy(true);
+
+        status.textContent =
+            "";
+
+        status.className =
+            "tidalPlaylistStatus";
+
+        var request;
+
+        if (
+            mode === "rename"
+        ) {
+            request =
+                postRenameQobuzPlaylist(
+                    options.playlistId,
+                    name
+                );
+        } else {
+            request =
+                postCreateQobuzPlaylist(
+                    name,
+                    description
+                );
+        }
+
+        request
+        .then(function(data) {
+            if (
+                mode === "rename"
+            ) {
+                if (
+                    !data ||
+                    data.ok !== true ||
+                    data.confirmed !== true
+                ) {
+                    throw new Error(
+                        (
+                            data &&
+                            (
+                                data.message ||
+                                data.error
+                            )
+                        ) ||
+                        "Could not rename playlist"
+                    );
+                }
+
+                var renamedName =
+                    String(
+                        data.name ||
+                        name
+                    ).trim() ||
+                    name;
+
+                updateQobuzPlaylistNameInUi(
+                    options.playlistId,
+                    renamedName
+                );
+
+                closeQobuzPlaylistModal(
+                    modal
+                );
+
+                showQueueActionToast(
+                    "Playlist renamed",
+                    false
+                );
+
+                if (
+                    typeof options.onSuccess
+                    === "function"
+                ) {
+                    options.onSuccess(
+                        data
+                    );
+                }
+
+                return;
+            }
+
+            if (
+                !data ||
+                data.ok !== true ||
+                !data.playlist
+            ) {
+                throw new Error(
+                    (
+                        data &&
+                        (
+                            data.message ||
+                            data.error
+                        )
+                    ) ||
+                    "Could not create playlist"
+                );
+            }
+
+            var created =
+                upsertQobuzPlaylistLocal(
+                    data.playlist
+                );
+
+            closeQobuzPlaylistModal(
+                modal
+            );
+
+            if (
+                currentPlaylistsProvider
+                === "qobuz"
+            ) {
+                renderPlaylistsList(
+                    qobuzPlaylists
+                );
+            }
+
+            showQueueActionToast(
+                "Qobuz playlist created",
+                false
+            );
+
+            reconcileQobuzPlaylistsAfterCreate(
+                created.id,
+                0
+            );
+
+            if (
+                typeof options.onSuccess
+                === "function"
+            ) {
+                options.onSuccess(
+                    data
+                );
+            }
+        })
+        .catch(function(err) {
+            setBusy(false);
+
+            status.textContent =
+                err &&
+                err.message
+                    ? err.message
+                    : (
+                        mode === "rename"
+                            ? "Could not rename playlist."
+                            : "Could not create playlist."
+                    );
+
+            status.className =
+                "tidalPlaylistStatus error";
+        });
+    }
+
+    cancelBtn.onclick =
+        function() {
+            closeQobuzPlaylistModal(
+                modal
+            );
+        };
+
+    createBtn.onclick =
+        submit;
+
+    nameInput.onkeydown =
+        function(event) {
+            if (
+                event.key === "Enter"
+            ) {
+                submit();
+            }
+        };
+
+    modal.addEventListener(
+        "click",
+        function(event) {
+            if (
+                event.target ===
+                modal
+            ) {
+                closeQobuzPlaylistModal(
+                    modal
+                );
+            }
+        }
+    );
+
+    body.appendChild(
+        nameInput
+    );
+
+    if (
+        !options.hideDescription
+    ) {
+        body.appendChild(
+            descInput
+        );
+    }
+
+    body.appendChild(
+        status
+    );
+
+    actions.appendChild(
+        cancelBtn
+    );
+
+    actions.appendChild(
+        createBtn
+    );
+
+    card.appendChild(
+        title
+    );
+
+    card.appendChild(
+        body
+    );
+
+    card.appendChild(
+        actions
+    );
+
+    modal.appendChild(
+        card
+    );
+
+    document.body.appendChild(
+        modal
+    );
+
+    setTimeout(
+        function() {
+            nameInput.focus();
+        },
+        0
+    );
 }
 
 function fetchTidalPlaylistsForPicker(retryCount) {
@@ -11720,6 +25909,278 @@ function showAddToTidalPlaylistModal(trackIds, options) {
         });
 }
 
+
+function showDeleteQobuzPlaylistModal(
+    playlist
+) {
+    playlist = playlist || {};
+
+    var playlistId =
+        String(
+            playlist.id || ""
+        ).trim();
+
+    if (!playlistId) {
+        showQueueActionToast(
+            "No playlist id",
+            true
+        );
+        return;
+    }
+
+    if (
+        playlist.playlist_editable
+        !== true
+    ) {
+        showQueueActionToast(
+            "This Qobuz playlist cannot be deleted",
+            true
+        );
+        return;
+    }
+
+    var existing =
+        document.getElementById(
+            "qobuzPlaylistModal"
+        );
+
+    if (existing) {
+        closeQobuzPlaylistModal(
+            existing
+        );
+    }
+
+    var modal =
+        document.createElement(
+            "div"
+        );
+
+    modal.id =
+        "qobuzPlaylistModal";
+
+    modal.className =
+        "tidalPlaylistModal";
+
+    modal.setAttribute(
+        "role",
+        "dialog"
+    );
+
+    modal.setAttribute(
+        "aria-modal",
+        "true"
+    );
+
+    var card =
+        document.createElement(
+            "div"
+        );
+
+    card.className =
+        "tidalPlaylistCard tidalPlaylistDeleteCard";
+
+    var title =
+        document.createElement(
+            "div"
+        );
+
+    title.className =
+        "tidalPlaylistTitle";
+
+    title.textContent =
+        qobuzPlaylistModalPresentationTitle(
+            "Delete Playlist"
+        );
+
+    var message =
+        document.createElement(
+            "div"
+        );
+
+    message.className =
+        "tidalPlaylistDeleteMessage";
+
+    message.textContent =
+        'This deletes "' +
+        (
+            playlist.name ||
+            "this playlist"
+        ) +
+        '" from your Qobuz account.';
+
+    var status =
+        document.createElement(
+            "div"
+        );
+
+    status.className =
+        "tidalPlaylistStatus";
+
+    var actions =
+        document.createElement(
+            "div"
+        );
+
+    actions.className =
+        "tidalPlaylistActions";
+
+    var cancelBtn =
+        document.createElement(
+            "button"
+        );
+
+    cancelBtn.className =
+        "settingsBtn";
+
+    cancelBtn.type =
+        "button";
+
+    cancelBtn.textContent =
+        "Cancel";
+
+    var deleteBtn =
+        document.createElement(
+            "button"
+        );
+
+    deleteBtn.className =
+        "settingsBtn tidalPlaylistDangerBtn";
+
+    deleteBtn.type =
+        "button";
+
+    deleteBtn.textContent =
+        "DELETE PLAYLIST";
+
+    function setBusy(busy) {
+        cancelBtn.disabled =
+            busy;
+
+        deleteBtn.disabled =
+            busy;
+
+        deleteBtn.textContent =
+            busy
+                ? "Deleting..."
+                : "DELETE PLAYLIST";
+    }
+
+    deleteBtn.onclick =
+        function() {
+            setBusy(true);
+
+            status.textContent =
+                "Deleting playlist...";
+
+            status.className =
+                "tidalPlaylistStatus";
+
+            postDeleteQobuzPlaylist(
+                playlistId
+            )
+            .then(function(data) {
+                if (
+                    !data ||
+                    data.ok !== true
+                ) {
+                    throw new Error(
+                        (
+                            data &&
+                            (
+                                data.message ||
+                                data.error
+                            )
+                        ) ||
+                        "Could not delete playlist"
+                    );
+                }
+
+                removeQobuzPlaylistLocal(
+                    playlistId
+                );
+
+                closeQobuzPlaylistModal(
+                    modal
+                );
+
+                showQueueActionToast(
+                    "Qobuz playlist deleted",
+                    false
+                );
+
+                reconcileQobuzPlaylistsAfterDelete(
+                    playlistId,
+                    0
+                );
+            })
+            .catch(function(err) {
+                setBusy(false);
+
+                status.textContent =
+                    err &&
+                    err.message
+                        ? err.message
+                        : "Could not delete playlist.";
+
+                status.className =
+                    "tidalPlaylistStatus error";
+            });
+        };
+
+    cancelBtn.onclick =
+        function() {
+            closeQobuzPlaylistModal(
+                modal
+            );
+        };
+
+    modal.addEventListener(
+        "click",
+        function(event) {
+            if (
+                event.target
+                === modal
+            ) {
+                closeQobuzPlaylistModal(
+                    modal
+                );
+            }
+        }
+    );
+
+    actions.appendChild(
+        cancelBtn
+    );
+
+    actions.appendChild(
+        deleteBtn
+    );
+
+    card.appendChild(
+        title
+    );
+
+    card.appendChild(
+        message
+    );
+
+    card.appendChild(
+        status
+    );
+
+    card.appendChild(
+        actions
+    );
+
+    modal.appendChild(
+        card
+    );
+
+    document.body.appendChild(
+        modal
+    );
+}
+
 function showDeleteTidalPlaylistModal(playlist) {
     playlist = playlist || {};
     var playlistId = String(playlist.id || "").trim();
@@ -11902,29 +26363,354 @@ function showRemoveFromTidalPlaylistModal(track, rowEl) {
     document.body.appendChild(modal);
 }
 
+function showRemoveFromQobuzPlaylistModal(
+    track,
+    rowEl
+) {
+    track = track || {};
+
+    var playlistId =
+        currentContext
+            ? String(
+                currentContext.id || ""
+            ).trim()
+            : "";
+
+    var normalized =
+        normalizeQobuzPlaylistRemoveTracks(
+            [track]
+        );
+
+    if (
+        !playlistId ||
+        normalized.length !== 1
+    ) {
+        showQueueActionToast(
+            "No valid Qobuz playlist occurrence",
+            true
+        );
+        return;
+    }
+
+    var playlistSeed = {
+        id:
+            playlistId,
+        name:
+            currentContext
+                ? (
+                    currentContext.title ||
+                    ""
+                )
+                : "",
+        image_url:
+            currentContext
+                ? (
+                    currentContext.cover ||
+                    ""
+                )
+                : ""
+    };
+
+    var returnView =
+        previousView ||
+        "playlists";
+
+    var existing =
+        document.getElementById(
+            "qobuzPlaylistModal"
+        );
+
+    if (existing) {
+        closeQobuzPlaylistModal(
+            existing
+        );
+    }
+
+    var modal =
+        document.createElement(
+            "div"
+        );
+
+    modal.id =
+        "qobuzPlaylistModal";
+
+    modal.className =
+        "tidalPlaylistModal";
+
+    modal.setAttribute(
+        "role",
+        "dialog"
+    );
+
+    modal.setAttribute(
+        "aria-modal",
+        "true"
+    );
+
+    var card =
+        document.createElement(
+            "div"
+        );
+
+    card.className =
+        "tidalPlaylistCard tidalPlaylistDeleteCard";
+
+    var title =
+        document.createElement(
+            "div"
+        );
+
+    title.className =
+        "tidalPlaylistTitle";
+
+    title.textContent =
+        "Remove Track";
+
+    var message =
+        document.createElement(
+            "div"
+        );
+
+    message.className =
+        "tidalPlaylistDeleteMessage";
+
+    message.textContent =
+        'Remove "' +
+        (
+            track.title ||
+            "this song"
+        ) +
+        '" from this Qobuz playlist? ' +
+        "This does not delete the song from Qobuz or your account.";
+
+    var status =
+        document.createElement(
+            "div"
+        );
+
+    status.className =
+        "tidalPlaylistStatus";
+
+    var actions =
+        document.createElement(
+            "div"
+        );
+
+    actions.className =
+        "tidalPlaylistActions";
+
+    var cancelBtn =
+        document.createElement(
+            "button"
+        );
+
+    cancelBtn.className =
+        "settingsBtn";
+
+    cancelBtn.type =
+        "button";
+
+    cancelBtn.textContent =
+        "Cancel";
+
+    var removeBtn =
+        document.createElement(
+            "button"
+        );
+
+    removeBtn.className =
+        "settingsBtn tidalPlaylistDangerBtn";
+
+    removeBtn.type =
+        "button";
+
+    removeBtn.textContent =
+        "REMOVE FROM PLAYLIST";
+
+    function setBusy(busy) {
+        cancelBtn.disabled =
+            busy;
+
+        removeBtn.disabled =
+            busy;
+
+        removeBtn.textContent =
+            busy
+                ? "Removing..."
+                : "REMOVE FROM PLAYLIST";
+    }
+
+    removeBtn.onclick =
+        function() {
+            setBusy(true);
+
+            status.textContent =
+                "Removing track...";
+
+            status.className =
+                "tidalPlaylistStatus";
+
+            postRemoveTracksFromQobuzPlaylist(
+                playlistId,
+                [track]
+            )
+            .then(function(data) {
+                if (
+                    !data ||
+                    data.ok !== true ||
+                    data.confirmed !== true
+                ) {
+                    throw new Error(
+                        (
+                            data &&
+                            (
+                                data.message ||
+                                data.error
+                            )
+                        ) ||
+                        "Could not remove track"
+                    );
+                }
+
+                if (
+                    data.total_after
+                    != null
+                ) {
+                    updateQobuzPlaylistTrackCountLocal(
+                        playlistId,
+                        data.total_after
+                    );
+                }
+
+                closeQobuzPlaylistModal(
+                    modal
+                );
+
+                showQueueActionToast(
+                    "Removed from playlist",
+                    false
+                );
+
+                if (
+                    rowEl &&
+                    rowEl.parentNode
+                ) {
+                    rowEl.parentNode.removeChild(
+                        rowEl
+                    );
+                }
+
+                // Q8E duplicate semantics may remove more than the clicked
+                // occurrence, so refresh from the complete provider truth.
+                loadStreamingPlaylistDetail(
+                    "qobuz",
+                    playlistSeed,
+                    returnView
+                );
+            })
+            .catch(function(err) {
+                setBusy(false);
+
+                status.textContent =
+                    err &&
+                    err.message
+                        ? err.message
+                        : "Could not remove track.";
+
+                status.className =
+                    "tidalPlaylistStatus error";
+            });
+        };
+
+    cancelBtn.onclick =
+        function() {
+            closeQobuzPlaylistModal(
+                modal
+            );
+        };
+
+    modal.addEventListener(
+        "click",
+        function(event) {
+            if (
+                event.target ===
+                modal
+            ) {
+                closeQobuzPlaylistModal(
+                    modal
+                );
+            }
+        }
+    );
+
+    actions.appendChild(
+        cancelBtn
+    );
+
+    actions.appendChild(
+        removeBtn
+    );
+
+    card.appendChild(
+        title
+    );
+
+    card.appendChild(
+        message
+    );
+
+    card.appendChild(
+        status
+    );
+
+    card.appendChild(
+        actions
+    );
+
+    modal.appendChild(
+        card
+    );
+
+    document.body.appendChild(
+        modal
+    );
+}
+
+
 var tidalLibraryUiGeneration = 0;
 var allPlaylists = [];
 var MY_PLAYLISTS_RETRY_MS = 1500;
 var MY_PLAYLISTS_MAX_RETRIES = 120;
 
 function loadMyPlaylists(retryCount, libraryGeneration) {
+    if (typeof currentPlaylistsProvider !== "undefined" && currentPlaylistsProvider !== "tidal") { return; }
     retryCount = retryCount || 0;
     if (libraryGeneration === undefined) {
         libraryGeneration = tidalLibraryUiGeneration;
     }
-    playlistsContent.innerHTML = '<div class="playlistsLoading">Loading playlists...</div>';
+    if (retryCount === 0) {
+        renderPlaylistsState(
+            playlistsContent,
+            "loading",
+            "Loading Playlists…"
+        );
+    }
     fetch("/tidal/myplaylists")
         .then(function(res) { return res.json(); })
         .then(function(playlists) {
             if (libraryGeneration !== tidalLibraryUiGeneration) { return; }
+            if (typeof currentPlaylistsProvider !== "undefined" && currentPlaylistsProvider !== "tidal") { return; }
             if (!playlists || playlists.length === 0) {
                 if (retryCount < MY_PLAYLISTS_MAX_RETRIES) {
-                    playlistsContent.innerHTML = '<div class="playlistsLoading">Fetching from Tidal (' + (retryCount + 1) + '/' + MY_PLAYLISTS_MAX_RETRIES + ')...</div>';
                     setTimeout(function() {
                         loadMyPlaylists(retryCount + 1, libraryGeneration);
                     }, MY_PLAYLISTS_RETRY_MS);
                 } else {
-                    playlistsContent.innerHTML = '<div class="playlistsLoading">No playlists found.</div>';
+                    renderPlaylistsState(
+                        playlistsContent,
+                        "empty",
+                        "No playlists found."
+                    );
                 }
                 return;
             }
@@ -11934,17 +26720,42 @@ function loadMyPlaylists(retryCount, libraryGeneration) {
         })
         .catch(function(e) {
             console.error("loadMyPlaylists failed:", e);
-            playlistsContent.innerHTML = '<div class="playlistsLoading">Could not load playlists.</div>';
+            renderPlaylistsState(
+                playlistsContent,
+                "error",
+                "Could not load playlists."
+            );
         });
 }
 
 function onPlaylistFilter(e) {
-    var q = e.target.value.trim().toLowerCase();
-    if (!q) { renderPlaylistRows(_sortPlaylists(allPlaylists)); return; }
-    var filtered = allPlaylists.filter(function(p) {
-        return (p.name || "").toLowerCase().indexOf(q) !== -1;
-    });
-    renderPlaylistRows(_sortPlaylists(filtered));
+    var q =
+        e.target.value
+            .trim()
+            .toLowerCase();
+
+    var active =
+        activePlaylistsArray();
+
+    if (!q) {
+        renderPlaylistRows(
+            _sortPlaylists(active)
+        );
+        return;
+    }
+
+    var filtered =
+        active.filter(function(p) {
+            return (
+                p.name || ""
+            )
+            .toLowerCase()
+            .indexOf(q) !== -1;
+        });
+
+    renderPlaylistRows(
+        _sortPlaylists(filtered)
+    );
 }
 
 var _plSortKey = "name";   // name | tracks | last_updated | created_at
@@ -11978,137 +26789,428 @@ function _sortPlaylists(playlists) {
 }
 
 function renderPlaylistsList(playlists) {
+    playlists =
+        Array.isArray(playlists)
+            ? playlists
+            : [];
+
+    var provider =
+        currentPlaylistsProvider === "qobuz"
+            ? "qobuz"
+            : "tidal";
+
     playlistsContent.innerHTML = "";
 
-    var header = document.createElement("div");
-    header.className = "playlistsHeader";
+    var header =
+        document.createElement("div");
 
-    var headingGroup = document.createElement("div");
-    headingGroup.className = "playlistsHeadingGroup";
+    header.className =
+        "playlistsHeader";
 
-    var h = document.createElement("h2");
-    h.textContent = "My Playlists";
+    var headingGroup =
+        document.createElement("div");
 
-    var count = document.createElement("span");
-    count.className   = "playlistsCount";
-    count.textContent = playlists.length + " playlists";
+    headingGroup.className =
+        "playlistsHeadingGroup";
 
-    var createBtn = document.createElement("button");
-    createBtn.className = "playlistsCreateBtn";
-    createBtn.type = "button";
-    createBtn.innerHTML = '<span class="material-icons">add</span><span>Create Playlist</span>';
-    createBtn.onclick = function() {
-        showCreateTidalPlaylistModal({
-            title: "Create Playlist",
-            submitLabel: "Create"
-        });
-    };
+    var h =
+        document.createElement("h2");
+
+    h.textContent =
+        "My Playlists";
+
+    var count =
+        document.createElement("span");
+
+    count.className =
+        "playlistsCount";
+
+    count.textContent =
+        playlists.length +
+        " playlists";
 
     headingGroup.appendChild(h);
     headingGroup.appendChild(count);
     header.appendChild(headingGroup);
-    header.appendChild(createBtn);
-    playlistsContent.appendChild(header);
 
-    // Sort controls
-    var sortBar = document.createElement("div");
-    sortBar.className = "playlistsSortBar";
+    if (provider === "tidal") {
+        var createBtn =
+            document.createElement("button");
 
-    var sortLabel = document.createElement("span");
-    sortLabel.className   = "playlistsSortLabel";
-    sortLabel.textContent = "Sort:";
+        createBtn.className =
+            "playlistsCreateBtn";
+
+        createBtn.type = "button";
+
+        createBtn.innerHTML =
+            '<span class="material-icons">add</span>' +
+            '<span>Create Playlist</span>';
+
+        createBtn.onclick = function() {
+            showCreateTidalPlaylistModal({
+                title: tidalPlaylistModalPresentationTitle(
+                    "Create Playlist"
+                ),
+                submitLabel: "Create"
+            });
+        };
+
+        header.appendChild(
+            createBtn
+        );
+    } else {
+        var qobuzCreateBtn =
+            document.createElement("button");
+
+        qobuzCreateBtn.className =
+            "playlistsCreateBtn";
+
+        qobuzCreateBtn.type =
+            "button";
+
+        qobuzCreateBtn.innerHTML =
+            '<span class="material-icons">add</span>' +
+            '<span>Create Playlist</span>';
+
+        qobuzCreateBtn.onclick =
+            function() {
+                showCreateQobuzPlaylistModal({
+                    title:
+                        qobuzPlaylistModalPresentationTitle(
+                            "Create Playlist"
+                        ),
+                    submitLabel:
+                        "Create"
+                });
+            };
+
+        header.appendChild(
+            qobuzCreateBtn
+        );
+    }
+
+    playlistsContent.appendChild(
+        header
+    );
+
+    var providerBar =
+        buildPlaylistsProviderBar();
+
+    if (providerBar) {
+        playlistsContent.appendChild(
+            providerBar
+        );
+    }
+
+    var sortBar =
+        document.createElement("div");
+
+    sortBar.className =
+        "playlistsSortBar";
+
+    var sortLabel =
+        document.createElement("span");
+
+    sortLabel.className =
+        "playlistsSortLabel";
+
+    sortLabel.textContent =
+        "Sort:";
+
     sortBar.appendChild(sortLabel);
 
-    var sortKeys = [
-        { key: "name",         label: "Name"         },
-        { key: "tracks",       label: "Tracks"       },
-        { key: "last_updated", label: "Last Updated" },
-        { key: "created_at",   label: "Created"      }
-    ];
+    var sortKeys =
+        provider === "qobuz"
+            ? [
+                {
+                    key: "name",
+                    label: "Name"
+                },
+                {
+                    key: "tracks",
+                    label: "Tracks"
+                }
+            ]
+            : [
+                {
+                    key: "name",
+                    label: "Name"
+                },
+                {
+                    key: "tracks",
+                    label: "Tracks"
+                },
+                {
+                    key: "last_updated",
+                    label: "Last Updated"
+                },
+                {
+                    key: "created_at",
+                    label: "Created"
+                }
+            ];
+
+    if (
+        !sortKeys.some(function(sk) {
+            return sk.key === _plSortKey;
+        })
+    ) {
+        _plSortKey = "name";
+        _plSortAsc = true;
+    }
 
     sortKeys.forEach(function(sk) {
-        var btn = document.createElement("button");
-        btn.className = "playlistsSortBtn" + (_plSortKey === sk.key ? " active" : "");
-        var arrow = _plSortKey === sk.key ? (_plSortAsc ? " \u2191" : " \u2193") : "";
-        btn.textContent = sk.label + arrow;
+        var btn =
+            document.createElement("button");
+
+        btn.type = "button";
+
+        btn.className =
+            "playlistsSortBtn" +
+            (
+                _plSortKey === sk.key
+                    ? " active"
+                    : ""
+            );
+
+        var arrow =
+            _plSortKey === sk.key
+                ? (
+                    _plSortAsc
+                        ? " \u2191"
+                        : " \u2193"
+                )
+                : "";
+
+        btn.textContent =
+            sk.label + arrow;
+
         (function(k) {
             btn.onclick = function() {
                 if (_plSortKey === k) {
-                    _plSortAsc = !_plSortAsc;
+                    _plSortAsc =
+                        !_plSortAsc;
                 } else {
                     _plSortKey = k;
-                    _plSortAsc = (k === "name");
+                    _plSortAsc =
+                        k === "name";
                 }
-                renderPlaylistsList(allPlaylists);
+
+                renderPlaylistsList(
+                    activePlaylistsArray()
+                );
             };
         }(sk.key));
+
         sortBar.appendChild(btn);
     });
-    var filterWrap = document.createElement("div");
-    filterWrap.className = "playlistsFilterWrap";
 
-    var filterInput = document.createElement("input");
-    filterInput.id          = "playlistsFilter";
-    filterInput.type        = "text";
-    filterInput.placeholder = "Filter playlists...";
-    filterInput.className   = "playlistsFilterInput";
-    filterInput.oninput     = onPlaylistFilter;
+    var filterWrap =
+        document.createElement("div");
 
-    filterWrap.appendChild(filterInput);
-    sortBar.appendChild(filterWrap);
-    playlistsContent.appendChild(sortBar);
+    filterWrap.className =
+        "playlistsFilterWrap";
 
-    var list = document.createElement("div");
-    list.id        = "playlistsList";
-    list.className = "playlistList";
-    playlistsContent.appendChild(list);
+    var filterInput =
+        document.createElement("input");
 
-    renderPlaylistRows(_sortPlaylists(playlists));
+    filterInput.id =
+        "playlistsFilter";
+
+    filterInput.type =
+        "text";
+
+    filterInput.placeholder =
+        "Filter playlists...";
+
+    filterInput.className =
+        "playlistsFilterInput";
+
+    filterInput.oninput =
+        onPlaylistFilter;
+
+    filterWrap.appendChild(
+        filterInput
+    );
+
+    sortBar.appendChild(
+        filterWrap
+    );
+
+    playlistsContent.appendChild(
+        sortBar
+    );
+
+    var list =
+        document.createElement("div");
+
+    list.id =
+        "playlistsList";
+
+    list.className =
+        "playlistList";
+
+    playlistsContent.appendChild(
+        list
+    );
+
+    renderPlaylistRows(
+        _sortPlaylists(playlists)
+    );
 }
 
 function renderPlaylistRows(playlists) {
-    var list = document.getElementById("playlistsList");
+    var list =
+        document.getElementById(
+            "playlistsList"
+        );
+
     if (!list) { return; }
+
+    var provider =
+        currentPlaylistsProvider === "qobuz"
+            ? "qobuz"
+            : "tidal";
+
+    playlists =
+        Array.isArray(playlists)
+            ? playlists.slice()
+            : [];
+
+    if (
+        provider === "qobuz"
+    ) {
+        playlists =
+            playlists.filter(
+                function(item) {
+                    return !isQobuzPlaylistDeleteTombstoned(
+                        (
+                            item ||
+                            {}
+                        ).id
+                    );
+                }
+            );
+    }
+
     list.innerHTML = "";
-    if (playlists.length === 0) {
-        list.innerHTML = '<div class="playlistsLoading">No matching playlists.</div>';
+
+    if (!playlists.length) {
+        renderPlaylistsState(
+            list,
+            "filter-empty",
+            "No matching playlists."
+        );
         return;
     }
+
     playlists.forEach(function(item) {
-        var row = document.createElement("div");
-        row.className = "playlistRow";
+        item = item || {};
+
+        var row =
+            document.createElement("div");
+
+        row.className =
+            "playlistRow";
+
         row.setAttribute(
             "data-playlist-id",
             String(item.id || "")
         );
+
+        row.setAttribute(
+            "data-playlist-provider",
+            provider
+        );
+
         row.innerHTML =
-            '<img src="' + (item.image_url || "") + '" class="playlistThumb">' +
+            '<img src="' +
+                (
+                    item.image_url ||
+                    SROVA_ARTWORK_PLACEHOLDER_SRC
+                ) +
+                '" class="playlistThumb">' +
             '<div class="playlistMeta">' +
-                '<div class="playlistName">'  + (item.name      || "") + '</div>' +
-                '<div class="playlistSub">'   + (item.sub_title || "") + '</div>' +
-            '</div>' +
-            '<button type="button" class="playlistDeleteBtn" title="Delete playlist" aria-label="Delete playlist">' +
-                '<span class="material-icons">delete</span>' +
-            '</button>';
-        if (item.id) {
-            (function(it) {
-                var deleteBtn = row.querySelector(".playlistDeleteBtn");
-                if (deleteBtn) {
-                    deleteBtn.onclick = function(e) {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        showDeleteTidalPlaylistModal(it);
-                    };
-                }
-                row.onclick = function() {
-                    loadTrackList(
-                        { id: it.id, cover: it.image_url, title: it.name, artist: it.sub_title || "" },
-                        "/tidal/playlist/" + it.id,
-                        "playlists"
+                '<div class="playlistName">' +
+                    (item.name || "") +
+                '</div>' +
+                '<div class="playlistSub">' +
+                    (item.sub_title || "") +
+                '</div>' +
+            '</div>';
+
+        setupArtworkFallback(
+            row.querySelector(".playlistThumb")
+        );
+
+        var canDelete =
+            item.playlist_editable
+            === true;
+
+        if (
+            canDelete &&
+            (
+                provider === "tidal" ||
+                provider === "qobuz"
+            )
+        ) {
+            var deleteBtn =
+                document.createElement(
+                    "button"
+                );
+
+            deleteBtn.type =
+                "button";
+
+            deleteBtn.className =
+                "playlistDeleteBtn";
+
+            deleteBtn.title =
+                "Delete playlist";
+
+            deleteBtn.setAttribute(
+                "aria-label",
+                "Delete playlist"
+            );
+
+            deleteBtn.innerHTML =
+                '<span class="material-icons">' +
+                'delete</span>';
+
+            deleteBtn.onclick =
+                function(e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+
+                    if (
+                        provider ===
+                        "qobuz"
+                    ) {
+                        showDeleteQobuzPlaylistModal(
+                            item
+                        );
+                        return;
+                    }
+
+                    showDeleteTidalPlaylistModal(
+                        item
                     );
                 };
-            }(item));
+
+            row.appendChild(
+                deleteBtn
+            );
         }
+
+        if (item.id) {
+            row.onclick = function() {
+                loadStreamingPlaylistDetail(
+                    provider,
+                    item
+                );
+            };
+        }
+
         list.appendChild(row);
     });
 }
@@ -12134,6 +27236,7 @@ function onSearchInput(e) {
         searchClear.classList.remove("hidden");
     }
     clearTimeout(searchTimer);
+    globalSearchRequestSerial += 1;
     if (!q) { return; }
     searchTimer = setTimeout(function() { doSearch(q); }, 400);
 }
@@ -12141,6 +27244,7 @@ function onSearchInput(e) {
 function onSearchKey(e) { if (e.key === "Escape") { clearSearch(); } }
 
 function clearSearch() {
+    globalSearchRequestSerial += 1;
     searchInput.value = "";
     searchClear.classList.add("hidden");
     showView("home");
@@ -12148,184 +27252,1025 @@ function clearSearch() {
 
 function doSearch(query, opts) {
     opts = opts || {};
+
+    query = String(
+        query || ""
+    ).trim();
+
+    if (!query) {
+        globalSearchRequestSerial += 1;
+        return;
+    }
+
     if (!globalSearchHasReadySource()) {
         setGlobalSearchVisible(true);
         showView("home");
         return;
     }
-    lastSearchQuery = String(query || "").trim();
-    showView("search");
-    if (!opts.restore) { currentSearchTab = "top"; }
-    searchResults.innerHTML = '<div class="searchLoading">Searching SROVA...</div>';
-    var encoded = encodeURIComponent(query);
-    var localRequest = globalSearchLocalReady
-        ? fetch("/api/local/library/search?q=" + encoded + "&limit=100")
-            .then(function(res) { return res.json(); })
-            .then(function(data) { return { ok: true, data: data || {} }; })
-            .catch(function() { return { ok: false, data: {} }; })
-        : Promise.resolve({ok: true, data: {}});
-    var tidalRequest = globalSearchTidalReady
-        ? fetchWithTimeout("/tidal/search?q=" + encoded + "&limit=" + TIDAL_SEARCH_LIMIT, {}, 4500)
-            .then(function(res) { return res.json(); })
-            .then(function(data) { return { ok: true, data: data || {} }; })
-            .catch(function() { return { ok: false, data: {} }; })
-        : Promise.resolve({ok: true, data: {}});
 
-    Promise.all([localRequest, tidalRequest]).then(function(parts) {
+    var requestSerial =
+        ++globalSearchRequestSerial;
+
+    lastSearchQuery = query;
+
+    showView("search");
+
+    if (!opts.restore) {
+        currentSearchTab = "top";
+    }
+
+    searchResults.innerHTML =
+        '<div class="searchLoading">' +
+        'Searching SROVA...</div>';
+
+    var encoded =
+        encodeURIComponent(
+            query
+        );
+
+    var localRequest = globalSearchLocalReady
+        ? fetch(
+            "/api/local/library/search?q=" +
+            encoded +
+            "&limit=100"
+        )
+            .then(function(res) {
+                return res.json();
+            })
+            .then(function(data) {
+                return {
+                    ok: true,
+                    searched: true,
+                    data: data || {}
+                };
+            })
+            .catch(function() {
+                return {
+                    ok: false,
+                    searched: true,
+                    data: {}
+                };
+            })
+        : Promise.resolve({
+            ok: true,
+            searched: false,
+            data: {}
+        });
+
+    var tidalRequest = globalSearchTidalReady
+        ? fetchWithTimeout(
+            "/tidal/search?q=" +
+            encoded +
+            "&limit=" +
+            TIDAL_SEARCH_LIMIT,
+            {},
+            4500
+        )
+            .then(function(res) {
+                if (!res.ok) {
+                    throw new Error(
+                        "TIDAL search unavailable"
+                    );
+                }
+
+                return res.json();
+            })
+            .then(function(data) {
+                data = data || {};
+
+                return {
+                    ok:
+                        data.ok !== false,
+                    searched: true,
+                    data: data
+                };
+            })
+            .catch(function() {
+                return {
+                    ok: false,
+                    searched: true,
+                    data: {}
+                };
+            })
+        : Promise.resolve({
+            ok: true,
+            searched: false,
+            data: {}
+        });
+
+    var qobuzRequest = globalSearchQobuzReady
+        ? fetchWithTimeout(
+            "/qobuz/catalog?" +
+            "op=search_catalog" +
+            "&q=" +
+            encoded +
+            "&limit=" +
+            encodeURIComponent(
+                String(
+                    QOBUZ_SOURCE_SEARCH_LIMIT
+                )
+            ) +
+            "&offset=0",
+            {
+                cache: "no-store"
+            },
+            4500
+        )
+            .then(function(res) {
+                if (!res.ok) {
+                    throw new Error(
+                        "Qobuz search unavailable"
+                    );
+                }
+
+                return res.json();
+            })
+            .then(function(data) {
+                data = data || {};
+
+                return {
+                    ok:
+                        data.ok === true,
+                    searched: true,
+                    data:
+                        data.ok === true
+                            ? data
+                            : {}
+                };
+            })
+            .catch(function() {
+                return {
+                    ok: false,
+                    searched: true,
+                    data: {}
+                };
+            })
+        : Promise.resolve({
+            ok: true,
+            searched: false,
+            data: {}
+        });
+
+    Promise.all([
+        localRequest,
+        tidalRequest,
+        qobuzRequest
+    ])
+    .then(function(parts) {
+        if (
+            requestSerial !==
+            globalSearchRequestSerial
+        ) {
+            return;
+        }
+
+        if (
+            String(
+                lastSearchQuery ||
+                ""
+            ).trim() !==
+            query
+        ) {
+            return;
+        }
+
         renderGlobalSearchResults({
             query: query,
             local: parts[0],
-            tidal: parts[1]
+            tidal: parts[1],
+            qobuz: parts[2]
         });
     });
 }
 
 function renderGlobalSearchResults(payload) {
     searchResults.innerHTML = "";
-    lastSearchPayload = normalizeSrovaSearchPayload(payload || {});
-    lastSearchQuery = lastSearchPayload.query || lastSearchQuery || "";
-    lastSearchTab = currentSearchTab || lastSearchTab || "top";
+
+    lastSearchPayload =
+        normalizeSrovaSearchPayload(
+            payload || {}
+        );
+
+    lastSearchQuery =
+        lastSearchPayload.query ||
+        lastSearchQuery ||
+        "";
+
+    lastSearchTab =
+        currentSearchTab ||
+        lastSearchTab ||
+        "top";
+
     persistSearchRestorePayload();
-    if (!lastSearchPayload.hasAny && lastSearchPayload.localOk && lastSearchPayload.tidalOk) {
-        searchResults.innerHTML = '<div class="searchLoading">No SROVA results found.</div>';
+
+    if (
+        !lastSearchPayload.hasAny &&
+        !lastSearchPayload.localBusy &&
+        !lastSearchPayload.localFailed &&
+        !lastSearchPayload.tidalFailed &&
+        !lastSearchPayload.qobuzFailed
+    ) {
+        searchResults.innerHTML =
+            '<div class="searchLoading">' +
+            'No SROVA results found.' +
+            '</div>';
+
         return;
     }
-    renderSrovaSearchShell(lastSearchPayload);
+
+    renderSrovaSearchShell(
+        lastSearchPayload
+    );
 }
 
 function normalizeSrovaSearchPayload(payload) {
-    var local = payload.local || { ok: false, data: {} };
-    var tidal = payload.tidal || { ok: false, data: {} };
-    var localData = local.data || {};
-    var tidalData = tidal.data || {};
+    var local =
+        payload.local || {
+            ok: false,
+            searched: false,
+            data: {}
+        };
+
+    var tidal =
+        payload.tidal || {
+            ok: false,
+            searched: false,
+            data: {}
+        };
+
+    var qobuz =
+        payload.qobuz || {
+            ok: true,
+            searched: false,
+            data: {}
+        };
+
+    var localData =
+        local.data || {};
+
+    var tidalData =
+        tidal.data || {};
+
+    var qobuzData =
+        qobuz.data || {};
+
+    var localBusy =
+        !!(
+            localData.busy ||
+            isLocalLibraryMaintenance(
+                localData
+            )
+        );
+
     var out = {
-        query: payload.query || "",
-        localOk: !!local.ok,
-        tidalOk: !!tidal.ok,
-        localBusy: !!(localData.busy || isLocalLibraryMaintenance(localData)),
-        localFailed: !local.ok,
-        tidalFailed: !tidal.ok,
+        query:
+            payload.query || "",
+
+        localOk:
+            !!local.ok,
+
+        tidalOk:
+            !!tidal.ok,
+
+        qobuzOk:
+            !!qobuz.ok,
+
+        localSearched:
+            local.searched === true,
+
+        tidalSearched:
+            tidal.searched === true,
+
+        qobuzSearched:
+            qobuz.searched === true,
+
+        localBusy:
+            localBusy,
+
+        localFailed:
+            (
+                local.searched === true &&
+                !local.ok &&
+                !localBusy
+            ),
+
+        tidalFailed:
+            (
+                tidal.searched === true &&
+                !tidal.ok
+            ),
+
+        qobuzFailed:
+            (
+                qobuz.searched === true &&
+                !qobuz.ok
+            ),
+
         tracks: [],
         albums: [],
         artists: [],
         hasAny: false
     };
 
-    if (!out.localBusy && local.ok) {
+    if (
+        !out.localBusy &&
+        local.ok
+    ) {
         var localArtistArtworkByName = {};
         var localArtistAlbumArtworkByName = {};
 
-        function rememberLocalArtistArtwork(name, item) {
-            var key = String(name || "").trim().toLowerCase();
-            if (!key) { return; }
-            item = item || {};
-            var artwork = item.cover || item.cover_url || item.artwork_url ||
-                item.image_url || item.album_art || item.album_art_url || "";
-            if (!artwork) { return; }
+        function rememberLocalArtistArtwork(
+            name,
+            item
+        ) {
+            var key =
+                String(
+                    name || ""
+                )
+                .trim()
+                .toLowerCase();
 
-            if (!localArtistArtworkByName[key]) {
-                localArtistArtworkByName[key] = artwork;
+            if (!key) {
+                return;
             }
 
-            var albumKey = String(
-                item.album || item.album_name || item.name || ""
-            ).trim().toLowerCase();
+            item =
+                item || {};
+
+            var artwork =
+                item.cover ||
+                item.cover_url ||
+                item.artwork_url ||
+                item.image_url ||
+                item.album_art ||
+                item.album_art_url ||
+                "";
+
+            if (!artwork) {
+                return;
+            }
+
+            if (
+                !localArtistArtworkByName[
+                    key
+                ]
+            ) {
+                localArtistArtworkByName[
+                    key
+                ] = artwork;
+            }
+
+            var albumKey =
+                String(
+                    item.album ||
+                    item.album_name ||
+                    item.name ||
+                    ""
+                )
+                .trim()
+                .toLowerCase();
+
             if (albumKey) {
-                if (!localArtistAlbumArtworkByName[key]) {
-                    localArtistAlbumArtworkByName[key] = {};
+                if (
+                    !localArtistAlbumArtworkByName[
+                        key
+                    ]
+                ) {
+                    localArtistAlbumArtworkByName[
+                        key
+                    ] = {};
                 }
-                if (!localArtistAlbumArtworkByName[key][albumKey]) {
-                    localArtistAlbumArtworkByName[key][albumKey] = artwork;
+
+                if (
+                    !localArtistAlbumArtworkByName[
+                        key
+                    ][
+                        albumKey
+                    ]
+                ) {
+                    localArtistAlbumArtworkByName[
+                        key
+                    ][
+                        albumKey
+                    ] = artwork;
                 }
             }
         }
 
-        (localData.albums || []).forEach(function(album) {
-            rememberLocalArtistArtwork(
-                album.album_artist || album.artist || "",
-                album
-            );
-        });
-        (localData.songs || localData.tracks || []).forEach(function(track) {
-            rememberLocalArtistArtwork(track.artist || "", track);
-            out.tracks.push(normalizeSearchTrack(track, "local"));
-        });
-        (localData.albums || []).forEach(function(album) {
-            out.albums.push(normalizeSearchAlbum(album, "local"));
-        });
-        (localData.artists || []).forEach(function(artist) {
-            var normalizedArtist = normalizeSearchArtist(artist, "local");
-            var artistKey = String(normalizedArtist.name || "").trim().toLowerCase();
-            normalizedArtist.cover = normalizedArtist.cover ||
-                localArtistArtworkByName[artistKey] || "";
-            normalizedArtist.albumArtwork =
-                localArtistAlbumArtworkByName[artistKey] || {};
-            out.artists.push(normalizedArtist);
-        });
+        (
+            localData.albums ||
+            []
+        ).forEach(
+            function(album) {
+                rememberLocalArtistArtwork(
+                    album.album_artist ||
+                    album.artist ||
+                    "",
+                    album
+                );
+            }
+        );
+
+        (
+            localData.songs ||
+            localData.tracks ||
+            []
+        ).forEach(
+            function(track) {
+                rememberLocalArtistArtwork(
+                    track.artist ||
+                    "",
+                    track
+                );
+
+                out.tracks.push(
+                    normalizeSearchTrack(
+                        track,
+                        "local"
+                    )
+                );
+            }
+        );
+
+        (
+            localData.albums ||
+            []
+        ).forEach(
+            function(album) {
+                out.albums.push(
+                    normalizeSearchAlbum(
+                        album,
+                        "local"
+                    )
+                );
+            }
+        );
+
+        (
+            localData.artists ||
+            []
+        ).forEach(
+            function(artist) {
+                var normalizedArtist =
+                    normalizeSearchArtist(
+                        artist,
+                        "local"
+                    );
+
+                var artistKey =
+                    String(
+                        normalizedArtist.name ||
+                        ""
+                    )
+                    .trim()
+                    .toLowerCase();
+
+                normalizedArtist.cover =
+                    normalizedArtist.cover ||
+                    localArtistArtworkByName[
+                        artistKey
+                    ] ||
+                    "";
+
+                normalizedArtist.albumArtwork =
+                    localArtistAlbumArtworkByName[
+                        artistKey
+                    ] ||
+                    {};
+
+                out.artists.push(
+                    normalizedArtist
+                );
+            }
+        );
     }
+
     if (tidal.ok) {
-        (tidalData.tracks || []).forEach(function(track) {
-            out.tracks.push(normalizeSearchTrack(track, "tidal"));
-        });
-        (tidalData.albums || []).forEach(function(album) {
-            out.albums.push(normalizeSearchAlbum(album, "tidal"));
-        });
-        (tidalData.artists || []).forEach(function(artist) {
-            out.artists.push(normalizeSearchArtist(artist, "tidal"));
-        });
+        (
+            tidalData.tracks ||
+            []
+        ).forEach(
+            function(track) {
+                out.tracks.push(
+                    normalizeSearchTrack(
+                        track,
+                        "tidal"
+                    )
+                );
+            }
+        );
+
+        (
+            tidalData.albums ||
+            []
+        ).forEach(
+            function(album) {
+                out.albums.push(
+                    normalizeSearchAlbum(
+                        album,
+                        "tidal"
+                    )
+                );
+            }
+        );
+
+        (
+            tidalData.artists ||
+            []
+        ).forEach(
+            function(artist) {
+                out.artists.push(
+                    normalizeSearchArtist(
+                        artist,
+                        "tidal"
+                    )
+                );
+            }
+        );
     }
-    out.hasAny = !!(out.tracks.length || out.albums.length || out.artists.length);
+
+    if (
+        qobuz.ok &&
+        qobuzData &&
+        typeof qobuzData ===
+            "object"
+    ) {
+        var qobuzTracks =
+            qobuzData.tracks &&
+            Array.isArray(
+                qobuzData.tracks.items
+            )
+                ? qobuzData.tracks.items
+                : [];
+
+        var qobuzAlbums =
+            qobuzData.albums &&
+            Array.isArray(
+                qobuzData.albums.items
+            )
+                ? qobuzData.albums.items
+                : [];
+
+        var qobuzArtists =
+            qobuzData.artists &&
+            Array.isArray(
+                qobuzData.artists.items
+            )
+                ? qobuzData.artists.items
+                : [];
+
+        qobuzTracks.forEach(
+            function(track) {
+                out.tracks.push(
+                    normalizeSearchTrack(
+                        track,
+                        "qobuz"
+                    )
+                );
+            }
+        );
+
+        qobuzAlbums.forEach(
+            function(album) {
+                out.albums.push(
+                    normalizeSearchAlbum(
+                        album,
+                        "qobuz"
+                    )
+                );
+            }
+        );
+
+        qobuzArtists.forEach(
+            function(artist) {
+                out.artists.push(
+                    normalizeSearchArtist(
+                        artist,
+                        "qobuz"
+                    )
+                );
+            }
+        );
+    }
+
+    [
+        out.tracks,
+        out.albums,
+        out.artists
+    ].forEach(
+        function(items) {
+            items.forEach(
+                function(item) {
+                    item.provider =
+                        String(
+                            item.source ||
+                            ""
+                        )
+                        .trim()
+                        .toLowerCase();
+
+                    if (
+                        item.provider ===
+                        "qobuz"
+                    ) {
+                        if (
+                            item.type ===
+                            "track"
+                        ) {
+                            item.native_id =
+                                String(
+                                    (
+                                        item.raw &&
+                                        item.raw.provider_track_id
+                                    ) ||
+                                    item.id ||
+                                    ""
+                                )
+                                .replace(
+                                    /^qobuz:/,
+                                    ""
+                                );
+
+                            if (
+                                item.native_id &&
+                                String(
+                                    item.id ||
+                                    ""
+                                ).indexOf(
+                                    "qobuz:"
+                                ) !== 0
+                            ) {
+                                item.id =
+                                    "qobuz:" +
+                                    item.native_id;
+                            }
+                        } else if (
+                            item.type ===
+                            "album"
+                        ) {
+                            item.native_id =
+                                String(
+                                    (
+                                        item.raw &&
+                                        item.raw.album_id
+                                    ) ||
+                                    item.id ||
+                                    ""
+                                );
+                        } else {
+                            item.native_id =
+                                String(
+                                    (
+                                        item.raw &&
+                                        item.raw.artist_id
+                                    ) ||
+                                    item.id ||
+                                    ""
+                                );
+                        }
+                    } else {
+                        item.native_id =
+                            String(
+                                item.id ||
+                                ""
+                            );
+                    }
+                }
+            );
+        }
+    );
+
+    out.hasAny =
+        !!(
+            out.tracks.length ||
+            out.albums.length ||
+            out.artists.length
+        );
+
     return out;
 }
 
 function normalizeSearchTrack(track, source) {
     track = track || {};
+
+    source =
+        String(
+            source || ""
+        ).toLowerCase();
+
+    var qobuzSeed =
+        source === "qobuz"
+            ? qobuzSourceSearchResultSeed(
+                track,
+                "track"
+            )
+            : null;
+
+    var nativeId =
+        source === "qobuz"
+            ? String(
+                track.provider_track_id ||
+                (
+                    qobuzSeed &&
+                    qobuzSeed.id
+                        ? String(
+                            qobuzSeed.id
+                        ).replace(
+                            /^qobuz:/,
+                            ""
+                        )
+                        : ""
+                )
+            )
+            : String(
+                track.id ||
+                ""
+            );
+
+    var canonicalId =
+        source === "qobuz"
+            ? String(
+                (
+                    qobuzSeed &&
+                    qobuzSeed.id
+                ) ||
+                (
+                    nativeId
+                        ? (
+                            "qobuz:" +
+                            nativeId
+                        )
+                        : ""
+                )
+            )
+            : String(
+                track.id ||
+                ""
+            );
+
     return {
         type: "track",
         source: source,
+        provider: source,
+        native_id: nativeId,
         raw: track,
-        id: String(track.id || ""),
-        title: track.title || track.name || "",
-        artist: track.artist || "",
-        album: track.album || track.album_name || "",
-        cover: track.artwork_url || track.cover || track.image_url || "",
-        duration: Number(track.duration || 0),
-        quality: track.quality || (source === "local" ? "LOCAL" : ""),
-        explicit: !!track.explicit
+        id: canonicalId,
+
+        title:
+            (
+                qobuzSeed &&
+                qobuzSeed.name
+            ) ||
+            track.title ||
+            track.name ||
+            "",
+
+        artist:
+            (
+                qobuzSeed &&
+                qobuzSeed.sub_title
+            ) ||
+            track.artist ||
+            "",
+
+        album:
+            track.album ||
+            track.album_name ||
+            "",
+
+        cover:
+            (
+                qobuzSeed &&
+                qobuzSeed.image_url
+            ) ||
+            track.artwork_url ||
+            track.cover ||
+            track.image_url ||
+            "",
+
+        duration:
+            Number(
+                track.duration ||
+                0
+            ),
+
+        quality:
+            track.quality ||
+            (
+                source === "local"
+                    ? "LOCAL"
+                    : ""
+            ),
+
+        explicit:
+            !!track.explicit
     };
 }
 
 function normalizeSearchAlbum(album, source) {
     album = album || {};
-    var year = album.year || "";
-    var releaseDate = album.release_date || album.releaseDate || "";
-    if (!year && releaseDate) { year = String(releaseDate).slice(0, 4); }
+
+    source =
+        String(
+            source || ""
+        ).toLowerCase();
+
+    var qobuzSeed =
+        source === "qobuz"
+            ? qobuzSourceSearchResultSeed(
+                album,
+                "album"
+            )
+            : null;
+
+    var nativeId =
+        source === "qobuz"
+            ? String(
+                album.album_id ||
+                (
+                    qobuzSeed &&
+                    qobuzSeed.id
+                ) ||
+                ""
+            )
+            : String(
+                album.id ||
+                album.album_id ||
+                album.group_id ||
+                ""
+            );
+
+    var year =
+        album.year ||
+        "";
+
+    var releaseDate =
+        album.release_date ||
+        album.release_date_original ||
+        album.release_date_stream ||
+        album.releaseDate ||
+        "";
+
+    if (
+        !year &&
+        releaseDate
+    ) {
+        year =
+            String(
+                releaseDate
+            ).slice(
+                0,
+                4
+            );
+    }
+
+    var title =
+        (
+            qobuzSeed &&
+            qobuzSeed.name
+        ) ||
+        album.album ||
+        album.name ||
+        album.title ||
+        "";
+
+    var artist =
+        (
+            qobuzSeed &&
+            qobuzSeed.sub_title
+        ) ||
+        album.artist ||
+        album.album_artist ||
+        "";
+
+    var cover = "";
+
+    if (
+        source ===
+        "qobuz"
+    ) {
+        cover =
+            (
+                qobuzSeed &&
+                qobuzSeed.image_url
+            ) ||
+            album.artwork_url ||
+            album.image_url ||
+            "";
+    } else {
+        cover =
+            localAlbumArtworkUrl(
+                album,
+                title,
+                artist
+            ) ||
+            album.image_url ||
+            "";
+    }
+
     return {
         type: "album",
         source: source,
+        provider: source,
+        native_id: nativeId,
         raw: album,
-        id: String(album.id || album.album_id || album.group_id || ""),
-        title: album.album || album.name || "",
-        artist: album.artist || album.album_artist || "",
-        cover: localAlbumArtworkUrl(album, album.album || album.name || "", album.artist || album.album_artist || "") || album.image_url || "",
+        id: nativeId,
+        title: title,
+        artist: artist,
+        cover: cover,
         year: year || "",
-        explicit: !!album.explicit,
-        trackCount: album.track_count || album.num_tracks || 0
+        explicit:
+            !!album.explicit,
+        trackCount:
+            album.track_count ||
+            album.num_tracks ||
+            album.tracks_count ||
+            0
     };
 }
 
 function normalizeSearchArtist(artist, source) {
     artist = artist || {};
+
+    source =
+        String(
+            source || ""
+        ).toLowerCase();
+
+    var qobuzSeed =
+        source === "qobuz"
+            ? qobuzSourceSearchResultSeed(
+                artist,
+                "artist"
+            )
+            : null;
+
+    var nativeId =
+        source === "qobuz"
+            ? String(
+                artist.artist_id ||
+                (
+                    qobuzSeed &&
+                    qobuzSeed.id
+                ) ||
+                ""
+            )
+            : String(
+                artist.id ||
+                ""
+            );
+
     return {
         type: "artist",
         source: source,
+        provider: source,
+        native_id: nativeId,
         raw: artist,
-        id: String(artist.id || ""),
-        name: artist.artist || artist.name || "",
-        cover: artist.image_url || "",
-        sub: source === "local"
-            ? ((artist.album_count || 0) + " albums")
-            : "Artist"
+        id: nativeId,
+
+        name:
+            (
+                qobuzSeed &&
+                qobuzSeed.name
+            ) ||
+            artist.artist ||
+            artist.name ||
+            "",
+
+        cover:
+            (
+                qobuzSeed &&
+                qobuzSeed.image_url
+            ) ||
+            artist.artwork_url ||
+            artist.image_url ||
+            "",
+
+        sub:
+            source === "local"
+                ? (
+                    (
+                        artist.album_count ||
+                        0
+                    ) +
+                    " albums"
+                )
+                : (
+                    source === "qobuz" &&
+                    Number(
+                        artist.albums_count ||
+                        0
+                    ) > 0
+                        ? (
+                            String(
+                                Number(
+                                    artist.albums_count
+                                )
+                            ) +
+                            " albums"
+                        )
+                        : "Artist"
+                )
     };
 }
 
@@ -12375,6 +28320,7 @@ function renderSrovaSearchShellInto(target, data, opts) {
     if (data.localBusy) { shell.appendChild(globalSearchNotice("Local Music is rebuilding.")); }
     if (data.localFailed) { shell.appendChild(globalSearchNotice("Local Music search failed.")); }
     if (data.tidalFailed) { shell.appendChild(globalSearchNotice("Tidal search failed.")); }
+    if (data.qobuzFailed) { shell.appendChild(globalSearchNotice("Qobuz search failed.")); }
 
     var panel = document.createElement("div");
     panel.className = "srovaSearchPanel";
@@ -12425,24 +28371,252 @@ function globalSearchNotice(text) {
     return div;
 }
 
-function renderSrovaSearchTopPanel(data, panel, opts) {
+function globalSearchProviderLabel(source) {
+    source =
+        String(
+            source || ""
+        )
+        .trim()
+        .toLowerCase();
+
+    if (source === "local") {
+        return "LOCAL";
+    }
+
+    if (source === "tidal") {
+        return "TIDAL";
+    }
+
+    if (source === "qobuz") {
+        return "QOBUZ";
+    }
+
+    return source
+        ? source.toUpperCase()
+        : "";
+}
+
+
+function globalSearchBalancedTopItems(
+    items,
+    limit
+) {
+    items =
+        Array.isArray(items)
+            ? items
+            : [];
+
+    limit =
+        Math.max(
+            0,
+            Number(limit) || 0
+        );
+
+    if (
+        !items.length ||
+        !limit
+    ) {
+        return [];
+    }
+
+    var providerOrder = [
+        "local",
+        "tidal",
+        "qobuz"
+    ];
+
+    var buckets = {
+        local: [],
+        tidal: [],
+        qobuz: [],
+        other: []
+    };
+
+    items.forEach(
+        function(item) {
+            item =
+                item || {};
+
+            var provider =
+                String(
+                    item.source ||
+                    item.provider ||
+                    ""
+                )
+                .trim()
+                .toLowerCase();
+
+            if (
+                provider === "local" ||
+                provider === "tidal" ||
+                provider === "qobuz"
+            ) {
+                buckets[
+                    provider
+                ].push(
+                    item
+                );
+            } else {
+                buckets.other.push(
+                    item
+                );
+            }
+        }
+    );
+
+    var positions = {
+        local: 0,
+        tidal: 0,
+        qobuz: 0,
+        other: 0
+    };
+
+    var out = [];
+
+    while (
+        out.length <
+        limit
+    ) {
+        var added =
+            false;
+
+        providerOrder.forEach(
+            function(provider) {
+                if (
+                    out.length >=
+                    limit
+                ) {
+                    return;
+                }
+
+                var index =
+                    positions[
+                        provider
+                    ];
+
+                if (
+                    index <
+                    buckets[
+                        provider
+                    ].length
+                ) {
+                    out.push(
+                        buckets[
+                            provider
+                        ][
+                            index
+                        ]
+                    );
+
+                    positions[
+                        provider
+                    ] =
+                        index + 1;
+
+                    added =
+                        true;
+                }
+            }
+        );
+
+        if (!added) {
+            break;
+        }
+    }
+
+    while (
+        out.length <
+            limit &&
+        positions.other <
+            buckets.other.length
+    ) {
+        out.push(
+            buckets.other[
+                positions.other
+            ]
+        );
+
+        positions.other +=
+            1;
+    }
+
+    return out;
+}
+
+function renderSrovaSearchTopPanel(
+    data,
+    panel,
+    opts
+) {
     opts = opts || {};
+
     var rows = [];
-    data.tracks.slice(0, 4).forEach(function(track) { rows.push(track); });
-    data.albums.slice(0, 4).forEach(function(album) { rows.push(album); });
-    data.artists.slice(0, 2).forEach(function(artist) { rows.push(artist); });
+
+    globalSearchBalancedTopItems(
+        data.tracks,
+        3
+    ).forEach(
+        function(track) {
+            rows.push(
+                track
+            );
+        }
+    );
+
+    globalSearchBalancedTopItems(
+        data.albums,
+        3
+    ).forEach(
+        function(album) {
+            rows.push(
+                album
+            );
+        }
+    );
+
+    globalSearchBalancedTopItems(
+        data.artists,
+        3
+    ).forEach(
+        function(artist) {
+            rows.push(
+                artist
+            );
+        }
+    );
 
     if (!rows.length) {
-        panel.appendChild(globalSearchNotice("No top results found."));
+        panel.appendChild(
+            globalSearchNotice(
+                "No top results found."
+            )
+        );
+
         return;
     }
 
-    var list = document.createElement("div");
-    list.className = "srovaSearchTopList";
-    rows.slice(0, 8).forEach(function(item) {
-        list.appendChild(renderSrovaSearchTopRow(item, opts));
-    });
-    panel.appendChild(list);
+    var list =
+        document.createElement(
+            "div"
+        );
+
+    list.className =
+        "srovaSearchTopList";
+
+    rows.forEach(
+        function(item) {
+            list.appendChild(
+                renderSrovaSearchTopRow(
+                    item,
+                    opts
+                )
+            );
+        }
+    );
+
+    panel.appendChild(
+        list
+    );
 }
 
 function renderSrovaSearchTracksPanel(data, panel) {
@@ -12507,248 +28681,1246 @@ function renderSrovaSearchArtistsPanel(data, panel, opts) {
     panel.appendChild(grid);
 }
 
-function renderSrovaSearchArtistCard(artist, featured, opts) {
+function globalSearchQobuzSeed(
+    item,
+    kind
+) {
+    if (
+        !item ||
+        item.source !== "qobuz"
+    ) {
+        return null;
+    }
+
+    return qobuzSourceSearchResultSeed(
+        item.raw || {},
+        kind
+    );
+}
+
+
+function captureGlobalSearchQobuzDetailReturn() {
+    captureSearchRestoreState();
+
+    captureDetailReturnScroll(
+        "search"
+    );
+}
+
+
+function openGlobalSearchQobuzAlbum(
+    item
+) {
+    var seed =
+        globalSearchQobuzSeed(
+            item,
+            "album"
+        );
+
+    if (
+        !seed ||
+        !seed.id
+    ) {
+        return;
+    }
+
+    captureGlobalSearchQobuzDetailReturn();
+
+    loadQobuzAlbumDetail(
+        seed.id,
+        seed,
+        "search"
+    );
+}
+
+
+function openGlobalSearchQobuzArtist(
+    item
+) {
+    var seed =
+        globalSearchQobuzSeed(
+            item,
+            "artist"
+        );
+
+    if (
+        !seed ||
+        !seed.id
+    ) {
+        return;
+    }
+
+    captureGlobalSearchQobuzDetailReturn();
+
+    loadQobuzArtistDetail(
+        seed.id,
+        seed.name || "",
+        seed.image_url || "",
+        "search",
+        null
+    );
+}
+
+
+function showGlobalSearchQobuzTrackMenu(
+    anchorEl,
+    item,
+    e
+) {
+    var seed =
+        globalSearchQobuzSeed(
+            item,
+            "track"
+        );
+
+    if (
+        !seed ||
+        !seed.id ||
+        String(
+            seed.id
+        ).indexOf(
+            "qobuz:"
+        ) !== 0
+    ) {
+        return;
+    }
+
+    captureGlobalSearchQobuzDetailReturn();
+
+    showQobuzTrackArtworkMenu(
+        anchorEl,
+        seed,
+        e,
+        "search"
+    );
+}
+
+function renderSrovaSearchArtistCard(
+    artist,
+    featured,
+    opts
+) {
     opts = opts || {};
-    var card = document.createElement("div");
-    card.className = "srovaSearchArtistCard" + (featured ? " featured" : "");
-    var img = artist.cover
-        ? '<img src="' + escapeHtml(artist.cover) + '" alt="">'
-        : '<div class="localArtPlaceholder localArtistArt"><span>' + escapeHtml(localInitials(artist.name || "")) + '</span></div>';
+
+    var card =
+        document.createElement(
+            "div"
+        );
+
+    card.className =
+        "srovaSearchArtistCard" +
+        (
+            featured
+                ? " featured"
+                : ""
+        );
+
+    var img = "";
+
+    if (artist.cover) {
+        img =
+            '<img src="' +
+            escapeHtml(
+                artist.cover
+            ) +
+            '" alt="">';
+    } else if (
+        artist.source ===
+        "qobuz"
+    ) {
+        img =
+            '<img src="' +
+            escapeHtml(
+                SROVA_STANDBY_ART
+            ) +
+            '" alt="">';
+    } else {
+        img =
+            '<div class="' +
+            'localArtPlaceholder ' +
+            'localArtistArt' +
+            '"><span>' +
+            escapeHtml(
+                localInitials(
+                    artist.name ||
+                    ""
+                )
+            ) +
+            '</span></div>';
+    }
+
+    var providerLabel =
+        globalSearchProviderLabel(
+            artist.source
+        );
+
     card.innerHTML =
         img +
         '<div class="srovaSearchCardMeta">' +
-          '<div class="srovaSearchEyebrow">' + escapeHtml(artist.source === "local" ? "LOCAL" : "TIDAL") + '</div>' +
-          '<div class="srovaSearchCardTitle">' + escapeHtml(artist.name || "") + '</div>' +
-          '<div class="srovaSearchCardSub">' + escapeHtml(artist.sub || "") + '</div>' +
+          '<div class="srovaSearchEyebrow">' +
+          escapeHtml(
+              providerLabel
+          ) +
+          '</div>' +
+          '<div class="srovaSearchCardTitle">' +
+          escapeHtml(
+              artist.name ||
+              ""
+          ) +
+          '</div>' +
+          '<div class="srovaSearchCardSub">' +
+          escapeHtml(
+              artist.sub ||
+              ""
+          ) +
+          '</div>' +
         '</div>';
-    card.onclick = function() {
-        if (artist.source === "local") {
-            openLocalArtistFromGlobalSearch(
-                artist.name || "",
-                artist.cover || "",
-                artist.albumArtwork || {}
+
+    if (
+        artist.source === "tidal" &&
+        artist.id
+    ) {
+        var tidalFavoriteActions =
+            document.createElement(
+                "div"
             );
-        } else if (artist.id) {
-            if (opts.sourceView === "tidalsource") {
-                captureTidalSourceSearchStateFromDom();
-            } else {
-                captureSearchRestoreState();
-            }
-            loadArtistPage(
-                artist.id,
-                artist.name || "",
-                artist.cover || "",
-                opts.sourceView === "tidalsource" ? "tidalsource" : "search"
+
+        tidalFavoriteActions.className =
+            "srovaSearchCardActions";
+
+        appendTidalSearchFavoriteHeart(
+            tidalFavoriteActions,
+            "artist",
+            artist.id
+        );
+
+        card.appendChild(
+            tidalFavoriteActions
+        );
+    } else if (
+        artist.source === "qobuz" &&
+        artist.id
+    ) {
+        var qobuzFavoriteActions =
+            document.createElement(
+                "div"
+            );
+
+        qobuzFavoriteActions.className =
+            "srovaSearchCardActions";
+
+        if (
+            appendQobuzSearchEntityFavoriteHeart(
+                qobuzFavoriteActions,
+                "artist",
+                artist.raw || {}
+            )
+        ) {
+            card.appendChild(
+                qobuzFavoriteActions
             );
         }
-    };
+    }
+
+    card.onclick =
+        function() {
+            if (
+                artist.source ===
+                "local"
+            ) {
+                openLocalArtistFromGlobalSearch(
+                    artist.name || "",
+                    artist.cover || "",
+                    artist.albumArtwork || {}
+                );
+
+                return;
+            }
+
+            if (
+                artist.source ===
+                "qobuz"
+            ) {
+                openGlobalSearchQobuzArtist(
+                    artist
+                );
+
+                return;
+            }
+
+            if (artist.id) {
+                if (
+                    opts.sourceView ===
+                    "tidalsource"
+                ) {
+                    captureTidalSourceSearchStateFromDom();
+                } else {
+                    captureSearchRestoreState();
+                }
+
+                loadArtistPage(
+                    artist.id,
+                    artist.name || "",
+                    artist.cover || "",
+                    opts.sourceView ===
+                        "tidalsource"
+                        ? "tidalsource"
+                        : "search"
+                );
+            }
+        };
+
     return card;
 }
 
 function renderSrovaSearchTopRow(item, opts) {
     opts = opts || {};
-    var row = document.createElement("div");
-    row.className = "srovaSearchTopRow";
+
+    var row =
+        document.createElement(
+            "div"
+        );
+
+    row.className =
+        "srovaSearchTopRow";
+
     var art = "";
     var title = "";
     var typeLabel = "";
     var sub = "";
     var meta = "";
 
-    if (item.type === "artist") {
-        title = item.name || "";
-        typeLabel = item.source === "local" ? "Artist · Local" : "Artist";
-        sub = item.sub || "";
-        art = item.cover
-            ? '<img class="srovaSearchTopArt artist" src="' + escapeHtml(item.cover) + '" alt="">'
-            : '<div class="srovaSearchTopArt localArtPlaceholder localArtistArt"><span>' + escapeHtml(localInitials(title)) + '</span></div>';
-        row.onclick = function() {
-            if (item.source === "local") {
-                openLocalArtistFromGlobalSearch(
-                    item.name || "",
-                    item.cover || "",
-                    item.albumArtwork || {}
-                );
-            }
-            else if (item.id) {
-                if (opts.sourceView === "tidalsource") {
-                    captureTidalSourceSearchStateFromDom();
-                    loadArtistPage(item.id, item.name || "", item.cover || "", "tidalsource");
-                } else {
-                    captureSearchRestoreState();
-                    loadArtistPage(item.id, item.name || "", item.cover || "", "search");
+    if (
+        item.source === "qobuz" &&
+        (
+            item.type === "track" ||
+            item.type === "album"
+        )
+    ) {
+        qobuzSourceSearchApplyQuality(
+            row,
+            globalSearchQobuzSeed(
+                item,
+                item.type
+            )
+        );
+    }
+
+    if (
+        item.type ===
+        "artist"
+    ) {
+        title =
+            item.name ||
+            "";
+
+        typeLabel =
+            globalSearchProviderLabel(
+                item.source
+            );
+
+        sub =
+            item.sub ||
+            "";
+
+        if (item.cover) {
+            art =
+                '<img class="' +
+                'srovaSearchTopArt artist' +
+                '" src="' +
+                escapeHtml(
+                    item.cover
+                ) +
+                '" alt="">';
+        } else if (
+            item.source ===
+            "qobuz"
+        ) {
+            art =
+                '<img class="' +
+                'srovaSearchTopArt artist' +
+                '" src="' +
+                escapeHtml(
+                    SROVA_STANDBY_ART
+                ) +
+                '" alt="">';
+        } else {
+            art =
+                '<div class="' +
+                'srovaSearchTopArt ' +
+                'localArtPlaceholder ' +
+                'localArtistArt' +
+                '"><span>' +
+                escapeHtml(
+                    localInitials(
+                        title
+                    )
+                ) +
+                '</span></div>';
+        }
+
+        row.onclick =
+            function() {
+                if (
+                    item.source ===
+                    "local"
+                ) {
+                    openLocalArtistFromGlobalSearch(
+                        item.name || "",
+                        item.cover || "",
+                        item.albumArtwork || {}
+                    );
+
+                    return;
                 }
-            }
-        };
-    } else if (item.type === "album") {
-        title = item.title || "";
-        typeLabel = item.source === "local" ? "Album · Local" : "Album";
-        sub = item.artist || "";
-        meta = item.year || "";
-        art = '<img class="srovaSearchTopArt" src="' + escapeHtml(item.cover || localAlbumArtDataUri(item.title, item.artist)) + '" alt="">';
-        row.onclick = function() {
-            if (item.source === "local") {
-                var localAlbumFromView = opts.sourceView || "search";
-                if (localAlbumFromView === "tidalsource") {
-                    captureTidalSourceSearchStateFromDom();
-                } else if (localAlbumFromView === "search") {
-                    captureSearchRestoreState();
+
+                if (
+                    item.source ===
+                    "qobuz"
+                ) {
+                    openGlobalSearchQobuzArtist(
+                        item
+                    );
+
+                    return;
                 }
-                loadLocalAlbum(item.raw.artist || item.artist || "", item.raw.album || item.title || "", item.raw.album_id || item.raw.group_id || item.id || "", localAlbumFromView);
-            } else if (item.id) {
-                if (opts.sourceView === "tidalsource") {
-                    captureTidalSourceSearchStateFromDom();
-                } else {
-                    captureSearchRestoreState();
+
+                if (item.id) {
+                    if (
+                        opts.sourceView ===
+                        "tidalsource"
+                    ) {
+                        captureTidalSourceSearchStateFromDom();
+
+                        loadArtistPage(
+                            item.id,
+                            item.name || "",
+                            item.cover || "",
+                            "tidalsource"
+                        );
+                    } else {
+                        captureSearchRestoreState();
+
+                        loadArtistPage(
+                            item.id,
+                            item.name || "",
+                            item.cover || "",
+                            "search"
+                        );
+                    }
                 }
-                loadTrackList({ id: item.id, cover: item.cover, title: item.title, artist: item.artist },
-                    "/tidal/album/" + item.id, opts.sourceView === "tidalsource" ? "tidalsource" : "search");
-            }
-        };
+            };
+    } else if (
+        item.type ===
+        "album"
+    ) {
+        title =
+            item.title ||
+            "";
+
+        typeLabel =
+            globalSearchProviderLabel(
+                item.source
+            );
+
+        sub =
+            item.artist ||
+            "";
+
+        meta =
+            item.year ||
+            "";
+
+        art =
+            '<img class="srovaSearchTopArt" src="' +
+            escapeHtml(
+                item.cover ||
+                (
+                    item.source ===
+                    "qobuz"
+                        ? SROVA_STANDBY_ART
+                        : localAlbumArtDataUri(
+                            item.title,
+                            item.artist
+                        )
+                )
+            ) +
+            '" alt="">';
+
+        row.onclick =
+            function() {
+                if (
+                    item.source ===
+                    "local"
+                ) {
+                    var localAlbumFromView =
+                        opts.sourceView ||
+                        "search";
+
+                    if (
+                        localAlbumFromView ===
+                        "tidalsource"
+                    ) {
+                        captureTidalSourceSearchStateFromDom();
+                    } else if (
+                        localAlbumFromView ===
+                        "search"
+                    ) {
+                        captureSearchRestoreState();
+                    }
+
+                    loadLocalAlbum(
+                        item.raw.artist ||
+                        item.artist ||
+                        "",
+                        item.raw.album ||
+                        item.title ||
+                        "",
+                        item.raw.album_id ||
+                        item.raw.group_id ||
+                        item.id ||
+                        "",
+                        localAlbumFromView
+                    );
+
+                    return;
+                }
+
+                if (
+                    item.source ===
+                    "qobuz"
+                ) {
+                    openGlobalSearchQobuzAlbum(
+                        item
+                    );
+
+                    return;
+                }
+
+                if (item.id) {
+                    if (
+                        opts.sourceView ===
+                        "tidalsource"
+                    ) {
+                        captureTidalSourceSearchStateFromDom();
+                    } else {
+                        captureSearchRestoreState();
+                    }
+
+                    loadTrackList(
+                        {
+                            id: item.id,
+                            cover: item.cover,
+                            title: item.title,
+                            artist: item.artist
+                        },
+                        "/tidal/album/" +
+                        item.id,
+                        opts.sourceView ===
+                            "tidalsource"
+                            ? "tidalsource"
+                            : "search"
+                    );
+                }
+            };
     } else {
-        title = item.title || "";
-        typeLabel = item.source === "local" ? "Track · Local" : "Track";
-        sub = item.artist || "";
-        meta = item.duration ? formatTime(item.duration) : "";
-        art = '<img class="srovaSearchTopArt" src="' + escapeHtml(item.cover || localAlbumArtDataUri(item.title, item.artist)) + '" alt="">';
-        row.onclick = function() { playSrovaSearchTrack(item); };
+        title =
+            item.title ||
+            "";
+
+        typeLabel =
+            globalSearchProviderLabel(
+                item.source
+            );
+
+        sub =
+            item.artist ||
+            "";
+
+        meta =
+            item.duration
+                ? formatTime(
+                    item.duration
+                )
+                : "";
+
+        art =
+            '<img class="srovaSearchTopArt" src="' +
+            escapeHtml(
+                item.cover ||
+                (
+                    item.source ===
+                    "qobuz"
+                        ? SROVA_STANDBY_ART
+                        : localAlbumArtDataUri(
+                            item.title,
+                            item.artist
+                        )
+                )
+            ) +
+            '" alt="">';
+
+        row.onclick =
+            function() {
+                playSrovaSearchTrack(
+                    item
+                );
+            };
     }
 
     row.innerHTML =
         art +
         '<div class="srovaSearchTopMeta">' +
-          '<div class="srovaSearchTopTitle">' + escapeHtml(title) + '</div>' +
+          '<div class="srovaSearchTopTitle">' +
+          escapeHtml(
+              title
+          ) +
+          '</div>' +
           '<div class="srovaSearchTopSub">' +
-            '<span class="srovaSearchTypePill">' + escapeHtml(typeLabel) + '</span>' +
-            '<span>' + escapeHtml(sub) + '</span>' +
+            '<span class="srovaSearchTypePill">' +
+            escapeHtml(
+                typeLabel
+            ) +
+            '</span>' +
+            '<span>' +
+            escapeHtml(
+                sub
+            ) +
+            '</span>' +
           '</div>' +
         '</div>' +
-        '<div class="srovaSearchTopExtra">' + escapeHtml(meta) + '</div>';
-    if (item.type === "track" && (item.source === "tidal" || item.source === "local")) {
-        var addBtn = document.createElement("button");
-        addBtn.className = "srovaSearchActionBtn";
-        addBtn.innerHTML = '<span class="material-icons">add</span>';
-        addBtn.title = "Track actions";
-        addBtn.setAttribute("aria-label", "Track actions");
-        addBtn.onclick = function(e) {
-            e.stopPropagation();
-            if (item.source === "tidal") {
-                showTidalSearchTrackMenu(addBtn, item, e);
-                return;
-            }
-            showLocalSearchTrackMenu(addBtn, item, e);
-        };
-        row.appendChild(addBtn);
+        '<div class="srovaSearchTopExtra">' +
+        escapeHtml(
+            meta
+        ) +
+        '</div>';
+
+    var actions =
+        document.createElement(
+            "div"
+        );
+
+    actions.className =
+        "srovaSearchTopActions";
+
+    if (
+        item.type === "track" &&
+        (
+            item.source === "tidal" ||
+            item.source === "local" ||
+            item.source === "qobuz"
+        )
+    ) {
+        var addBtn =
+            document.createElement(
+                "button"
+            );
+
+        addBtn.className =
+            "srovaSearchActionBtn";
+
+        addBtn.innerHTML =
+            '<span class="material-icons">' +
+            'add</span>';
+
+        addBtn.title =
+            "Track actions";
+
+        addBtn.setAttribute(
+            "aria-label",
+            "Track actions"
+        );
+
+        addBtn.onclick =
+            function(e) {
+                e.stopPropagation();
+
+                if (
+                    item.source ===
+                    "tidal"
+                ) {
+                    showTidalSearchTrackMenu(
+                        addBtn,
+                        item,
+                        e
+                    );
+
+                    return;
+                }
+
+                if (
+                    item.source ===
+                    "qobuz"
+                ) {
+                    showGlobalSearchQobuzTrackMenu(
+                        addBtn,
+                        item,
+                        e
+                    );
+
+                    return;
+                }
+
+                showLocalSearchTrackMenu(
+                    addBtn,
+                    item,
+                    e
+                );
+            };
+
+        actions.appendChild(
+            addBtn
+        );
     }
-    applyLocalArtworkFallback(row.querySelector("img"), title, sub);
+
+    if (
+        item.source === "tidal" &&
+        item.id &&
+        (
+            item.type === "track" ||
+            item.type === "album" ||
+            item.type === "artist"
+        )
+    ) {
+        appendTidalSearchFavoriteHeart(
+            actions,
+            item.type,
+            item.id
+        );
+    } else if (
+        item.source === "qobuz" &&
+        item.id
+    ) {
+        if (
+            item.type ===
+            "track"
+        ) {
+            appendQobuzSearchTrackFavoriteHeart(
+                actions,
+                globalSearchQobuzSeed(
+                    item,
+                    "track"
+                )
+            );
+        } else if (
+            item.type === "album" ||
+            item.type === "artist"
+        ) {
+            appendQobuzSearchEntityFavoriteHeart(
+                actions,
+                item.type,
+                item.raw || {}
+            );
+        }
+    }
+
+    if (
+        actions.children.length
+    ) {
+        row.appendChild(
+            actions
+        );
+    }
+
+    if (
+        item.source !==
+        "qobuz"
+    ) {
+        applyLocalArtworkFallback(
+            row.querySelector(
+                "img"
+            ),
+            title,
+            sub
+        );
+    }
+
     return row;
 }
 
-function renderSrovaSearchAlbumCard(album, featured, opts) {
+function renderSrovaSearchAlbumCard(
+    album,
+    featured,
+    opts
+) {
     opts = opts || {};
-    var card = document.createElement("div");
-    card.className = "srovaSearchAlbumCard" + (featured ? " featured" : "");
+
+    var card =
+        document.createElement(
+            "div"
+        );
+
+    card.className =
+        "srovaSearchAlbumCard" +
+        (
+            featured
+                ? " featured"
+                : ""
+        );
+
+    if (
+        album.source ===
+        "qobuz"
+    ) {
+        qobuzSourceSearchApplyQuality(
+            card,
+            globalSearchQobuzSeed(
+                album,
+                "album"
+            )
+        );
+    }
+
+    var artwork =
+        album.cover ||
+        (
+            album.source ===
+            "qobuz"
+                ? SROVA_STANDBY_ART
+                : localAlbumArtDataUri(
+                    album.title,
+                    album.artist
+                )
+        );
+
+    var eyebrow =
+        globalSearchProviderLabel(
+            album.source
+        );
+
     card.innerHTML =
-        '<img src="' + escapeHtml(album.cover || localAlbumArtDataUri(album.title, album.artist)) + '" alt="">' +
+        '<img src="' +
+        escapeHtml(
+            artwork
+        ) +
+        '" alt="">' +
         '<div class="srovaSearchCardMeta">' +
-          '<div class="srovaSearchEyebrow">' + escapeHtml(album.source === "local" ? "LOCAL ALBUM" : "ALBUM") + '</div>' +
-          '<div class="srovaSearchCardTitle">' + escapeHtml(album.title || "") + '</div>' +
-          '<div class="srovaSearchCardSub">' + escapeHtml(album.artist || "") + '</div>' +
+          '<div class="srovaSearchEyebrow">' +
+          escapeHtml(
+              eyebrow
+          ) +
+          '</div>' +
+          '<div class="srovaSearchCardTitle">' +
+          escapeHtml(
+              album.title ||
+              ""
+          ) +
+          '</div>' +
+          '<div class="srovaSearchCardSub">' +
+          escapeHtml(
+              album.artist ||
+              ""
+          ) +
+          '</div>' +
           '<div class="srovaSearchAlbumFacts">' +
-            (album.year ? '<span>' + escapeHtml(album.year) + '</span>' : '') +
-            (album.explicit ? '<span class="srovaSearchExplicit">E</span>' : '') +
+            (
+                album.year
+                    ? (
+                        '<span>' +
+                        escapeHtml(
+                            album.year
+                        ) +
+                        '</span>'
+                    )
+                    : ''
+            ) +
+            (
+                album.explicit
+                    ? (
+                        '<span class="' +
+                        'srovaSearchExplicit' +
+                        '">E</span>'
+                    )
+                    : ''
+            ) +
           '</div>' +
         '</div>';
-    applyLocalArtworkFallback(card.querySelector("img"), album.title, album.artist);
-    card.onclick = function() {
-        if (album.source === "local") {
-            var localAlbumFromView = opts.sourceView || "search";
-            if (localAlbumFromView === "tidalsource") {
-                captureTidalSourceSearchStateFromDom();
-            } else if (localAlbumFromView === "search") {
-                captureSearchRestoreState();
-            }
-            loadLocalAlbum(album.raw.artist || album.artist || "", album.raw.album || album.title || "", album.raw.album_id || album.raw.group_id || album.id || "", localAlbumFromView);
-        } else if (album.id) {
-            if (opts.sourceView === "tidalsource") {
-                captureTidalSourceSearchStateFromDom();
-            } else {
-                captureSearchRestoreState();
-            }
-            loadTrackList({ id: album.id, cover: album.cover, title: album.title, artist: album.artist },
-                "/tidal/album/" + album.id, opts.sourceView === "tidalsource" ? "tidalsource" : "search");
+
+    if (
+        album.source !==
+        "qobuz"
+    ) {
+        applyLocalArtworkFallback(
+            card.querySelector(
+                "img"
+            ),
+            album.title,
+            album.artist
+        );
+    }
+
+    if (
+        album.source === "tidal" &&
+        album.id
+    ) {
+        var tidalFavoriteActions =
+            document.createElement(
+                "div"
+            );
+
+        tidalFavoriteActions.className =
+            "srovaSearchCardActions";
+
+        appendTidalSearchFavoriteHeart(
+            tidalFavoriteActions,
+            "album",
+            album.id
+        );
+
+        card.appendChild(
+            tidalFavoriteActions
+        );
+    } else if (
+        album.source === "qobuz" &&
+        album.id
+    ) {
+        var qobuzFavoriteActions =
+            document.createElement(
+                "div"
+            );
+
+        qobuzFavoriteActions.className =
+            "srovaSearchCardActions";
+
+        if (
+            appendQobuzSearchEntityFavoriteHeart(
+                qobuzFavoriteActions,
+                "album",
+                album.raw || {}
+            )
+        ) {
+            card.appendChild(
+                qobuzFavoriteActions
+            );
         }
-    };
+    }
+
+    card.onclick =
+        function() {
+            if (
+                album.source ===
+                "local"
+            ) {
+                var localAlbumFromView =
+                    opts.sourceView ||
+                    "search";
+
+                if (
+                    localAlbumFromView ===
+                    "tidalsource"
+                ) {
+                    captureTidalSourceSearchStateFromDom();
+                } else if (
+                    localAlbumFromView ===
+                    "search"
+                ) {
+                    captureSearchRestoreState();
+                }
+
+                loadLocalAlbum(
+                    album.raw.artist ||
+                    album.artist ||
+                    "",
+                    album.raw.album ||
+                    album.title ||
+                    "",
+                    album.raw.album_id ||
+                    album.raw.group_id ||
+                    album.id ||
+                    "",
+                    localAlbumFromView
+                );
+
+                return;
+            }
+
+            if (
+                album.source ===
+                "qobuz"
+            ) {
+                openGlobalSearchQobuzAlbum(
+                    album
+                );
+
+                return;
+            }
+
+            if (album.id) {
+                if (
+                    opts.sourceView ===
+                    "tidalsource"
+                ) {
+                    captureTidalSourceSearchStateFromDom();
+                } else {
+                    captureSearchRestoreState();
+                }
+
+                loadTrackList(
+                    {
+                        id: album.id,
+                        cover: album.cover,
+                        title: album.title,
+                        artist: album.artist
+                    },
+                    "/tidal/album/" +
+                    album.id,
+                    opts.sourceView ===
+                        "tidalsource"
+                        ? "tidalsource"
+                        : "search"
+                );
+            }
+        };
+
     return card;
 }
 
-function renderSrovaSearchTrackRow(track, index, compact) {
-    var row = document.createElement("div");
-    row.className = "srovaSearchTrackRow" + (compact ? " compact" : "");
-    row.setAttribute("data-track-id", track.id);
-    row.innerHTML =
-        '<div class="srovaSearchTrackNum">' + index + '</div>' +
-        '<img class="srovaSearchTrackArt" src="' + escapeHtml(track.cover || localAlbumArtDataUri(track.title, track.artist)) + '" alt="">' +
-        '<div class="srovaSearchTrackTitleCell">' +
-          '<div class="srovaSearchTrackTitle">' + escapeHtml(track.title || "") + '</div>' +
-          '<div class="srovaSearchSourcePill">' + escapeHtml(track.source === "local" ? "LOCAL" : "TIDAL") + '</div>' +
-        '</div>' +
-        '<div class="srovaSearchTrackArtist">' + escapeHtml(track.artist || "") + '</div>' +
-        '<div class="srovaSearchTrackAlbum">' + escapeHtml(track.album || "") + '</div>' +
-        '<div class="srovaSearchTrackTime">' + formatTime(track.duration || 0) + '</div>';
+function renderSrovaSearchTrackRow(
+    track,
+    index,
+    compact
+) {
+    var row =
+        document.createElement(
+            "div"
+        );
 
-    var addBtn = document.createElement("button");
-    addBtn.className = "srovaSearchActionBtn";
-    addBtn.innerHTML = '<span class="material-icons">add</span>';
-    addBtn.title = "Track actions";
-    addBtn.setAttribute("aria-label", "Track actions");
-    addBtn.onclick = function(e) {
-        e.stopPropagation();
-        if (track.source === "tidal") {
-            showTidalSearchTrackMenu(addBtn, track, e);
-            return;
-        }
-        if (track.source === "local") {
-            showLocalSearchTrackMenu(addBtn, track, e);
-        }
-    };
-    row.appendChild(addBtn);
+    row.className =
+        "srovaSearchTrackRow" +
+        (
+            compact
+                ? " compact"
+                : ""
+        );
 
-    var heartBtn = document.createElement("button");
-    heartBtn.className = "srovaSearchActionBtn srovaSearchHeart";
-    heartBtn.innerHTML = '<span class="material-icons">favorite_border</span>';
-    heartBtn.title = "Favorite";
-    heartBtn.setAttribute("aria-label", "Favorite");
-    if (track.source === "tidal" && track.id) {
-        heartBtn.setAttribute("data-track-id", track.id);
-        updateSingleHeartEl(heartBtn, !!favTrackIds[track.id]);
-        heartBtn.onclick = function(e) {
-            e.stopPropagation();
-            toggleTrackFavorite(track.id, heartBtn);
-        };
-    } else {
-        heartBtn.disabled = true;
-        heartBtn.classList.add("disabled");
+    row.setAttribute(
+        "data-track-id",
+        track.id
+    );
+
+    if (
+        track.source ===
+        "qobuz"
+    ) {
+        qobuzSourceSearchApplyQuality(
+            row,
+            globalSearchQobuzSeed(
+                track,
+                "track"
+            )
+        );
     }
-    row.appendChild(heartBtn);
 
-    applyLocalArtworkFallback(row.querySelector(".srovaSearchTrackArt"), track.title, track.artist);
-    row.onclick = function() { playSrovaSearchTrack(track); };
+    var providerLabel =
+        globalSearchProviderLabel(
+            track.source
+        );
+
+    var artwork =
+        track.cover ||
+        (
+            track.source ===
+            "qobuz"
+                ? SROVA_STANDBY_ART
+                : localAlbumArtDataUri(
+                    track.title,
+                    track.artist
+                )
+        );
+
+    row.innerHTML =
+        '<div class="srovaSearchTrackNum">' +
+        index +
+        '</div>' +
+        '<img class="srovaSearchTrackArt" src="' +
+        escapeHtml(
+            artwork
+        ) +
+        '" alt="">' +
+        '<div class="srovaSearchTrackTitleCell">' +
+          '<div class="srovaSearchTrackTitle">' +
+          escapeHtml(
+              track.title ||
+              ""
+          ) +
+          '</div>' +
+          '<div class="srovaSearchSourcePill">' +
+          escapeHtml(
+              providerLabel
+          ) +
+          '</div>' +
+        '</div>' +
+        '<div class="srovaSearchTrackArtist">' +
+        escapeHtml(
+            track.artist ||
+            ""
+        ) +
+        '</div>' +
+        '<div class="srovaSearchTrackAlbum">' +
+        escapeHtml(
+            track.album ||
+            ""
+        ) +
+        '</div>' +
+        '<div class="srovaSearchTrackTime">' +
+        formatTime(
+            track.duration ||
+            0
+        ) +
+        '</div>';
+
+    var addBtn =
+        document.createElement(
+            "button"
+        );
+
+    addBtn.className =
+        "srovaSearchActionBtn";
+
+    addBtn.innerHTML =
+        '<span class="material-icons">' +
+        'add</span>';
+
+    addBtn.title =
+        "Track actions";
+
+    addBtn.setAttribute(
+        "aria-label",
+        "Track actions"
+    );
+
+    addBtn.onclick =
+        function(e) {
+            e.stopPropagation();
+
+            if (
+                track.source ===
+                "tidal"
+            ) {
+                showTidalSearchTrackMenu(
+                    addBtn,
+                    track,
+                    e
+                );
+
+                return;
+            }
+
+            if (
+                track.source ===
+                "qobuz"
+            ) {
+                showGlobalSearchQobuzTrackMenu(
+                    addBtn,
+                    track,
+                    e
+                );
+
+                return;
+            }
+
+            if (
+                track.source ===
+                "local"
+            ) {
+                showLocalSearchTrackMenu(
+                    addBtn,
+                    track,
+                    e
+                );
+            }
+        };
+
+    row.appendChild(
+        addBtn
+    );
+
+    if (
+        track.source === "tidal" &&
+        track.id
+    ) {
+        appendTidalSearchFavoriteHeart(
+            row,
+            "track",
+            track.id
+        );
+    } else if (
+        track.source === "qobuz" &&
+        track.id
+    ) {
+        appendQobuzSearchTrackFavoriteHeart(
+            row,
+            globalSearchQobuzSeed(
+                track,
+                "track"
+            )
+        );
+    }
+
+    if (
+        track.source !==
+        "qobuz"
+    ) {
+        applyLocalArtworkFallback(
+            row.querySelector(
+                ".srovaSearchTrackArt"
+            ),
+            track.title,
+            track.artist
+        );
+    }
+
+    row.onclick =
+        function() {
+            playSrovaSearchTrack(
+                track
+            );
+        };
+
     return row;
 }
 
 function searchTrackQueuePayload(track) {
-    if (track.source === "local") {
-        return buildLocalTrackPayload(track.raw, track.cover);
+    if (
+        track.source ===
+        "local"
+    ) {
+        return buildLocalTrackPayload(
+            track.raw,
+            track.cover
+        );
     }
+
+    if (
+        track.source ===
+        "qobuz"
+    ) {
+        var qobuzSeed =
+            globalSearchQobuzSeed(
+                track,
+                "track"
+            );
+
+        return buildQobuzWallTrackPayload(
+            qobuzSeed || {}
+        );
+    }
+
     return {
-        id: track.id,
-        title: track.title || "",
-        artist: track.artist || "",
-        album: track.album || "",
-        cover: track.cover || "",
-        duration: track.duration || 0,
-        quality: track.quality || ""
+        id:
+            track.id,
+        title:
+            track.title || "",
+        artist:
+            track.artist || "",
+        album:
+            track.album || "",
+        cover:
+            track.cover || "",
+        duration:
+            track.duration || 0,
+        quality:
+            track.quality || ""
     };
 }
 
@@ -12804,11 +29976,42 @@ function showLocalSearchTrackMenu(anchorEl, track, e) {
 }
 
 function playSrovaSearchTrack(track) {
-    if (track.source === "local") {
-        playLocalLibraryTrack(track.raw);
+    if (
+        track.source ===
+        "local"
+    ) {
+        playLocalLibraryTrack(
+            track.raw
+        );
+
         return;
     }
-    playSearchTrack(track.raw);
+
+    if (
+        track.source ===
+        "qobuz"
+    ) {
+        var qobuzSeed =
+            globalSearchQobuzSeed(
+                track,
+                "track"
+            );
+
+        if (
+            qobuzSeed &&
+            qobuzSeed.id
+        ) {
+            playQobuzWallTrackNow(
+                qobuzSeed
+            );
+        }
+
+        return;
+    }
+
+    playSearchTrack(
+        track.raw
+    );
 }
 
 function tidalSearchSection(title, items, rowRenderer) {
@@ -12886,6 +30089,9 @@ function renderSearchArtist(artist) {
 }
 
 function postTidalQueueReplace(payload) {
+    if (!requireNativePlaybackAvailable()) {
+        return Promise.reject(new Error(SPOTIFY_NATIVE_BLOCKED_MESSAGE));
+    }
     if (!requireOnlineSource()) {
         return Promise.reject(new Error(ONLINE_SOURCE_OFFLINE_MESSAGE));
     }
@@ -12963,7 +30169,12 @@ function handleTidalWallItemClick(item, fromView, e, anchorEl) {
         handleItemClick(item, fromView);
         return;
     }
-    showTidalTrackArtworkMenu(anchorEl, item, e);
+    showTidalTrackArtworkMenu(
+        anchorEl,
+        item,
+        e,
+        true
+    );
 }
 
 function buildTidalWallTrackPayload(item) {
@@ -12978,7 +30189,7 @@ function buildTidalWallTrackPayload(item) {
     };
 }
 
-function showTidalTrackArtworkMenu(anchorEl, item, e) {
+function showTidalTrackArtworkMenu(anchorEl, item, e, allowRadio) {
     if (e) { e.stopPropagation(); }
     if (!requireOnlineSource()) { return; }
     if (!item || !item.id) { return; }
@@ -13014,6 +30225,25 @@ function showTidalTrackArtworkMenu(anchorEl, item, e) {
         addMenuButton("playlist_add", "Add to Playlist", function() {
             showAddToTidalPlaylistModal(trackIds);
         });
+    }
+
+    /*
+     * H6.3: expose contextual Track Radio on the TIDAL provider wall.
+     * Global Search intentionally keeps calling this helper without
+     * fromView and therefore remains unchanged.
+     */
+    if (allowRadio === true) {
+        addMenuButton(
+            "radio",
+            "Start Radio",
+            function() {
+                startTidalRadioFromSeed(
+                    item,
+                    "track",
+                    "tidalsource"
+                );
+            }
+        );
     }
 
     positionQueuePopover(anchorEl, popover);
@@ -13132,23 +30362,53 @@ function loadTrackList(context, endpoint, fromView) {
                         ? "tidal-detail"
                         : "";
             setAlbumViewKind(tidalDetailKind);
+
+            if (
+                albumView &&
+                currentViewEndpoint.indexOf(
+                    "/tidal/mix/"
+                ) === 0 &&
+                fromView === "radio"
+            ) {
+                albumView.classList.add(
+                    "providerRadioDetail"
+                );
+            }
+
             showView("album");
             albumArt.src            = context.cover  || "";
             albumTitle.textContent  = context.title  || "";
-            var albumMeta = context.artist || "";
-            if (currentViewEndpoint.indexOf("/tidal/album/") === 0) {
-                var totalDuration = tracks.reduce(function(sum, t) {
-                    return sum + (Number(t.duration) || 0);
-                }, 0);
-                if (tracks.length) {
-                    albumMeta += (albumMeta ? " · " : "") + tracks.length + (tracks.length === 1 ? " track" : " tracks");
-                }
-                if (totalDuration) {
-                    albumMeta += (albumMeta ? " · " : "") + formatDuration(totalDuration);
-                }
-                albumMeta += (albumMeta ? " · " : "") + "Tidal";
+
+            var isTidalAlbum =
+                currentViewEndpoint.indexOf("/tidal/album/") === 0;
+
+            /*
+             * Q7H6 H6.2 — SOURCE 01 TIDAL personal Radio uses the
+             * native Mix endpoint, but must retain visible Radio identity.
+             * Ordinary TIDAL Mix detail is intentionally unchanged.
+             */
+            albumArtist.textContent =
+                (
+                    currentViewEndpoint.indexOf(
+                        "/tidal/mix/"
+                    ) === 0 &&
+                    fromView === "radio"
+                )
+                    ? "Artist Radio · TIDAL"
+                    : (context.artist || "");
+
+            if (isTidalAlbum) {
+                var tidalStats =
+                    streamingAlbumStatsText(tracks);
+
+                albumStatsLine.textContent =
+                    tidalStats;
+
+                albumStatsLine.className =
+                    tidalStats
+                        ? "streamingAlbumStatsLine"
+                        : "hidden";
             }
-            albumArtist.textContent = albumMeta;
             albumArtist.style.cursor  = "";
             albumArtist.onclick       = null;
             currentContext = context;
@@ -13171,16 +30431,21 @@ function loadTrackList(context, endpoint, fromView) {
                 _wireAlbumArtistClick(respArtistId, respArtistName || context.artist || "");
             }
 
-            if (albumTechInfo && tracks.length > 0) {
-                var firstQuality = tracks[0].quality || null;
-                if (firstQuality === "HI-RES") {
-                    albumTechInfo.textContent = "HI-RES FLAC";
-                    albumTechInfo.className   = "techInfoHiRes";
-                } else if (firstQuality === "CD") {
-                    albumTechInfo.textContent = "CD FLAC";
-                    albumTechInfo.className   = "techInfoCD";
-                } else {
-                    albumTechInfo.classList.add("hidden");
+            if (albumTechInfo) {
+                if (isTidalAlbum) {
+                    albumTechInfo.textContent = "";
+                    albumTechInfo.className = "hidden";
+                } else if (tracks.length > 0) {
+                    var firstQuality = tracks[0].quality || null;
+                    if (firstQuality === "HI-RES") {
+                        albumTechInfo.textContent = "HI-RES FLAC";
+                        albumTechInfo.className   = "techInfoHiRes";
+                    } else if (firstQuality === "CD") {
+                        albumTechInfo.textContent = "CD FLAC";
+                        albumTechInfo.className   = "techInfoCD";
+                    } else {
+                        albumTechInfo.classList.add("hidden");
+                    }
                 }
             }
 
@@ -13330,7 +30595,22 @@ function showQueuePopover(anchorEl, tracksList, e) {
     e.stopPropagation();
     closeActivePopover();
     var hasLocalTracks = queueTracksContainLocal(tracksList);
-    var tidalTrackIds = hasLocalTracks ? [] : normalizeTidalTrackIds(tracksList);
+    var hasQobuzTracks = Array.isArray(tracksList) &&
+        tracksList.some(function(track) {
+            return String(track && track.id || "").indexOf("qobuz:") === 0 ||
+                String(track && track.source || "").toLowerCase() === "qobuz";
+        });
+    var qobuzPlaylistTracks =
+        normalizeQobuzPlaylistTracks(
+            tracksList
+        );
+    var allQobuzTracks =
+        Array.isArray(tracksList) &&
+        tracksList.length > 0 &&
+        qobuzPlaylistTracks.length ===
+            tracksList.length;
+    var tidalTrackIds =
+        (hasLocalTracks || hasQobuzTracks) ? [] : normalizeTidalTrackIds(tracksList);
     if (hasLocalTracks && isLocalLibraryMaintenance()) {
         showQueueActionToast("Local Music is rebuilding", true);
         return;
@@ -13359,7 +30639,25 @@ function showQueuePopover(anchorEl, tracksList, e) {
 
     popover.appendChild(btnNext);
     popover.appendChild(btnAdd);
-    if (!hasLocalTracks && tidalTrackIds.length) {
+    if (allQobuzTracks) {
+        var btnQobuzPlaylist =
+            document.createElement("button");
+        btnQobuzPlaylist.className =
+            "queuePopoverBtn";
+        btnQobuzPlaylist.innerHTML =
+            '<span class="material-icons">playlist_add</span> Add to Playlist';
+        btnQobuzPlaylist.onclick =
+            function(ev) {
+                ev.stopPropagation();
+                closeActivePopover();
+                showAddToQobuzPlaylistModal(
+                    qobuzPlaylistTracks
+                );
+            };
+        popover.appendChild(
+            btnQobuzPlaylist
+        );
+    } else if (!hasLocalTracks && tidalTrackIds.length) {
         var btnPlaylist = document.createElement("button");
         btnPlaylist.className = "queuePopoverBtn";
         btnPlaylist.innerHTML = '<span class="material-icons">playlist_add</span> Add to Playlist';
@@ -13380,17 +30678,76 @@ document.addEventListener("click", function() { closeActivePopover(); });
 
 // --- Build a track payload object from a track row data ---
 
+function streamingTrackArtworkUrl(track, fallbackCover) {
+    track = track || {};
+
+    var artworkObject =
+        track.artwork &&
+        typeof track.artwork === "object"
+            ? track.artwork
+            : null;
+
+    return String(
+        track.cover ||
+        track.artwork_url ||
+        (
+            artworkObject &&
+            artworkObject.url
+        ) ||
+        fallbackCover ||
+        ""
+    );
+}
+
 function buildTrackPayload(t, ctxCover) {
     var viewCover = ctxCover || (currentContext ? (currentContext.cover || "") : "") || "";
-    var preferTrackCover = currentViewEndpoint && currentViewEndpoint.indexOf("/tidal/artist/") === 0;
-    return {
+
+    var tidalPlaylist =
+        currentViewEndpoint &&
+        currentViewEndpoint.indexOf("/tidal/playlist/") === 0;
+
+    var qobuzPlaylist =
+        currentViewEndpoint &&
+        currentViewEndpoint.indexOf("qobuz:playlist:") === 0;
+
+    var streamingPlaylist =
+        tidalPlaylist ||
+        qobuzPlaylist;
+
+    var preferTrackCover = currentViewEndpoint && (
+        currentViewEndpoint.indexOf("/tidal/artist/") === 0 ||
+        currentViewEndpoint.indexOf("/tidal/radio/") === 0 ||
+        currentViewEndpoint.indexOf("qobuz:artist:") === 0 ||
+        streamingPlaylist
+    );
+
+    var trackCover =
+        streamingTrackArtworkUrl(
+            t,
+            viewCover
+        );
+
+    var payload = {
         id:       t.id,
         title:    t.title   || "",
         artist:   t.artist  || (currentContext ? (currentContext.artist || "") : ""),
-        cover:    preferTrackCover ? (t.cover || viewCover) : (viewCover || t.cover || ""),
+        cover:    preferTrackCover ? trackCover : (viewCover || trackCover),
         duration: t.duration || 0,
         quality:  t.quality  || ""
     };
+    if (
+        String(t.id || "").indexOf("qobuz:") === 0 ||
+        String(t.source || "").toLowerCase() === "qobuz"
+    ) {
+        payload.source = "qobuz";
+        payload.provider_track_id = String(
+            t.provider_track_id ||
+            (String(t.id || "").indexOf("qobuz:") === 0
+                ? String(t.id).slice(6)
+                : "")
+        );
+    }
+    return payload;
 }
 
 
@@ -13403,21 +30760,78 @@ function renderTrackList(tracks) {
     else           { trackList.classList.remove("trackListWide"); }
 
     var ctxCover = currentContext ? (currentContext.cover || "") : "";
-    var canRemoveFromPlaylist = currentViewEndpoint &&
-        currentViewEndpoint.indexOf("/tidal/playlist/") === 0 &&
+    var tidalPlaylistDetail =
+        currentViewEndpoint &&
+        currentViewEndpoint.indexOf("/tidal/playlist/") === 0;
+
+    var qobuzPlaylistDetail =
+        currentViewEndpoint &&
+        currentViewEndpoint.indexOf("qobuz:playlist:") === 0 &&
+        currentContext &&
+        currentContext.source === "qobuz";
+
+    var streamingPlaylistDetail =
+        tidalPlaylistDetail ||
+        qobuzPlaylistDetail;
+
+    var canRemoveFromTidalPlaylist =
+        tidalPlaylistDetail &&
         previousView === "playlists" &&
         currentContext &&
         currentContext.id;
 
+    var canRemoveFromQobuzPlaylist =
+        qobuzPlaylistDetail &&
+        currentContext.playlist_editable === true &&
+        currentContext.id;
+
+    var canRemoveFromPlaylist =
+        canRemoveFromTidalPlaylist ||
+        canRemoveFromQobuzPlaylist;
+
+    var qobuzReadOnlyPlaylist =
+        qobuzPlaylistDetail;
+
+    var qobuzReadOnlyTrack =
+        currentViewEndpoint &&
+        currentViewEndpoint.indexOf("qobuz:track:") === 0 &&
+        currentContext &&
+        currentContext.source === "qobuz";
+
+    var qobuzReadOnlyDetail =
+        qobuzReadOnlyPlaylist ||
+        qobuzReadOnlyTrack;
+
+    var tidalRadioDetail =
+        currentViewEndpoint &&
+        currentViewEndpoint.indexOf(
+            "/tidal/radio/"
+        ) === 0;
+
     tracks.forEach(function(track, idx) {
+        var rowTrackCover =
+            streamingTrackArtworkUrl(
+                track,
+                ""
+            );
+
         trackMap[String(track.id)] = {
             title:    track.title  || "",
             artist:   track.artist || (currentContext ? (currentContext.artist || "") : ""),
-            cover:    ctxCover || track.cover || "",
+            cover:    (
+                streamingPlaylistDetail ||
+                qobuzReadOnlyTrack ||
+                tidalRadioDetail
+            )
+                ? (rowTrackCover || ctxCover)
+                : (ctxCover || rowTrackCover),
             duration: track.duration || 0
         };
         var row = document.createElement("div");
-        row.className = (hasArtist ? "track trackWide" : "track") + (canRemoveFromPlaylist ? " playlistEditableTrack" : "");
+        row.className =
+            (hasArtist ? "track trackWide" : "track") +
+            (streamingPlaylistDetail ? " streamingPlaylistTrack" : "") +
+            (canRemoveFromPlaylist ? " playlistEditableTrack" : "");
         row.setAttribute("data-track-id", String(track.id));
 
         // Inner content columns (no "+" button inside the grid columns --
@@ -13435,19 +30849,34 @@ function renderTrackList(tracks) {
                 '<div class="track-duration">' + formatTime(track.duration) + '</div>';
         }
 
-        // Heart (favorite) button -- always rendered; faved ones stay visible in red
-        var heartBtn = document.createElement("button");
-        heartBtn.className = "trackHeart";
-        heartBtn.setAttribute("data-track-id", String(track.id));
-        heartBtn.innerHTML = '<span class="material-icons">favorite_border</span>';
-        heartBtn.title = "Favorite";
-        (function(tid, btn) {
-            btn.onclick = function(e) {
-                e.stopPropagation();
-                toggleTrackFavorite(tid, btn);
-            };
-        }(String(track.id), heartBtn));
-        row.appendChild(heartBtn);
+        // Q10I supersedes only the old Qobuz no-Favorite behavior.
+        // The historical guards remain visible as provider-boundary evidence.
+        if (!qobuzReadOnlyPlaylist) {
+            if (!qobuzReadOnlyTrack) {
+                var heartBtn = document.createElement("button");
+                heartBtn.className = "trackHeart";
+                heartBtn.setAttribute("data-track-id", String(track.id));
+                heartBtn.innerHTML = '<span class="material-icons">favorite_border</span>';
+                heartBtn.title = "Favorite";
+                (function(tid, btn) {
+                    btn.onclick = function(e) {
+                        e.stopPropagation();
+                        toggleTrackFavorite(tid, btn);
+                    };
+                }(String(track.id), heartBtn));
+                row.appendChild(heartBtn);
+            } else {
+                appendQobuzTrackFavoriteHeart(
+                    row,
+                    track
+                );
+            }
+        } else {
+            appendQobuzTrackFavoriteHeart(
+                row,
+                track
+            );
+        }
 
         // "+" button -- appended after the grid columns, positioned via CSS
         var addBtn = document.createElement("button");
@@ -13472,7 +30901,11 @@ function renderTrackList(tracks) {
             (function(t, btn, rowRef) {
                 btn.onclick = function(e) {
                     e.stopPropagation();
-                    showRemoveFromTidalPlaylistModal(t, rowRef);
+                    if (canRemoveFromQobuzPlaylist) {
+                        showRemoveFromQobuzPlaylistModal(t, rowRef);
+                    } else {
+                        showRemoveFromTidalPlaylistModal(t, rowRef);
+                    }
                 };
             }(track, removeBtn, row));
             row.appendChild(removeBtn);
@@ -13492,6 +30925,204 @@ function renderTrackList(tracks) {
 }
 
 
+// --- Q10K finite-collection Play All helpers ---
+
+function playFiniteCollectionFromHeader(
+    tracks,
+    ctxCover
+) {
+    tracks =
+        Array.isArray(tracks)
+            ? tracks
+            : [];
+
+    if (!tracks.length) {
+        return;
+    }
+
+    /*
+     * Q10K: Artist detail is a mixed Top Tracks + Discography view.
+     * Play All therefore means the displayed Top Tracks collection
+     * only. Reuse the same dedicated playback path as row one for
+     * both TIDAL and Qobuz artists.
+     */
+    var artistTopTracks =
+        currentViewEndpoint &&
+        (
+            currentViewEndpoint.indexOf(
+                "/tidal/artist/"
+            ) === 0 ||
+            (
+                currentViewEndpoint.indexOf(
+                    "qobuz:artist:"
+                ) === 0 &&
+                currentContext &&
+                currentContext.source ===
+                    "qobuz"
+            )
+        );
+
+    if (artistTopTracks) {
+        _playArtistTopTrack(
+            tracks[0],
+            0,
+            tracks,
+            currentContext
+                ? (
+                    currentContext.title ||
+                    ""
+                )
+                : "",
+            ctxCover ||
+                (
+                    currentContext
+                        ? (
+                            currentContext.cover ||
+                            ""
+                        )
+                        : ""
+                )
+        );
+
+        return;
+    }
+
+    playTrack(
+        tracks[0],
+        0
+    );
+}
+
+
+function renderProviderRadioPlayAllBtn(
+    tracks,
+    onPlay,
+    queuePayload
+) {
+    var existing =
+        document.getElementById(
+            "albumQueueBtnGroup"
+        );
+
+    if (
+        existing &&
+        existing.parentNode
+    ) {
+        existing.parentNode.removeChild(
+            existing
+        );
+    }
+
+    tracks =
+        Array.isArray(tracks)
+            ? tracks
+            : [];
+
+    queuePayload =
+        Array.isArray(queuePayload)
+            ? queuePayload
+            : [];
+
+    if (
+        !tracks.length ||
+        typeof onPlay !== "function"
+    ) {
+        return;
+    }
+
+    var albumHeader =
+        document.getElementById(
+            "albumHeader"
+        );
+
+    if (!albumHeader) {
+        return;
+    }
+
+    var group =
+        document.createElement(
+            "div"
+        );
+
+    group.id =
+        "albumQueueBtnGroup";
+
+    group.className =
+        "albumQueueBtnGroup";
+
+    var playAllBtn =
+        document.createElement(
+            "button"
+        );
+
+    playAllBtn.className =
+        "albumQueueBtn";
+
+    playAllBtn.innerHTML =
+        '<span class="material-icons">' +
+        'play_arrow</span>';
+
+    playAllBtn.title =
+        "Play All";
+
+    playAllBtn.setAttribute(
+        "aria-label",
+        "Play All"
+    );
+
+    playAllBtn.onclick =
+        function(e) {
+            e.stopPropagation();
+            onPlay();
+        };
+
+    group.appendChild(
+        playAllBtn
+    );
+
+    if (queuePayload.length) {
+        var addBtn =
+            document.createElement(
+                "button"
+            );
+
+        addBtn.className =
+            "albumQueueBtn";
+
+        addBtn.innerHTML =
+            '<span class="material-icons">' +
+            'playlist_add</span>';
+
+        addBtn.title =
+            "Add to queue";
+
+        addBtn.setAttribute(
+            "aria-label",
+            "Add to queue"
+        );
+
+        addBtn.onclick =
+            function(e) {
+                e.stopPropagation();
+
+                showQueuePopover(
+                    addBtn,
+                    queuePayload,
+                    e
+                );
+            };
+
+        group.appendChild(
+            addBtn
+        );
+    }
+
+    albumHeader.appendChild(
+        group
+    );
+}
+
+
 // --- Album header queue buttons ---
 
 function renderAlbumQueueBtn(tracks, ctxCover) {
@@ -13499,13 +31130,55 @@ function renderAlbumQueueBtn(tracks, ctxCover) {
     if (existing) { existing.parentNode.removeChild(existing); }
 
     tracks = Array.isArray(tracks) ? tracks : [];
-    var canRenamePlaylist =
+    var canRenameTidalPlaylist =
         currentViewEndpoint.indexOf("/tidal/playlist/") === 0 &&
         currentContext &&
         currentContext.playlist_editable === true &&
         String(currentContext.id || "").trim();
 
-    if (tracks.length === 0 && !canRenamePlaylist) { return; }
+    var canRenameQobuzPlaylist =
+        currentContext &&
+        currentContext.source === "qobuz" &&
+        currentContext.type === "playlist" &&
+        currentContext.playlist_editable === true &&
+        String(currentContext.id || "").trim();
+
+    var canRenamePlaylist =
+        canRenameTidalPlaylist ||
+        canRenameQobuzPlaylist;
+
+    // Q10I: a valid provider Favorite is itself a header action.
+    // Do not suppress album/artist Favorite controls merely because
+    // an artist currently has zero Top Tracks.
+    var canRenderHeaderFavorite =
+        currentContext &&
+        String(
+            currentContext.id ||
+            ""
+        ).trim() &&
+        (
+            currentViewEndpoint.indexOf(
+                "/tidal/album/"
+            ) === 0 ||
+            currentViewEndpoint.indexOf(
+                "/tidal/artist/"
+            ) === 0 ||
+            (
+                currentViewEndpoint.indexOf(
+                    "qobuz:artist:"
+                ) === 0 &&
+                currentContext.source ===
+                    "qobuz"
+            )
+        );
+
+    if (
+        tracks.length === 0 &&
+        !canRenamePlaylist &&
+        !canRenderHeaderFavorite
+    ) {
+        return;
+    }
 
     var albumHeader = document.getElementById("albumHeader");
     if (!albumHeader) { return; }
@@ -13514,32 +31187,185 @@ function renderAlbumQueueBtn(tracks, ctxCover) {
     group.id        = "albumQueueBtnGroup";
     group.className = "albumQueueBtnGroup";
 
-    // Header heart -- album or artist only (no API for mixes/playlists)
+    if (tracks.length > 0) {
+        var playAllBtn =
+            document.createElement(
+                "button"
+            );
+
+        playAllBtn.className =
+            "albumQueueBtn";
+
+        playAllBtn.innerHTML =
+            '<span class="material-icons">' +
+            'play_arrow</span>';
+
+        playAllBtn.title =
+            "Play All";
+
+        playAllBtn.setAttribute(
+            "aria-label",
+            "Play All"
+        );
+
+        playAllBtn.onclick =
+            function(e) {
+                e.stopPropagation();
+
+                playFiniteCollectionFromHeader(
+                    tracks,
+                    ctxCover
+                );
+            };
+
+        group.appendChild(
+            playAllBtn
+        );
+    }
+
+    // Header Heart -- provider-aware album/artist Favorites only.
+    // Playlists/mixes keep their historical no-header-Heart behavior.
     var heartType = "";
     var heartId   = "";
-    if (currentViewEndpoint.indexOf("/tidal/album/") === 0) {
+    var heartProvider = "tidal";
+
+    if (
+        currentViewEndpoint.indexOf(
+            "/tidal/album/"
+        ) === 0
+    ) {
         heartType = "album";
-        heartId   = currentContext ? String(currentContext.id || "") : "";
-    } else if (currentViewEndpoint.indexOf("/tidal/artist/") === 0) {
+        heartId =
+            currentContext
+                ? String(
+                    currentContext.id ||
+                    ""
+                )
+                : "";
+    } else if (
+        currentViewEndpoint.indexOf(
+            "/tidal/artist/"
+        ) === 0
+    ) {
         heartType = "artist";
-        heartId   = currentContext ? String(currentContext.id || "") : "";
+        heartId =
+            currentContext
+                ? String(
+                    currentContext.id ||
+                    ""
+                )
+                : "";
+    } else if (
+        currentViewEndpoint.indexOf(
+            "qobuz:artist:"
+        ) === 0 &&
+        currentContext &&
+        currentContext.source ===
+            "qobuz"
+    ) {
+        heartProvider = "qobuz";
+        heartType = "artist";
+        heartId =
+            String(
+                currentContext.id ||
+                ""
+            );
     }
+
     if (heartType && heartId) {
-        var heartBtn = document.createElement("button");
-        heartBtn.id        = "albumHeaderHeart";
-        heartBtn.className = "albumQueueBtn";
-        heartBtn.innerHTML = '<span class="material-icons">favorite_border</span>';
-        heartBtn.title     = heartType === "album" ? "Favorite album" : "Favorite artist";
-        heartBtn.setAttribute("data-heart-type", heartType);
-        heartBtn.setAttribute("data-heart-id",   heartId);
-        (function(htype, hid, btn) {
-            btn.onclick = function(e) {
-                e.stopPropagation();
-                if (htype === "album")  { toggleAlbumFavorite(hid, btn); }
-                if (htype === "artist") { toggleArtistFavorite(hid, btn); }
-            };
-        }(heartType, heartId, heartBtn));
-        group.appendChild(heartBtn);
+        var heartBtn = null;
+
+        if (
+            heartProvider ===
+            "qobuz"
+        ) {
+            heartBtn =
+                makeQobuzFavoriteHeart(
+                    heartType,
+                    heartId,
+                    "albumQueueBtn",
+                    heartType === "album"
+                        ? "Favorite album"
+                        : "Favorite artist"
+                );
+
+            if (heartBtn) {
+                heartBtn.id =
+                    "albumHeaderHeart";
+            }
+        } else {
+            heartBtn =
+                document.createElement(
+                    "button"
+                );
+
+            heartBtn.id =
+                "albumHeaderHeart";
+
+            heartBtn.className =
+                "albumQueueBtn";
+
+            heartBtn.innerHTML =
+                '<span class="material-icons">' +
+                'favorite_border' +
+                '</span>';
+
+            heartBtn.title =
+                heartType === "album"
+                    ? "Favorite album"
+                    : "Favorite artist";
+
+            heartBtn.setAttribute(
+                "data-heart-type",
+                heartType
+            );
+
+            heartBtn.setAttribute(
+                "data-heart-id",
+                heartId
+            );
+
+            (function(
+                htype,
+                hid,
+                btn
+            ) {
+                btn.onclick =
+                    function(e) {
+                        e.stopPropagation();
+
+                        if (
+                            htype ===
+                            "album"
+                        ) {
+                            toggleAlbumFavorite(
+                                hid,
+                                btn
+                            );
+                        }
+
+                        if (
+                            htype ===
+                            "artist"
+                        ) {
+                            toggleArtistFavorite(
+                                hid,
+                                btn
+                            );
+                        }
+                    };
+            }(
+                heartType,
+                heartId,
+                heartBtn
+            ));
+        }
+
+        if (heartBtn) {
+            group.appendChild(
+                heartBtn
+            );
+        }
     }
 
     if (canRenamePlaylist) {
@@ -13551,7 +31377,8 @@ function renderAlbumQueueBtn(tracks, ctxCover) {
         renameBtn.setAttribute("aria-label", "Rename playlist");
         renameBtn.onclick = function(e) {
             e.stopPropagation();
-            showCreateTidalPlaylistModal({
+
+            var options = {
                 title: "Rename Playlist",
                 submitLabel: "Rename",
                 busyLabel: "Renaming...",
@@ -13560,7 +31387,20 @@ function renderAlbumQueueBtn(tracks, ctxCover) {
                 mode: "rename",
                 playlistId: currentContext.id,
                 editable: currentContext.playlist_editable === true
-            });
+            };
+
+            if (
+                canRenameQobuzPlaylist
+            ) {
+                showCreateQobuzPlaylistModal(
+                    options
+                );
+                return;
+            }
+
+            showCreateTidalPlaylistModal(
+                options
+            );
         };
         group.appendChild(renameBtn);
     }
@@ -14037,7 +31877,9 @@ function saveViewTracksAsPlaylist(tracks) {
         return;
     }
     showCreateTidalPlaylistModal({
-        title: "Save as Playlist",
+        title: tidalPlaylistModalPresentationTitle(
+            "Save as Playlist"
+        ),
         submitLabel: "Save",
         hideDescription: true,
         mode: "tracks",
@@ -14049,7 +31891,14 @@ function saveViewTracksAsPlaylist(tracks) {
 // --- Play track from album/detail view using full context queue ---
 
 function playTrack(track, idx) {
-    if (currentViewEndpoint && currentViewEndpoint.indexOf("/tidal/") === 0 && !requireOnlineSource()) { return; }
+    if (
+        currentViewEndpoint &&
+        (
+            currentViewEndpoint.indexOf("/tidal/") === 0 ||
+            currentViewEndpoint.indexOf("qobuz:") === 0
+        ) &&
+        !requireOnlineSource()
+    ) { return; }
     clearRadioIdleStandbyTimer();
     resetTidalInfinitePlayGuard();
     var ctxCover = currentContext ? (currentContext.cover || "") : "";
@@ -14080,6 +31929,18 @@ function playTrack(track, idx) {
         ctxId   = currentContext ? String(currentContext.id || "") : "";
     } else if (currentViewEndpoint.indexOf("/tidal/artist/")   === 0) {
         ctxType = "artist";
+        ctxId   = currentContext ? String(currentContext.id || "") : "";
+    } else if (currentViewEndpoint.indexOf("/tidal/radio/artist/") === 0) {
+        ctxType = "tidal_radio_artist";
+        ctxId   = currentContext ? String(currentContext.id || "") : "";
+    } else if (currentViewEndpoint.indexOf("/tidal/radio/track/") === 0) {
+        ctxType = "tidal_radio_track";
+        ctxId   = currentContext ? String(currentContext.id || "") : "";
+    } else if (currentViewEndpoint.indexOf("qobuz:playlist:") === 0) {
+        ctxType = "playlist";
+        ctxId   = currentContext ? String(currentContext.id || "") : "";
+    } else if (currentViewEndpoint.indexOf("qobuz:track:") === 0) {
+        ctxType = "track";
         ctxId   = currentContext ? String(currentContext.id || "") : "";
     }
     _setPlaybackSource(ctxType || "album", ctxId, ctxTitle);
@@ -14141,6 +32002,7 @@ function handleSeekResponse(data, requestedPosition) {
 }
 
 function requestSeekTo(seekSec) {
+    if (!requireNativePlaybackAvailable()) { return; }
     if (lastKnownPlaybackStatus && isRadioLiveStatus(lastKnownPlaybackStatus)) {
         skipRadioRestoreSeek();
         return;
@@ -14273,7 +32135,9 @@ function renderQueue(data, options) {
     saveBtn.title       = "Save as Playlist";
     saveBtn.onclick = function() {
         showCreateTidalPlaylistModal({
-            title: "Save Queue as Playlist",
+            title: tidalPlaylistModalPresentationTitle(
+                "Save Queue as Playlist"
+            ),
             submitLabel: "Save",
             hideDescription: true,
             mode: "queue"
@@ -14741,6 +32605,10 @@ function openQueueRemoveConfirm(track, onConfirm) {
 }
 
 function buildQueueRow(track, absIdx, isNowPlaying, isPlayed, isUpcoming) {
+    var queueTrackIsQobuz = (
+        String((track && track.source) || "").toLowerCase() === "qobuz" ||
+        String((track && track.id) || "").indexOf("qobuz:") === 0
+    );
     var row = document.createElement("div");
     row.className = "queueRow" +
         (isNowPlaying ? " queueRowPlaying" : "") +
@@ -14833,6 +32701,7 @@ function buildQueueRow(track, absIdx, isNowPlaying, isPlayed, isUpcoming) {
             if (row._suppressQueueClickUntil && Date.now() < row._suppressQueueClickUntil) {
                 return;
             }
+            if (!requireNativePlaybackAvailable()) { return; }
             fetch("/tidal/queue/jump/" + idx)
             .then(function(res) { return res.json().catch(function() { return {}; }); })
             .then(function(data) {
@@ -14841,7 +32710,7 @@ function buildQueueRow(track, absIdx, isNowPlaying, isPlayed, isUpcoming) {
                     return;
                 }
                 startTime = Date.now() / 1000;
-                playing   = true;
+                playing   = !queueTrackIsQobuz;
                 setPlayerHasActiveMedia(true);
                 progressFill._elapsed = 0;
                 updatePlayPauseIcon();
@@ -14855,6 +32724,1000 @@ function buildQueueRow(track, absIdx, isNowPlaying, isPlayed, isUpcoming) {
 
 
 // --- Favorites ---
+
+function qobuzFavoriteNativeId(
+    favoriteType,
+    value
+) {
+    favoriteType =
+        String(
+            favoriteType || ""
+        ).trim().toLowerCase();
+
+    var nativeId =
+        String(
+            value == null
+                ? ""
+                : value
+        ).trim();
+
+    if (favoriteType === "track") {
+        if (
+            nativeId.indexOf(
+                "qobuz:"
+            ) === 0
+        ) {
+            nativeId =
+                nativeId.slice(6);
+        }
+
+        if (
+            !/^[0-9]+$/.test(nativeId) ||
+            /^0+$/.test(nativeId)
+        ) {
+            return "";
+        }
+
+        return nativeId;
+    }
+
+    if (favoriteType === "artist") {
+        if (
+            nativeId.indexOf(
+                "qobuz:artist:"
+            ) === 0
+        ) {
+            nativeId =
+                nativeId.slice(14);
+        }
+
+        if (
+            !/^[0-9]+$/.test(nativeId) ||
+            /^0+$/.test(nativeId)
+        ) {
+            return "";
+        }
+
+        return nativeId;
+    }
+
+    if (favoriteType === "album") {
+        if (
+            nativeId.indexOf(
+                "qobuz:album:"
+            ) === 0
+        ) {
+            nativeId =
+                nativeId.slice(12);
+        }
+
+        if (
+            !nativeId ||
+            nativeId.length > 512 ||
+            /[\x00-\x20\x7f]/.test(
+                nativeId
+            )
+        ) {
+            return "";
+        }
+
+        return nativeId;
+    }
+
+    return "";
+}
+
+
+function qobuzFavoriteMap(
+    favoriteType
+) {
+    favoriteType =
+        String(
+            favoriteType || ""
+        ).trim().toLowerCase();
+
+    if (favoriteType === "track") {
+        return qobuzFavTrackIds;
+    }
+
+    if (favoriteType === "album") {
+        return qobuzFavAlbumIds;
+    }
+
+    if (favoriteType === "artist") {
+        return qobuzFavArtistIds;
+    }
+
+    return null;
+}
+
+
+function qobuzFavoriteState(
+    favoriteType,
+    itemId
+) {
+    var nativeId =
+        qobuzFavoriteNativeId(
+            favoriteType,
+            itemId
+        );
+
+    var map =
+        qobuzFavoriteMap(
+            favoriteType
+        );
+
+    return !!(
+        nativeId &&
+        map &&
+        map[nativeId]
+    );
+}
+
+
+function qobuzFavoriteIdsToSet(
+    favoriteType,
+    values
+) {
+    if (!Array.isArray(values)) {
+        throw new Error(
+            "Invalid Qobuz Favorite IDs"
+        );
+    }
+
+    var result = {};
+
+    for (
+        var i = 0;
+        i < values.length;
+        i++
+    ) {
+        var nativeId =
+            qobuzFavoriteNativeId(
+                favoriteType,
+                values[i]
+            );
+
+        if (!nativeId) {
+            throw new Error(
+                "Invalid Qobuz Favorite ID"
+            );
+        }
+
+        result[nativeId] = true;
+    }
+
+    return result;
+}
+
+
+function clearQobuzFavoriteIds() {
+    qobuzFavoriteIdsRequestSerial += 1;
+    qobuzFavoriteIdsLoadPromise = null;
+    qobuzFavoriteIdsLoaded = false;
+
+    qobuzFavTrackIds = {};
+    qobuzFavAlbumIds = {};
+    qobuzFavArtistIds = {};
+
+    updateHeartStates();
+}
+
+
+function loadQobuzFavoriteIds(
+    force
+) {
+    force = force === true;
+
+    if (
+        streamingProviderAuthState.qobuz ===
+        false
+    ) {
+        clearQobuzFavoriteIds();
+
+        return Promise.resolve(
+            false
+        );
+    }
+
+    if (
+        streamingProviderAuthState.qobuz !==
+        true
+    ) {
+        return Promise.resolve(
+            false
+        );
+    }
+
+    if (
+        qobuzFavoriteIdsLoaded &&
+        !force
+    ) {
+        updateHeartStates();
+
+        return Promise.resolve(
+            true
+        );
+    }
+
+    if (
+        qobuzFavoriteIdsLoadPromise &&
+        !force
+    ) {
+        return qobuzFavoriteIdsLoadPromise;
+    }
+
+    var requestSerial =
+        ++qobuzFavoriteIdsRequestSerial;
+
+    var request =
+        fetchWithTimeout(
+            "/qobuz/favorites/ids?_=" +
+                encodeURIComponent(
+                    String(Date.now())
+                ),
+            {
+                cache: "no-store"
+            },
+            5000
+        )
+        .then(function(response) {
+            if (!response.ok) {
+                throw new Error(
+                    "Qobuz Favorite state unavailable"
+                );
+            }
+
+            return response.json();
+        })
+        .then(function(data) {
+            if (
+                requestSerial !==
+                    qobuzFavoriteIdsRequestSerial ||
+                streamingProviderAuthState.qobuz !==
+                    true
+            ) {
+                return false;
+            }
+
+            if (
+                !data ||
+                data.ok !== true
+            ) {
+                throw new Error(
+                    (
+                        data &&
+                        (
+                            data.message ||
+                            data.error
+                        )
+                    ) ||
+                    "Qobuz Favorite state unavailable"
+                );
+            }
+
+            var nextTracks =
+                qobuzFavoriteIdsToSet(
+                    "track",
+                    data.track_ids
+                );
+
+            var nextAlbums =
+                qobuzFavoriteIdsToSet(
+                    "album",
+                    data.album_ids
+                );
+
+            var nextArtists =
+                qobuzFavoriteIdsToSet(
+                    "artist",
+                    data.artist_ids
+                );
+
+            if (
+                requestSerial !==
+                    qobuzFavoriteIdsRequestSerial ||
+                streamingProviderAuthState.qobuz !==
+                    true
+            ) {
+                return false;
+            }
+
+            qobuzFavTrackIds =
+                nextTracks;
+
+            qobuzFavAlbumIds =
+                nextAlbums;
+
+            qobuzFavArtistIds =
+                nextArtists;
+
+            qobuzFavoriteIdsLoaded =
+                true;
+
+            updateHeartStates();
+
+            return true;
+        })
+        .catch(function() {
+            return false;
+        });
+
+    qobuzFavoriteIdsLoadPromise =
+        request.then(
+            function(result) {
+                if (
+                    requestSerial ===
+                    qobuzFavoriteIdsRequestSerial
+                ) {
+                    qobuzFavoriteIdsLoadPromise =
+                        null;
+                }
+
+                return result;
+            }
+        );
+
+    return qobuzFavoriteIdsLoadPromise;
+}
+
+
+function qobuzNowPlayingFavoriteActive() {
+    var activeSource =
+        String(
+            playerBarActivePlaybackSource ||
+            ""
+        ).toLowerCase();
+
+    if (activeSource === "qobuz") {
+        return true;
+    }
+
+    if (activeSource) {
+        return false;
+    }
+
+    var status =
+        lastKnownPlaybackStatus ||
+        {};
+
+    if (
+        !currentPlayingId ||
+        String(
+            status.current_track_id ||
+            ""
+        ) !==
+            String(
+                currentPlayingId
+            )
+    ) {
+        return false;
+    }
+
+    return (
+        inferStatusPlaybackSource(
+            status
+        ) === "qobuz"
+    );
+}
+
+
+function updateQobuzFavoriteElements(
+    favoriteType,
+    itemId
+) {
+    var nativeId =
+        qobuzFavoriteNativeId(
+            favoriteType,
+            itemId
+        );
+
+    if (!nativeId) {
+        return;
+    }
+
+    var isFavorite =
+        qobuzFavoriteState(
+            favoriteType,
+            nativeId
+        );
+
+    var hearts =
+        document.querySelectorAll(
+            '[data-heart-provider="qobuz"]'
+        );
+
+    for (
+        var i = 0;
+        i < hearts.length;
+        i++
+    ) {
+        var heart = hearts[i];
+
+        if (
+            heart.getAttribute(
+                "data-heart-type"
+            ) === favoriteType &&
+            heart.getAttribute(
+                "data-heart-id"
+            ) === nativeId
+        ) {
+            updateSingleHeartEl(
+                heart,
+                isFavorite
+            );
+        }
+    }
+
+    if (
+        favoriteType === "track"
+    ) {
+        updateNpHeart();
+    }
+}
+
+
+function setQobuzFavoriteState(
+    favoriteType,
+    itemId,
+    desiredState
+) {
+    favoriteType =
+        String(
+            favoriteType || ""
+        ).trim().toLowerCase();
+
+    var nativeId =
+        qobuzFavoriteNativeId(
+            favoriteType,
+            itemId
+        );
+
+    var map =
+        qobuzFavoriteMap(
+            favoriteType
+        );
+
+    if (
+        !nativeId ||
+        !map ||
+        typeof desiredState !==
+            "boolean"
+    ) {
+        return Promise.resolve(
+            false
+        );
+    }
+
+    var key =
+        favoriteType +
+        ":" +
+        nativeId;
+
+    var mutationSerial =
+        (
+            qobuzFavoriteMutationSerial[
+                key
+            ] ||
+            0
+        ) + 1;
+
+    qobuzFavoriteMutationSerial[
+        key
+    ] = mutationSerial;
+
+    var previousState =
+        !!map[nativeId];
+
+    if (desiredState) {
+        map[nativeId] = true;
+    } else {
+        delete map[nativeId];
+    }
+
+    updateQobuzFavoriteElements(
+        favoriteType,
+        nativeId
+    );
+
+    return postJson(
+        "/qobuz/favorite/set",
+        {
+            type:
+                favoriteType,
+            id:
+                nativeId,
+            is_favorite:
+                desiredState
+        }
+    )
+    .then(function(data) {
+        if (
+            qobuzFavoriteMutationSerial[
+                key
+            ] !== mutationSerial
+        ) {
+            return false;
+        }
+
+        if (
+            !data ||
+            data.ok !== true ||
+            String(
+                data.type || ""
+            ) !== favoriteType ||
+            String(
+                data.id || ""
+            ) !== nativeId ||
+            data.is_favorite !==
+                desiredState
+        ) {
+            throw new Error(
+                (
+                    data &&
+                    (
+                        data.message ||
+                        data.error
+                    )
+                ) ||
+                "Qobuz Favorite update failed"
+            );
+        }
+
+        if (desiredState) {
+            map[nativeId] = true;
+        } else {
+            delete map[nativeId];
+        }
+
+        qobuzFavoriteIdsLoaded =
+            true;
+
+        updateQobuzFavoriteElements(
+            favoriteType,
+            nativeId
+        );
+
+        return true;
+    })
+    .catch(function(error) {
+        if (
+            qobuzFavoriteMutationSerial[
+                key
+            ] === mutationSerial
+        ) {
+            if (previousState) {
+                map[nativeId] = true;
+            } else {
+                delete map[nativeId];
+            }
+
+            updateQobuzFavoriteElements(
+                favoriteType,
+                nativeId
+            );
+
+            showQueueActionToast(
+                (
+                    error &&
+                    error.message
+                ) ||
+                    "Could not update Qobuz Favorite.",
+                true
+            );
+        }
+
+        return false;
+    });
+}
+
+
+function toggleQobuzFavorite(
+    favoriteType,
+    itemId
+) {
+    var nativeId =
+        qobuzFavoriteNativeId(
+            favoriteType,
+            itemId
+        );
+
+    if (!nativeId) {
+        return Promise.resolve(
+            false
+        );
+    }
+
+    return setQobuzFavoriteState(
+        favoriteType,
+        nativeId,
+        !qobuzFavoriteState(
+            favoriteType,
+            nativeId
+        )
+    );
+}
+
+
+function makeQobuzFavoriteHeart(
+    favoriteType,
+    itemId,
+    className,
+    title
+) {
+    var nativeId =
+        qobuzFavoriteNativeId(
+            favoriteType,
+            itemId
+        );
+
+    if (!nativeId) {
+        return null;
+    }
+
+    var button =
+        document.createElement(
+            "button"
+        );
+
+    button.className =
+        className ||
+        "trackHeart";
+
+    button.innerHTML =
+        '<span class="material-icons">' +
+        'favorite_border' +
+        '</span>';
+
+    button.title =
+        title ||
+        "Favorite";
+
+    button.setAttribute(
+        "aria-label",
+        button.title
+    );
+
+    button.setAttribute(
+        "data-heart-provider",
+        "qobuz"
+    );
+
+    button.setAttribute(
+        "data-heart-type",
+        favoriteType
+    );
+
+    button.setAttribute(
+        "data-heart-id",
+        nativeId
+    );
+
+    updateSingleHeartEl(
+        button,
+        qobuzFavoriteState(
+            favoriteType,
+            nativeId
+        )
+    );
+
+    button.onclick =
+        function(e) {
+            if (e) {
+                e.stopPropagation();
+            }
+
+            toggleQobuzFavorite(
+                favoriteType,
+                nativeId
+            );
+        };
+
+    if (
+        streamingProviderAuthState.qobuz ===
+            true &&
+        !qobuzFavoriteIdsLoaded
+    ) {
+        loadQobuzFavoriteIds(
+            false
+        );
+    }
+
+    return button;
+}
+
+
+function appendQobuzTrackFavoriteHeart(
+    parent,
+    track
+) {
+    track = track || {};
+
+    var nativeId =
+        qobuzFavoriteNativeId(
+            "track",
+            track.provider_track_id ||
+            track.id
+        );
+
+    if (
+        !parent ||
+        !nativeId
+    ) {
+        return null;
+    }
+
+    var button =
+        makeQobuzFavoriteHeart(
+            "track",
+            nativeId,
+            "trackHeart",
+            "Favorite"
+        );
+
+    if (!button) {
+        return null;
+    }
+
+    button.setAttribute(
+        "data-track-id",
+        String(
+            track.id ||
+            (
+                "qobuz:" +
+                nativeId
+            )
+        )
+    );
+
+    parent.appendChild(
+        button
+    );
+
+    return button;
+}
+
+
+
+function tidalSearchFavoriteMap(
+    favoriteType
+) {
+    favoriteType =
+        String(
+            favoriteType ||
+            ""
+        ).trim().toLowerCase();
+
+    if (favoriteType === "track") {
+        return favTrackIds;
+    }
+
+    if (favoriteType === "album") {
+        return favAlbumIds;
+    }
+
+    if (favoriteType === "artist") {
+        return favArtistIds;
+    }
+
+    return null;
+}
+
+
+function appendTidalSearchFavoriteHeart(
+    parent,
+    favoriteType,
+    itemId
+) {
+    favoriteType =
+        String(
+            favoriteType ||
+            ""
+        ).trim().toLowerCase();
+
+    var nativeId =
+        String(
+            itemId == null
+                ? ""
+                : itemId
+        ).trim();
+
+    var favoriteMap =
+        tidalSearchFavoriteMap(
+            favoriteType
+        );
+
+    if (
+        !parent ||
+        !nativeId ||
+        !favoriteMap
+    ) {
+        return null;
+    }
+
+    var button =
+        document.createElement(
+            "button"
+        );
+
+    button.className =
+        "srovaSearchActionBtn " +
+        "srovaSearchHeart";
+
+    button.innerHTML =
+        '<span class="material-icons">' +
+        'favorite_border' +
+        '</span>';
+
+    button.title = "Favorite";
+
+    button.setAttribute(
+        "aria-label",
+        "Favorite"
+    );
+
+    button.setAttribute(
+        "data-heart-provider",
+        "tidal"
+    );
+
+    button.setAttribute(
+        "data-heart-type",
+        favoriteType
+    );
+
+    button.setAttribute(
+        "data-heart-id",
+        nativeId
+    );
+
+    if (favoriteType === "track") {
+        button.setAttribute(
+            "data-track-id",
+            nativeId
+        );
+    }
+
+    updateSingleHeartEl(
+        button,
+        !!favoriteMap[nativeId]
+    );
+
+    button.onclick =
+        function(e) {
+            if (e) {
+                e.stopPropagation();
+            }
+
+            if (favoriteType === "track") {
+                toggleTrackFavorite(
+                    nativeId,
+                    button
+                );
+                return;
+            }
+
+            if (favoriteType === "album") {
+                toggleAlbumFavorite(
+                    nativeId,
+                    button
+                );
+                return;
+            }
+
+            if (favoriteType === "artist") {
+                toggleArtistFavorite(
+                    nativeId,
+                    button
+                );
+            }
+        };
+
+    parent.appendChild(
+        button
+    );
+
+    return button;
+}
+
+
+function appendQobuzSearchEntityFavoriteHeart(
+    parent,
+    favoriteType,
+    item
+) {
+    item = item || {};
+
+    var seed =
+        qobuzSourceSearchResultSeed(
+            item,
+            favoriteType
+        );
+
+    if (
+        !parent ||
+        !seed ||
+        !seed.id
+    ) {
+        return null;
+    }
+
+    var button =
+        makeQobuzFavoriteHeart(
+            favoriteType,
+            seed.id,
+            (
+                "srovaSearchActionBtn " +
+                "srovaSearchHeart"
+            ),
+            "Favorite"
+        );
+
+    if (!button) {
+        return null;
+    }
+
+    parent.appendChild(
+        button
+    );
+
+    return button;
+}
+
+
+function appendQobuzSearchTrackFavoriteHeart(
+    parent,
+    track
+) {
+    track = track || {};
+
+    var nativeId =
+        qobuzFavoriteNativeId(
+            "track",
+            track.provider_track_id ||
+            track.id
+        );
+
+    if (
+        !parent ||
+        !nativeId
+    ) {
+        return null;
+    }
+
+    var button =
+        makeQobuzFavoriteHeart(
+            "track",
+            nativeId,
+            (
+                "srovaSearchActionBtn " +
+                "srovaSearchHeart"
+            ),
+            "Favorite"
+        );
+
+    if (!button) {
+        return null;
+    }
+
+    button.setAttribute(
+        "data-track-id",
+        String(
+            track.id ||
+            (
+                "qobuz:" +
+                nativeId
+            )
+        )
+    );
+
+    parent.appendChild(
+        button
+    );
+
+    return button;
+}
+
 
 function loadFavoriteIds() {
     fetch("/tidal/favorites/ids")
@@ -14887,30 +33750,211 @@ function updateSingleHeartEl(el, isFaved) {
 function updateNpHeart() {
     var el = document.getElementById("npBtnHeart");
     if (!el || !currentPlayingId) { return; }
-    updateSingleHeartEl(el, !!favTrackIds[currentPlayingId]);
+
+    if (
+        qobuzNowPlayingFavoriteActive()
+    ) {
+        var nativeId =
+            qobuzFavoriteNativeId(
+                "track",
+                currentPlayingId
+            );
+
+        updateSingleHeartEl(
+            el,
+            !!(
+                nativeId &&
+                qobuzFavTrackIds[
+                    nativeId
+                ]
+            )
+        );
+
+        return;
+    }
+
+    updateSingleHeartEl(
+        el,
+        !!favTrackIds[
+            currentPlayingId
+        ]
+    );
 }
 
 function updateHeaderHeart() {
     var el = document.getElementById("albumHeaderHeart");
     if (!el) { return; }
-    var htype = el.getAttribute("data-heart-type");
-    var hid   = el.getAttribute("data-heart-id");
-    if (!htype || !hid) { return; }
+
+    var htype =
+        el.getAttribute(
+            "data-heart-type"
+        );
+
+    var hid =
+        el.getAttribute(
+            "data-heart-id"
+        );
+
+    if (!htype || !hid) {
+        return;
+    }
+
+    if (
+        el.getAttribute(
+            "data-heart-provider"
+        ) === "qobuz"
+    ) {
+        updateSingleHeartEl(
+            el,
+            qobuzFavoriteState(
+                htype,
+                hid
+            )
+        );
+
+        return;
+    }
+
     var isFaved = false;
-    if (htype === "album")  { isFaved = !!favAlbumIds[hid]; }
-    if (htype === "artist") { isFaved = !!favArtistIds[hid]; }
-    updateSingleHeartEl(el, isFaved);
+
+    if (htype === "album") {
+        isFaved =
+            !!favAlbumIds[hid];
+    }
+
+    if (htype === "artist") {
+        isFaved =
+            !!favArtistIds[hid];
+    }
+
+    updateSingleHeartEl(
+        el,
+        isFaved
+    );
 }
 
 function updateHeartStates() {
-    // Track row hearts in the album/artist/playlist/mix view
-    var hearts = trackList ? trackList.querySelectorAll(".trackHeart") : [];
+    // Historical TIDAL row Hearts retain their existing map.
+    var hearts =
+        trackList
+            ? trackList.querySelectorAll(
+                ".trackHeart"
+            )
+            : [];
+
     var i;
-    for (i = 0; i < hearts.length; i++) {
-        var tid = hearts[i].getAttribute("data-track-id");
-        updateSingleHeartEl(hearts[i], !!favTrackIds[tid]);
+
+    for (
+        i = 0;
+        i < hearts.length;
+        i++
+    ) {
+        if (
+            hearts[i].getAttribute(
+                "data-heart-provider"
+            ) === "qobuz"
+        ) {
+            var qobuzType =
+                hearts[i].getAttribute(
+                    "data-heart-type"
+                );
+
+            var qobuzId =
+                hearts[i].getAttribute(
+                    "data-heart-id"
+                );
+
+            updateSingleHeartEl(
+                hearts[i],
+                qobuzFavoriteState(
+                    qobuzType,
+                    qobuzId
+                )
+            );
+
+            continue;
+        }
+
+        var tid =
+            hearts[i].getAttribute(
+                "data-track-id"
+            );
+
+        updateSingleHeartEl(
+            hearts[i],
+            !!favTrackIds[tid]
+        );
     }
-    // Now Playing heart and header heart
+
+    // TIDAL provider-search Hearts are outside trackList.
+    var tidalSearchHearts =
+        document.querySelectorAll(
+            '[data-heart-provider="tidal"]'
+        );
+
+    for (
+        var tsi = 0;
+        tsi < tidalSearchHearts.length;
+        tsi++
+    ) {
+        var tidalHeart =
+            tidalSearchHearts[tsi];
+
+        var tidalType =
+            tidalHeart.getAttribute(
+                "data-heart-type"
+            );
+
+        var tidalId =
+            tidalHeart.getAttribute(
+                "data-heart-id"
+            );
+
+        var tidalMap =
+            tidalSearchFavoriteMap(
+                tidalType
+            );
+
+        updateSingleHeartEl(
+            tidalHeart,
+            !!(
+                tidalMap &&
+                tidalId &&
+                tidalMap[tidalId]
+            )
+        );
+    }
+
+    // Qobuz provider-search Hearts are outside trackList.
+    var qobuzHearts =
+        document.querySelectorAll(
+            '[data-heart-provider="qobuz"]'
+        );
+
+    for (
+        i = 0;
+        i < qobuzHearts.length;
+        i++
+    ) {
+        var heartType =
+            qobuzHearts[i].getAttribute(
+                "data-heart-type"
+            );
+
+        var heartId =
+            qobuzHearts[i].getAttribute(
+                "data-heart-id"
+            );
+
+        updateSingleHeartEl(
+            qobuzHearts[i],
+            qobuzFavoriteState(
+                heartType,
+                heartId
+            )
+        );
+    }
+
     updateNpHeart();
     updateHeaderHeart();
 }
@@ -14936,8 +33980,27 @@ function toggleTrackFavorite(tid, el) {
 
 function toggleNpHeart() {
     if (!currentPlayingId) { return; }
-    var el = document.getElementById("npBtnHeart");
-    toggleTrackFavorite(currentPlayingId, el);
+
+    if (
+        qobuzNowPlayingFavoriteActive()
+    ) {
+        toggleQobuzFavorite(
+            "track",
+            currentPlayingId
+        );
+
+        return;
+    }
+
+    var el =
+        document.getElementById(
+            "npBtnHeart"
+        );
+
+    toggleTrackFavorite(
+        currentPlayingId,
+        el
+    );
 }
 
 function toggleAlbumFavorite(albumId, el) {
@@ -15202,6 +34265,7 @@ function _metaBioBlock(text, limit) {
 var lyricsPanel      = document.getElementById("lyricsPanel");
 var lyricsContent    = document.getElementById("lyricsContent");
 var lyricsLastTrackId = null;
+var lyricsRequestSerial = 0;
 var _lyricsLines     = [];    // [{ms, text, el}] for synced lyrics
 var _lyricsSynced    = false;
 var _lyricsActiveIdx = -1;
@@ -15241,21 +34305,88 @@ function renderLyricsLoading() {
 function loadLyrics() {
     var trackId = String(currentPlayingId || "");
     var source = "";
+
     try {
-        source = inferStatusPlaybackSource(lastKnownPlaybackStatus || {});
+        source = String(
+            inferStatusPlaybackSource(
+                lastKnownPlaybackStatus || {}
+            ) || ""
+        ).toLowerCase();
     } catch (e) {}
-    var isLocal = source === "local" || trackId.indexOf("local:") === 0;
-    var lyricsUrl = (isLocal ? "/api/local/library/lyrics/" : "/tidal/lyrics/") + encodeURIComponent(trackId);
+
+    var isLocal =
+        source === "local" ||
+        trackId.indexOf("local:") === 0;
+
+    var isQobuz =
+        source === "qobuz" ||
+        trackId.indexOf("qobuz:") === 0;
+
+    var providerTrackId = trackId;
+    var lyricsUrl = "";
+
+    if (isLocal) {
+        lyricsUrl =
+            "/api/local/library/lyrics/" +
+            encodeURIComponent(trackId);
+    } else if (isQobuz) {
+        if (providerTrackId.indexOf("qobuz:") === 0) {
+            providerTrackId =
+                providerTrackId.slice(
+                    "qobuz:".length
+                );
+        }
+
+        if (!/^[0-9]+$/.test(providerTrackId)) {
+            lyricsContent.innerHTML =
+                '<div class="lyricsLoading"><span>' +
+                'Could not load lyrics.' +
+                '</span></div>';
+            return;
+        }
+
+        lyricsUrl =
+            "/qobuz/lyrics/" +
+            encodeURIComponent(providerTrackId);
+    } else {
+        lyricsUrl =
+            "/tidal/lyrics/" +
+            encodeURIComponent(trackId);
+    }
+
+    var requestSerial = ++lyricsRequestSerial;
+    var requestTrackId = trackId;
+
     fetch(lyricsUrl)
-        .then(function(r) { return r.json(); })
+        .then(function(r) {
+            if (!r.ok) {
+                throw new Error(
+                    "Lyrics request failed"
+                );
+            }
+            return r.json();
+        })
         .then(function(data) {
+            if (
+                requestSerial !== lyricsRequestSerial ||
+                String(currentPlayingId || "") !==
+                    requestTrackId
+            ) {
+                return;
+            }
+
             if (data.error) {
                 lyricsContent.innerHTML =
                     '<div class="lyricsLoading"><span>' +
-                    (data.error === "no_lyrics" ? "No lyrics available for this track." : "Could not load lyrics.") +
+                    (
+                        data.error === "no_lyrics"
+                            ? "No lyrics available for this track."
+                            : "Could not load lyrics."
+                    ) +
                     '</span></div>';
                 return;
             }
+
             if (data.synced) {
                 renderSyncedLyrics(data.lines);
             } else {
@@ -15263,8 +34394,18 @@ function loadLyrics() {
             }
         })
         .catch(function() {
+            if (
+                requestSerial !== lyricsRequestSerial ||
+                String(currentPlayingId || "") !==
+                    requestTrackId
+            ) {
+                return;
+            }
+
             lyricsContent.innerHTML =
-                '<div class="lyricsLoading"><span>Could not load lyrics.</span></div>';
+                '<div class="lyricsLoading"><span>' +
+                'Could not load lyrics.' +
+                '</span></div>';
         });
 }
 
@@ -15378,6 +34519,385 @@ function _wireAlbumArtistClick(artistId, artistName) {
     albumArtist.onclick = function() {
         loadArtistPage(artistId, artistName, albumArt.src || "", previousView);
     };
+}
+
+var _qobuzArtistPageRestoreFn = null;
+
+function qobuzArtistAlbumViews(page) {
+    var groups = Array.isArray(page.release_groups) ? page.release_groups : [];
+    var seen = {};
+    var albums = [];
+
+    groups.forEach(function(group) {
+        (Array.isArray(group.items) ? group.items : []).forEach(function(album) {
+            var id = String(album.album_id || "");
+            if (!id || seen[id]) { return; }
+            seen[id] = true;
+
+            albums.push({
+                id: id,
+                name: String(album.title || "") +
+                    (album.version ? " — " + String(album.version) : ""),
+                image_url: String(album.artwork_url || SROVA_STANDBY_ART),
+                release_date: String(
+                    album.release_date ||
+                    album.release_date_original ||
+                    ""
+                ),
+                type: String(
+                    album.release_type ||
+                    group.release_type ||
+                    "ALBUM"
+                ),
+                source: "qobuz"
+            });
+        });
+    });
+
+    return albums;
+}
+
+function wireQobuzAlbumArtistClick(albumId) {
+    if (!albumArtist || !currentContext || !currentContext.artist_id) {
+        return;
+    }
+
+    var artistId = String(currentContext.artist_id);
+    var artistName = String(currentContext.artist || "");
+    var artistCover = String(currentContext.cover || "");
+    var returnView = previousView;
+    var parentArtistRestore =
+        _artistPageRestoreFn;
+    var seed = {
+        image_url: String(currentContext.cover || ""),
+        name: String(currentContext.title || ""),
+        sub_title: artistName
+    };
+
+    var restoreAlbum = function() {
+        _artistPageRestoreFn =
+            parentArtistRestore;
+        loadQobuzAlbumDetail(
+            albumId,
+            seed,
+            returnView
+        );
+    };
+
+    albumArtist.style.cursor = "pointer";
+    albumArtist.title = artistName;
+    albumArtist.onclick = function() {
+        loadQobuzArtistDetail(
+            artistId,
+            artistName,
+            artistCover,
+            "artistpage",
+            restoreAlbum
+        );
+    };
+}
+
+function qobuzBiographyPlainText(value) {
+    return String(value || "")
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<\/p\s*>/gi, "\n\n")
+        .replace(/<[^>]+>/g, "")
+        .replace(/&nbsp;/gi, " ")
+        .replace(/&copy;?/gi, "\u00a9")
+        .replace(/&amp;/gi, "&")
+        .replace(/&quot;/gi, '"')
+        .replace(/&#39;|&apos;/gi, "'")
+        .replace(/&ndash;/gi, "\u2013")
+        .replace(/&mdash;/gi, "\u2014")
+        .replace(/&hellip;/gi, "\u2026")
+        .trim();
+}
+
+function renderQobuzArtistEditorial(page) {
+    page = page || {};
+
+    var biography =
+        page.biography &&
+        typeof page.biography === "object"
+            ? qobuzBiographyPlainText(
+                page.biography.content
+            )
+            : "";
+
+    var similar =
+        page.similar_artists &&
+        typeof page.similar_artists === "object" &&
+        Array.isArray(page.similar_artists.items)
+            ? page.similar_artists.items
+            : [];
+
+    if (!biography && !similar.length) {
+        return;
+    }
+
+    if (biography) {
+        var bioSection =
+            document.createElement("div");
+
+        bioSection.className =
+            "artistSection qobuzArtistBiographySection";
+
+        var bioHeader =
+            document.createElement("div");
+
+        bioHeader.className =
+            "artistSectionHdr";
+
+        bioHeader.textContent =
+            "Biography";
+
+        var bioText =
+            document.createElement("div");
+
+        bioText.className =
+            "qobuzArtistBiographyText";
+
+        bioText.textContent =
+            biography;
+
+        bioSection.appendChild(bioHeader);
+        bioSection.appendChild(bioText);
+        trackList.appendChild(bioSection);
+    }
+
+    var similarItems =
+        similar.map(function(item) {
+            return adaptQobuzWallItem(
+                item,
+                "artist"
+            );
+        }).filter(function(item) {
+            return !!item.id;
+        });
+
+    if (!similarItems.length) {
+        return;
+    }
+
+    var parentRestore =
+        _qobuzArtistPageRestoreFn;
+
+    var similarSection =
+        buildScrollSection(
+            "Similar Artists",
+            similarItems,
+            function(item) {
+                loadQobuzArtistDetail(
+                    item.id,
+                    item.name || "",
+                    item.image_url || "",
+                    "artistpage",
+                    parentRestore
+                );
+            },
+            {
+                kind: "curated"
+            }
+        );
+
+    similarSection.className =
+        "artistSection qobuzArtistSimilarSection";
+
+    similarSection.removeAttribute(
+        "data-kind"
+    );
+
+    var similarHeader =
+        similarSection.querySelector("h2");
+
+    if (similarHeader) {
+        similarHeader.className =
+            "artistSectionHdr";
+    }
+
+    trackList.appendChild(
+        similarSection
+    );
+}
+
+function loadQobuzArtistDetail(
+    artistId,
+    artistName,
+    artistCover,
+    fromView,
+    returnFn
+) {
+    artistId = String(artistId || "").trim();
+    if (!artistId || !requireOnlineSource()) { return; }
+
+    artistName = String(artistName || "");
+    artistCover = String(artistCover || "");
+    previousView = fromView || "qobuzsource";
+
+    if (previousView === "artistpage" && returnFn) {
+        _artistPageRestoreFn = returnFn;
+    }
+
+    currentViewEndpoint = "qobuz:artist:" + artistId;
+    currentContext = {
+        id: artistId,
+        cover: artistCover || SROVA_STANDBY_ART,
+        title: artistName || "Qobuz Artist",
+        artist: "",
+        source: "qobuz"
+    };
+
+    setAlbumViewKind("qobuz-artist");
+    showView("album");
+
+    albumArt.src = currentContext.cover;
+    albumTitle.textContent = currentContext.title;
+    albumArtist.textContent = "";
+    albumArtist.style.cursor = "";
+    albumArtist.onclick = null;
+    albumTechInfo.textContent = "";
+    albumTechInfo.className = "hidden";
+    albumStatsLine.textContent = "";
+    albumStatsLine.className = "hidden";
+    trackList.innerHTML =
+        '<div class="trackListLoading">Loading artist\u2026</div>';
+
+    renderAlbumQueueBtn([], "");
+    resetAlbumDetailScroll();
+
+    var endpoint = currentViewEndpoint;
+
+    fetchWithTimeout(
+        "/qobuz/catalog?op=artist_page&artist_id=" +
+        encodeURIComponent(artistId),
+        {cache: "no-store"},
+        8000
+    )
+    .then(function(response) {
+        if (!response.ok) {
+            throw new Error("Qobuz artist request failed");
+        }
+        return response.json();
+    })
+    .then(function(page) {
+        if (currentViewEndpoint !== endpoint) { return; }
+
+        page = page || {};
+        if (
+            page.ok === false ||
+            String(page.artist_id || "") !== artistId
+        ) {
+            throw new Error("Invalid Qobuz artist response");
+        }
+
+        var name = String(page.name || artistName || "Qobuz Artist");
+        var cover =
+            qobuzArtistPageFallbackArtwork(page) ||
+            artistCover ||
+            SROVA_STANDBY_ART;
+
+        var tracks = (
+            Array.isArray(page.top_tracks)
+                ? page.top_tracks
+                : []
+        ).map(function(track) {
+            return qobuzAlbumTrackPayload(
+                track,
+                {
+                    artist: name,
+                    artwork_url: cover
+                }
+            );
+        });
+
+        var albums = qobuzArtistAlbumViews(page);
+
+        currentContext = {
+            id: artistId,
+            cover: cover,
+            title: name,
+            artist: "",
+            source: "qobuz"
+        };
+
+        albumArt.src = cover;
+        albumTitle.textContent = name;
+        originalTracks = tracks;
+        shuffledTracks = [];
+        currentViewTracks = tracks;
+
+        _qobuzArtistPageRestoreFn = function() {
+            loadQobuzArtistDetail(
+                artistId,
+                name,
+                cover,
+                fromView,
+                returnFn
+            );
+        };
+
+        _renderArtistPage(
+            artistId,
+            name,
+            cover,
+            tracks,
+            albums
+        );
+
+        var qobuzArtistActionGroup =
+            document.getElementById(
+                "albumQueueBtnGroup"
+            );
+
+        if (qobuzArtistActionGroup) {
+            var qobuzArtistViewToggle =
+                qobuzArtistActionGroup
+                    .querySelector(
+                        ".artworkViewToggle"
+                    );
+
+            appendQobuzStartRadioHeaderAction(
+                qobuzArtistActionGroup,
+                {
+                    id: artistId,
+                    artist_id: artistId,
+                    name: name,
+                    image_url: cover
+                },
+                "artist",
+                "",
+                function() {
+                    loadQobuzArtistDetail(
+                        artistId,
+                        name,
+                        cover,
+                        fromView,
+                        returnFn
+                    );
+                },
+                qobuzArtistViewToggle
+            );
+        }
+
+        renderQobuzArtistEditorial(
+            page
+        );
+
+        resetAlbumDetailScroll();
+    })
+    .catch(function(err) {
+        if (currentViewEndpoint !== endpoint) { return; }
+
+        console.error(
+            "loadQobuzArtistDetail failed:",
+            err
+        );
+
+        trackList.innerHTML =
+            '<div class="unavailableMsg">Could not load Qobuz artist.</div>';
+
+        renderAlbumQueueBtn([], "");
+    });
 }
 
 function loadArtistPage(artistId, artistName, artistCover, fromView) {
@@ -15507,7 +35027,32 @@ function _renderArtistPage(artistId, artistName, artistCover, tracks, albums) {
     var artistActionGroup = document.getElementById("albumQueueBtnGroup");
     if (artistActionGroup) {
         artistActionGroup.classList.add("artistHeaderActionGroup");
-        appendArtworkViewToggle(artistActionGroup);
+
+        if (
+            currentViewEndpoint.indexOf(
+                "/tidal/artist/"
+            ) === 0
+        ) {
+            appendTidalStartRadioHeaderAction(
+                artistActionGroup,
+                {
+                    id:
+                        artistId,
+                    artist_id:
+                        artistId,
+                    name:
+                        artistName,
+                    image_url:
+                        artistCover
+                },
+                "artist",
+                "artistpage"
+            );
+        }
+
+        appendArtworkViewToggle(
+            artistActionGroup
+        );
     }
     loadFavoriteIds();
 }
@@ -15573,6 +35118,22 @@ function _buildDiscoCard(album, artistName) {
     if (album.id) {
         (function(alb, aName) {
             card.onclick = function() {
+                if (alb.source === "qobuz") {
+                    _artistPageRestoreFn =
+                        _qobuzArtistPageRestoreFn;
+
+                    loadQobuzAlbumDetail(
+                        alb.id,
+                        {
+                            image_url: alb.image_url || "",
+                            name: alb.name || "",
+                            sub_title: aName || ""
+                        },
+                        "artistpage"
+                    );
+                    return;
+                }
+
                 loadTrackList(
                     { id: alb.id, cover: alb.image_url || "", title: alb.name || "", artist: aName || "" },
                     "/tidal/album/" + alb.id,
@@ -15595,6 +35156,9 @@ function _albumTypeLabel(type) {
 
 function _buildArtistTrackRow(t, idx, allTracks, artistName, artistCover) {
     var row = document.createElement("div");
+    var qobuzTrack =
+        String(t.id || "").indexOf("qobuz:") === 0 ||
+        String(t.source || "").toLowerCase() === "qobuz";
     var trackCover = t.cover || artistCover || "";
     row.className = "track";
     row.setAttribute("data-track-id", String(t.id || ""));
@@ -15605,18 +35169,29 @@ function _buildArtistTrackRow(t, idx, allTracks, artistName, artistCover) {
         '<img src="' + trackCover + '" class="artistTrackThumb">' +
         '<div class="track-num">'      + (idx + 1)              + '</div>' +
         '<div class="track-title">'    + (t.title  || "")       + '</div>' +
-        '<div class="track-artist">'   + (artistName || t.artist || "") + '</div>' +
+        '<div class="track-artist">'   +
+        (qobuzTrack ? (t.artist || artistName || "") : (artistName || t.artist || "")) +
+        '</div>' +
         '<div class="track-duration">' + formatTime(t.duration) + '</div>';
 
-    var heartBtn = document.createElement("button");
-    heartBtn.className = "trackHeart";
-    heartBtn.setAttribute("data-track-id", String(t.id));
-    heartBtn.innerHTML = '<span class="material-icons">favorite_border</span>';
-    heartBtn.title = "Favorite";
-    (function(tid, btn) {
-        btn.onclick = function(e) { e.stopPropagation(); toggleTrackFavorite(tid, btn); };
-    }(String(t.id), heartBtn));
-    row.appendChild(heartBtn);
+    if (!qobuzTrack) {
+        var heartBtn = document.createElement("button");
+        heartBtn.className = "trackHeart";
+        heartBtn.setAttribute("data-track-id", String(t.id));
+        heartBtn.innerHTML = '<span class="material-icons">favorite_border</span>';
+        heartBtn.title = "Favorite";
+        (function(tid, btn) {
+            btn.onclick = function(e) { e.stopPropagation(); toggleTrackFavorite(tid, btn); };
+        }(String(t.id), heartBtn));
+        row.appendChild(heartBtn);
+    }
+
+    if (qobuzTrack) {
+        appendQobuzTrackFavoriteHeart(
+            row,
+            t
+        );
+    }
 
     var addBtn = document.createElement("button");
     addBtn.className = "trackAddBtn";
@@ -15625,11 +35200,14 @@ function _buildArtistTrackRow(t, idx, allTracks, artistName, artistCover) {
     (function(track, btn, fallbackCover) {
         btn.onclick = function(e) {
             e.stopPropagation();
-            showQueuePopover(btn, [{
-                id: track.id, title: track.title || "", artist: artistName || "",
-                cover: track.cover || fallbackCover || "", duration: track.duration || 0,
-                quality: track.quality || ""
-            }], e);
+            var queueTrack = qobuzTrack
+                ? buildTrackPayload(track, fallbackCover)
+                : {
+                    id: track.id, title: track.title || "", artist: artistName || "",
+                    cover: track.cover || fallbackCover || "", duration: track.duration || 0,
+                    quality: track.quality || ""
+                };
+            showQueuePopover(btn, [queueTrack], e);
         };
     }(t, addBtn, artistCover));
     row.appendChild(addBtn);
@@ -15642,48 +35220,67 @@ function _buildArtistTrackRow(t, idx, allTracks, artistName, artistCover) {
 
 function _playArtistTopTrack(t, idx, allTracks, artistName, artistCover) {
     if (!requireOnlineSource()) { return; }
+    var qobuzArtist =
+        currentContext &&
+        currentContext.source === "qobuz" &&
+        currentViewEndpoint.indexOf("qobuz:artist:") === 0;
     clearRadioIdleStandbyTimer();
     resetTidalInfinitePlayGuard();
-    _setPlaybackSource("artist", "", t.title || "");
+    _setPlaybackSource(
+        "artist",
+        qobuzArtist ? String(currentContext.id || "") : "",
+        t.title || ""
+    );
     var payload = [];
     for (var i = idx; i < allTracks.length; i++) {
         var tr = allTracks[i];
-        payload.push({
-            id:       tr.id,
-            title:    tr.title    || "",
-            artist:   artistName  || tr.artist || "",
-            cover:    tr.cover || artistCover || "",
-            duration: tr.duration || 0,
-            quality:  tr.quality  || ""
-        });
+        payload.push(
+            qobuzArtist
+                ? buildTrackPayload(tr, artistCover)
+                : {
+                    id:       tr.id,
+                    title:    tr.title    || "",
+                    artist:   artistName  || tr.artist || "",
+                    cover:    tr.cover || artistCover || "",
+                    duration: tr.duration || 0,
+                    quality:  tr.quality  || ""
+                }
+        );
     }
     if (!payload.length) { return; }
     postTidalQueueReplace({
         tracks:        payload,
         start_index:   0,
         context_type:  "artist",
-        context_id:    "",
+        context_id:
+            qobuzArtist ? String(currentContext.id || "") : "",
         context_title: artistName || ""
     }).then(function() {
         trackMap[String(t.id)] = {
-            title: t.title || "", artist: artistName || t.artist || "",
-            cover: t.cover || artistCover || "", duration: t.duration || 0
+            title: t.title || "",
+            artist: qobuzArtist
+                ? (t.artist || artistName || "")
+                : (artistName || t.artist || ""),
+            cover: t.cover || artistCover || "",
+            duration: t.duration || 0
         };
     }).catch(function() {});
 }
 
 
 window.addEventListener("DOMContentLoaded", function() {
+    initNativePlaybackBlocker();
     initHeaderHomeNavigation();
     updatePlayPauseIcon();
     startOnlineSourcePolling();
-    loadHome();
-    restoreSession();
+    var initialSessionRestore = restoreSession();
+    loadInitialHomeAfterStreamingProviderResolution(initialSessionRestore);
     loadFavoriteIds();
     initPlayerTechTray();
     initPlayerInfinitePlayControl();
     showSrovaVolumeSafetyModal();
     checkSrovaUpdate();
+    checkSpotifySoloistUpdate();
     setTimeout(restoreSrovaRestartReturnView, 0);
 });
 
@@ -15803,9 +35400,16 @@ document.addEventListener("visibilitychange", function() {
 // --- Session restore for multi-device sync ---
 
 function restoreSession() {
-    fetch("/session")
+    return fetch("/session")
         .then(function(res) { return res.json(); })
         .then(function(s) {
+            /*
+             * P7: cache/apply authoritative session artwork before provider-
+             * specific restore branches. updateHomeHeroNowPlaying() itself
+             * rejects Qobuz replacement-pending transitional snapshots.
+             */
+            updateHomeHeroNowPlaying(s);
+
             if (isRadioLiveStatus(s) && (s.radio_mode || s.source === "radio" || s.context_type === "radio")) {
                 skipRadioRestoreSeek();
                 currentPlayingId = null;
@@ -15819,7 +35423,19 @@ function restoreSession() {
                 updatePlayPauseIcon();
                 return;
             }
-            if (s.current_track_valid === false || s.playback_state === "idle" || !s.track_id) {
+            var qobuzReplacementPending = !!s.qobuz_replacement_pending;
+            var sessionInvalid = (
+                s.current_track_valid === false ||
+                s.playback_state === "idle" ||
+                !s.track_id
+            );
+            if (qobuzReplacementPending) {
+                playing = !!s.playing;
+                updatePlayPauseIcon();
+                updatePlayerInfinitePlayControl();
+                return;
+            }
+            if (sessionInvalid) {
                 playing = !!s.playing;
                 applyStandbyPlayerBar();
                 return;
@@ -16205,6 +35821,153 @@ function deleteRadioStation(id) {
         })
         .catch(function() { loadRadioStations(); });
 }
+
+function buildProviderRadioSettingsSection() {
+    var sec = document.createElement("div");
+    sec.className =
+        "settingsSection settingsProviderRadioSection";
+
+    var titleRow =
+        document.createElement("div");
+
+    titleRow.className =
+        "settingsSectionTitle";
+
+    titleRow.innerHTML =
+        '<span class="material-icons">sensors</span> Provider Radio';
+
+    sec.appendChild(titleRow);
+
+    var desc =
+        document.createElement("div");
+
+    desc.className =
+        "settingsSectionDesc";
+
+    desc.textContent =
+        "Show provider Radio sections in SOURCE 01 when that service is signed in. Your preference is kept when you sign out.";
+
+    sec.appendChild(desc);
+
+    function addProviderToggle(
+        provider,
+        label,
+        toggleId,
+        subId
+    ) {
+        var row =
+            document.createElement("div");
+
+        row.className =
+            "settingsToggleRow providerRadioToggleRow";
+
+        var copy =
+            document.createElement("div");
+
+        copy.className =
+            "settingsToggleCopy";
+
+        var labelEl =
+            document.createElement("div");
+
+        labelEl.className =
+            "settingsLabel";
+
+        labelEl.textContent =
+            label;
+
+        var sub =
+            document.createElement("div");
+
+        sub.className =
+            "settingsToggleSub";
+
+        sub.id =
+            subId;
+
+        sub.textContent =
+            "Loading…";
+
+        copy.appendChild(labelEl);
+        copy.appendChild(sub);
+
+        var toggle =
+            document.createElement("button");
+
+        toggle.type =
+            "button";
+
+        toggle.id =
+            toggleId;
+
+        toggle.className =
+            "settingsToggleSwitch";
+
+        toggle.setAttribute(
+            "aria-label",
+            label
+        );
+
+        toggle.setAttribute(
+            "aria-pressed",
+            "false"
+        );
+
+        toggle.setAttribute(
+            "aria-disabled",
+            "true"
+        );
+
+        toggle.disabled =
+            true;
+
+        toggle.innerHTML =
+            "<span></span>";
+
+        toggle.onclick = function() {
+            if (toggle.disabled) {
+                return;
+            }
+
+            saveProviderRadioVisibilitySetting(
+                provider,
+                !providerRadioStoredPreference(provider)
+            );
+        };
+
+        row.appendChild(copy);
+        row.appendChild(toggle);
+        sec.appendChild(row);
+    }
+
+    addProviderToggle(
+        "tidal",
+        "Show TIDAL Radio",
+        "settingsShowTidalRadioToggle",
+        "settingsShowTidalRadioSub"
+    );
+
+    addProviderToggle(
+        "qobuz",
+        "Show Qobuz Radio",
+        "settingsShowQobuzRadioToggle",
+        "settingsShowQobuzRadioSub"
+    );
+
+    loadProviderRadioVisibilitySettings()
+        .catch(function() {});
+
+    refreshStreamingProviderPresentation()
+        .then(function() {
+            syncProviderRadioSettingsControls();
+        })
+        .catch(function() {
+            syncProviderRadioSettingsControls();
+        });
+
+    return sec;
+}
+
 
 function buildRadioSection() {
     var sec = document.createElement("div");

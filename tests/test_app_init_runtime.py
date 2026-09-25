@@ -181,7 +181,6 @@ def test_init_audio_and_data_services_sets_up_player_and_cache(tmp_path, monkeyp
     root.mkdir()
     app = SimpleNamespace()
     app._cache_root = str(root)
-    app._config_root = str(tmp_path / "config")
     app._account_scope = "guest"
     app.settings = {
         "viz_sync_device_offsets": {"dev_a": 10},
@@ -378,7 +377,6 @@ def test_init_audio_and_data_services_restores_saved_convolver(tmp_path, monkeyp
     root.mkdir()
     app = SimpleNamespace()
     app._cache_root = str(root)
-    app._config_root = str(tmp_path / "config")
     app._account_scope = "guest"
     app.settings = {
         "viz_sync_device_offsets": {},
@@ -451,8 +449,8 @@ def test_init_runtime_calls_stages_in_order(monkeypatch):
 
     assert app.app_version == "1.2.3"
     assert calls == [
-        ("app_name", "SROVA"),
-        ("prg", "SROVA"),
+        ("app_name", "HiresTI"),
+        ("prg", "HiresTI"),
         "paths",
         "audio",
         "state",
@@ -521,7 +519,6 @@ def test_init_audio_and_data_services_batches_lv2_restore(tmp_path, monkeypatch)
     root.mkdir()
     app = SimpleNamespace()
     app._cache_root = str(root)
-    app._config_root = str(tmp_path / "config")
     app._account_scope = "guest"
     app.settings = {
         "viz_sync_device_offsets": {},

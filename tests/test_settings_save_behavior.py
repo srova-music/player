@@ -64,7 +64,7 @@ def test_dac_selection_auto_saves_and_keeps_release_gate():
     assert 'loadDacUi("DAC was not saved:' in source
 
     route_start = BACKEND.index('if self.path == "/api/audio/output":', BACKEND.index("def do_POST"))
-    route_end = BACKEND.index('if self.path == "/api/settings/tidal-infinite-play":', route_start)
+    route_end = BACKEND.index('if self.path == "/api/settings/provider-radio":', route_start)
     route = BACKEND[route_start:route_end]
     assert 'if locked.get("dac_locked"):' in route
     assert "_set_audio_output_preference(driver, device, name)" in route

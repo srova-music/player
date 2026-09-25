@@ -264,7 +264,7 @@ def _rounded_pixbuf(pb, radius):
 
 
 def _get_rounded_radius(classes: set, size: int) -> int:
-    """Return the corner radius for a CSS class."""
+    """根据 CSS 类返回圆角半径"""
     if "circular-avatar" in classes:
         return size // 2
     if "playback-art" in classes:

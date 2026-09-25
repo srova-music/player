@@ -1,31 +1,69 @@
 # SROVA
 
 SROVA is a headless Linux music player for dedicated audio systems. Connect the
-player computer to a DAC, place it out of sight, and control TIDAL, My Music and
-Internet Radio from a browser on another device.
+player computer to a DAC and control playback from a browser on another device.
 
-SROVA is designed around high-quality playback, a responsive browser interface
-and clear Bit-Perfect signal-path reporting.
+SROVA is designed around high-quality native playback, a responsive browser
+interface and clear Bit-Perfect signal-path reporting.
 
-## Version 1.4 release
+## Version 2.0 release
 
 This public source snapshot corresponds to:
 
-- SROVA Version 1.4
-- Debian package version `1.4-1`
-- web and control port `8081`
+- SROVA Version 2.0
+- Debian package version `2.0-1`
+- default web and control port `8081`
+- canonical installed runtime root `/opt/srova`
 - qualified Debian package architectures: AMD64 and ARM64
 
-This Version 1.4 public source update was derived from the locked private
-release source at commit af935a16615ea50d37cc2f2225d8d07bcb70406e.
+This Version 2.0 public source update is derived from the locked private release
+source at commit:
 
-Private Git history is not included. The public repository contains the curated
-release source, build materials and tests. Private-only development files,
-generated artifacts, binaries, logs and databases are excluded.
+`7e9d57aed0293aca85b2a707cf3843dde59bb2e5`
 
-## Features
+Private Git history is not included. The public repository contains curated
+release source, build materials and tests. Private runtime state, credentials,
+provider tokens, user databases, downloaded third-party runtime artifacts,
+generated packages and development-only material are excluded.
 
-- TIDAL playback and library browsing
+## Playback sources and online providers
+
+SROVA presents three native source families:
+
+- My Music — Local Music and mounted Network Music
+- Internet Radio
+- SOURCE 03 — online music providers
+
+TIDAL and Qobuz are normal SROVA online providers.
+
+When one online provider is authenticated, SOURCE 03 identifies that provider
+as TIDAL or QOBUZ. When both providers are available, SOURCE 03 is presented as
+ONLINE.
+
+Version 2.0 includes Qobuz authentication, catalog and library browsing,
+lossless playback, search, playlists, favorites, lyrics, contextual Radio and
+provider-aware navigation alongside TIDAL.
+
+Provider-aware features include shared search and queue behavior, Infinite
+Play, Auto-Mix and Go To Album.
+
+## Optional Spotify Connect endpoint
+
+SROVA can optionally manage Spotify's official Soloist endpoint as an external
+convenience integration.
+
+Spotify/Soloist is not SOURCE 04 and is separate from the SROVA native source
+model.
+
+The Spotify/Soloist path is not represented as SROVA native
+Bit-Perfect/exclusive playback. Its playback behavior is determined by Spotify,
+Soloist and the Linux audio path used by that endpoint.
+
+Downloaded Soloist executables and archives are not included in this public
+source snapshot.
+
+## Other features
+
 - My Music local-library scanning and playback
 - mounted Network Music support
 - Internet Radio with saved stations
@@ -33,125 +71,109 @@ generated artifacts, binaries, logs and databases are excluded.
 - queue and playback control
 - lyrics, track information and visualisation
 - Last.fm and ListenBrainz scrobbling
-- Bit-Perfect status and signal-path reporting
+- Bit-Perfect status and signal-path reporting for native playback
 - direct ALSA and supported Linux audio-output paths
 - automatic systemd service startup
 
 ## Supported release targets
 
-The Version 1.4 release-qualified package format is Debian `.deb`.
+The Version 2.0 release-qualified package format is Debian `.deb`.
 
-- AMD64: tested on Debian and Debian-family PC or NUC systems
-- ARM64: built natively on ARM64 Debian systems and tested on Raspberry Pi
+- AMD64: Debian and Debian-family PC or NUC systems
+- ARM64: native Debian ARM64 systems including Raspberry Pi
 
-Other inherited packaging and desktop-oriented source may remain in the tree
+Other inherited packaging or desktop-oriented source may remain in the tree
 for compatibility or future work, but RPM, Arch and Flatpak packages are not
-qualified Version 1.4 release targets.
+qualified Version 2.0 release targets.
 
 ## Accessing SROVA
 
 The Debian package installs and enables `srova.service`.
 
-After installation, open:
+The default control address is:
 
     http://<SROVA-player-LAN-IP>:8081
 
-The player and browser device must be connected to the same local network.
+The package default is port 8081. A configured `SROVA_PORT` remains supported
+where exposed by the runtime.
 
-The service launches the canonical runtime with:
+The canonical installed application runtime is:
 
-    /usr/bin/python3 /opt/srova/main_headless.py --host 0.0.0.0
+    /opt/srova
 
-The installed application runtime is under `/opt/srova`.
+Runtime state and user configuration are stored outside the public source tree.
 
 ## Repository layout
 
 - `src/main_headless.py` — headless application and HTTP service
 - `src/ui_web/` — browser interface
-- `src/backend/` — TIDAL and backend integrations
-- `src/services/` — remote API, scrobbling and supporting services
-- `src/core/` — settings and shared application infrastructure
-- `src_rust/` — Rust audio, visualisation and launcher sources
-- `packaging/network/` — Network Music mount helper and systemd unit
-- `packaging/arm64/build_deb.sh` — native ARM64 wrapper
-- `package.sh` — authoritative Debian package builder
+- `src/backend/` — TIDAL and Qobuz provider backends
+- `src/services/` — Spotify endpoint, scrobbling and support services
+- `src/local_library.py` — Local and Network Music support
+- `src_rust/` — Rust audio, visualisation and launcher source
+- `packaging/network/` — Network Music and Spotify firewall helpers
+- `packaging/arm64/build_rc1_deb.sh` — canonical ARM64 wrapper
+- `package.sh` — AMD64/native Debian package source
 - `tests/` — automated test suite
-- `CHANGELOG.md` — release and release-candidate history
-- `NOTICE.md` — upstream attribution and modification notice
+- `CHANGELOG.md` — release history
+- `NOTICE.md` — attribution and third-party notices
+
+The ARM64 wrapper retains its historical filename `build_rc1_deb.sh` for
+release-workflow compatibility. The filename does not define the current
+package version.
 
 ## Building an AMD64 Debian package
 
-Build on a prepared native AMD64 Debian or Debian-family system with the
-required Debian, Python, GStreamer, Rust and Cargo build dependencies installed.
-
-From the repository root:
+On a prepared native AMD64 Debian or Debian-family build host:
 
     ./package.sh deb "$(cat version.txt)"
 
-For Version 1.4 this produces:
+For Version 2.0 the package version is `2.0-1`.
 
-    dist/srova_1.4-1_amd64.deb
+Architecture-specific package validation must be completed before publication.
 
 ## Building an ARM64 Debian package
 
-Build on a prepared native Debian ARM64 host, such as a Raspberry Pi 5:
+Build on a prepared native Debian ARM64 host such as a Raspberry Pi 5:
 
-    ./packaging/arm64/build_deb.sh
+    ./packaging/arm64/build_rc1_deb.sh
 
-The wrapper verifies that the host architecture is ARM64, reads `version.txt`,
-and delegates to the same authoritative `package.sh` Debian build path used for
-AMD64.
+The ARM64 wrapper uses a Git source export and rebuilds the Rust audio core
+natively for ARM64.
 
-For Version 1.4 this produces:
-
-    dist/srova_1.4-1_arm64.deb
-
-See `packaging/arm64/README.md` for the ARM64 build contract.
-
-## Installing a locally built package
-
-Install the package matching the machine architecture:
-
-    sudo apt install ./dist/srova_1.4-1_amd64.deb
-
-or:
-
-    sudo apt install ./dist/srova_1.4-1_arm64.deb
-
-The resulting package must be validated on a separate clean target system
-before publication.
+See `packaging/arm64/README.md` for the exact Version 2.0 ARM64 build contract.
 
 ## Configuration and secrets
 
-Do not commit runtime environment files, TIDAL sessions, Last.fm credentials,
-API keys, databases, logs, mounted-share credentials or user-library data.
+Do not commit runtime environment files, TIDAL or Qobuz sessions, Last.fm
+credentials, Spotify API keys, databases, logs, Network Music credentials,
+signed media URLs or user-library data.
 
 Optional Last.fm application credentials are read from:
 
 - `SROVA_LASTFM_API_KEY`
 - `SROVA_LASTFM_API_SECRET`
 
-Users connect their own TIDAL, Last.fm and ListenBrainz-compatible accounts
-through the application interfaces.
+Qobuz service metadata needed by the provider implementation is discovered at
+runtime from the Qobuz web-player service and cached outside the source tree.
+
+Spotify API material and Soloist state are private runtime data.
 
 ## Public-source scope
 
-This repository contains the SROVA player source and its AMD64 and ARM64 Debian
-build materials.
+This repository contains the SROVA Linux player source and its AMD64 and ARM64
+Debian build materials.
 
-The SROVA Remote Android application, APK source and SROVA Cast
-receiver/provisioning source are separate projects and are not included in
-this repository. Player-side SROVA Cast display assets used by the Linux
-player are included here.
+The SROVA Remote Android application and SROVA Cast receiver/provisioning source
+are separate projects and are not included here. Player-side SROVA Cast display
+assets used by the Linux player remain part of this repository.
 
 ## Licence and attribution
 
-SROVA is a modified work derived from the GPL-licensed
-[hiresTI Music Player](https://github.com/yelanxin/hiresTI).
+SROVA is a modified work derived from the GPL-licensed hiresTI Music Player.
 
-SROVA includes substantial modifications for headless operation, browser
-control, My Music, Network Music, Internet Radio, packaging, branding, queue
-behaviour, service management and remote control.
+The Qobuz implementation contains work adapted from the MIT-licensed QBZ
+project.
 
-See `NOTICE.md` for attribution and `LICENSE` for the complete GNU General
-Public License text.
+See `NOTICE.md` for attribution and `LICENSE` for the GNU General Public License
+text applying to SROVA.

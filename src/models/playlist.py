@@ -129,7 +129,7 @@ class HistoryManager:
             out.append(tr)
         return out
 
-
+    # [必须确保有这个方法]
     def get_albums(self):
         raw = self.load_raw()
         seen = set()

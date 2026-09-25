@@ -176,7 +176,7 @@ class AudioSignalPathWindow(Adw.Window):
     def __init__(self, parent_app):
         super().__init__(transient_for=parent_app.win, modal=True)
         self._ensure_terminal_css()
-
+        # [修复 1] 先初始化变量，防止 AttributeError
         self.timer_id = None
         self._closed = False
         
@@ -188,34 +188,34 @@ class AudioSignalPathWindow(Adw.Window):
         self._pw_runtime_cache_ts = 0.0
         self._pw_runtime_cache = {}
 
-
+        # 主界面容器
         content = Adw.ToolbarView()
         content.add_css_class("signal-terminal-content")
         self.set_content(content)
 
-
+        # 顶部栏
         header = Adw.HeaderBar()
         header.add_css_class("signal-terminal-header")
         content.add_top_bar(header)
 
-
+        # 滚动区域
         scroll = Gtk.ScrolledWindow()
         scroll.add_css_class("signal-terminal-scroll")
         content.set_content(scroll)
 
-
+        # 居中布局
         clamp = Adw.Clamp(maximum_size=550, margin_top=24, margin_bottom=24, margin_start=12, margin_end=12)
         clamp.add_css_class("signal-terminal-clamp")
         scroll.set_child(clamp)
 
-
+        # 垂直主盒子
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         main_box.add_css_class("signal-path-root")
         main_box.add_css_class("signal-terminal-root")
         clamp.set_child(main_box)
         self.root_box = main_box
 
-
+        # --- 标题区域 ---
         title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin_bottom=12)
         lbl_title = Gtk.Label(label="Signal Path", css_classes=["signal-terminal-title"])
         lbl_sub = Gtk.Label(label="Live Audio Processing Pipeline", css_classes=["signal-terminal-subtitle"])
@@ -223,7 +223,7 @@ class AudioSignalPathWindow(Adw.Window):
         title_box.append(lbl_sub)
         main_box.append(title_box)
 
-
+        # --- 顶部状态摘要 ---
         self.summary_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["signal-card", "signal-terminal-card"], margin_bottom=8)
         summary_head = Gtk.Box(spacing=8, margin_bottom=8)
         summary_icon = Gtk.Image.new_from_icon_name("dialog-information-symbolic")
@@ -241,25 +241,25 @@ class AudioSignalPathWindow(Adw.Window):
         self._init_bitperfect_help_button()
         main_box.append(self.summary_card)
 
-
+        # --- 1. Source Stage (源文件) ---
         self.card_source = self.create_stage_card(
             "cloud-symbolic", "Source Media", "TIDAL Cloud"
         )
         main_box.append(self.card_source)
 
-
+        # ↓ 连接箭头
         main_box.append(self.create_arrow())
 
-
+        # --- 2. Player Engine (播放器处理) ---
         self.card_engine = self.create_stage_card(
             "preferences-system-symbolic", "SROVA Engine", "Audio Processing"
         )
         main_box.append(self.card_engine)
 
-
+        # ↓ 连接箭头
         main_box.append(self.create_arrow())
 
-
+        # --- 3. Hardware Output (硬件输出) ---
         self.card_output = self.create_stage_card(
             "audio-card-symbolic", "Audio Device", "Hardware Output"
         )
@@ -271,11 +271,11 @@ class AudioSignalPathWindow(Adw.Window):
         )
         main_box.append(self.card_events)
 
-
-        self.update_info()
+        # 启动定时器刷新数据 (每秒刷新)
+        self.update_info() # 现在调用它是安全的
         self.timer_id = GLib.timeout_add(1000, self.update_info)
         
-
+        # 窗口关闭时清理定时器
         self.connect("close-request", self.on_close)
 
     def _sync_theme_from_app(self):
@@ -304,10 +304,10 @@ class AudioSignalPathWindow(Adw.Window):
         return False
 
     def create_stage_card(self, icon_name, title, subtitle):
-        """Create a card for one signal-path stage."""
+        """创建每一级的卡片"""
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["signal-card", "signal-terminal-card"])
         
-
+        # 头部：图标 + 标题
         header = Gtk.Box(spacing=12, margin_bottom=12)
         icon = Gtk.Image.new_from_icon_name(icon_name)
         icon.add_css_class("signal-icon")
@@ -322,7 +322,7 @@ class AudioSignalPathWindow(Adw.Window):
         header.append(text_box)
         card.append(header)
         
-
+        # 内容区域
         content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         card.content_box = content_box 
         card.append(content_box)
@@ -330,12 +330,12 @@ class AudioSignalPathWindow(Adw.Window):
         return card
 
     def create_arrow(self):
-        """Create the connector arrow between stages."""
+        """创建连接箭头"""
         lbl = Gtk.Label(label="↓", css_classes=["signal-connector", "signal-terminal-arrow"])
         return lbl
 
     def set_card_rows(self, card, rows):
-        """Update the data rows within a stage card."""
+        """更新卡片内的数据行"""
         while child := card.content_box.get_first_child():
             card.content_box.remove(child)
             
@@ -670,7 +670,7 @@ class AudioSignalPathWindow(Adw.Window):
         ]
         self.set_card_rows(self.card_source, source_rows)
 
-
+        # --- 2. Engine Data (优化显示) ---
         is_exclusive = self.player.exclusive_lock_mode
         is_bp = self.player.bit_perfect_mode
         current_driver = self._get_current_driver()
@@ -698,9 +698,9 @@ class AudioSignalPathWindow(Adw.Window):
             engine_rows.append(("Mode", "USB Rawlink Direct", False))
             engine_rows.append(("Software Mixer", "Bypassed (Direct USB)", True))
         else:
-
+            # [优化] 根据驱动显示不同文案
             if current_driver == "PipeWire":
-                engine_rows.append(("Mode", "PipeWire Graph 🚀", False))
+                engine_rows.append(("Mode", "PipeWire Graph 🚀", False)) # 加个图标表示高性能
                 engine_rows.append(("Scheduling", "Quantum Driven", False))
             else:
                 engine_rows.append(("Mode", "Shared Mode", False))
@@ -712,7 +712,7 @@ class AudioSignalPathWindow(Adw.Window):
             
         self.set_card_rows(self.card_engine, engine_rows)
 
-
+        # --- 3. Output Data (优化显示) ---
         output_rows = []
         
         dev_name = str(getattr(self.app, "current_device_name", "") or "Default")
@@ -734,7 +734,7 @@ class AudioSignalPathWindow(Adw.Window):
         )
         output_rows.append(("Latency", lat_str, bool(latency_ms_value is not None and latency_ms_value < 15.0)))
 
-
+        # 输出路径描述
         snap_usb = snap.get("usb_rawlink") if isinstance(snap, dict) else None
         if current_driver == "USB Rawlink" and isinstance(snap_usb, dict):
             usb_rate = int(snap_usb.get("rate", 0) or 0)

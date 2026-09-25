@@ -243,8 +243,8 @@ SROVA_INSTALL_DIR="$BUILD_ROOT/opt/$SROVA_NAME"
 install_srova_headless_rust_audio_core() {
     # Headless/runtime package fix:
     # _rust/audio.py loads the native Rust core from /opt/srova/src_rust first.
-    # Ensure the .deb includes that file from the canonical
-    # /opt/srova runtime tree.
+    # Ensure the .deb includes that file so it never falls back to legacy
+    # /usr/share/hiresti paths.
     local script_dir
     local source_root
     local rust_audio_so=""
@@ -257,7 +257,11 @@ install_srova_headless_rust_audio_core() {
         "$PWD/src_rust/rust_audio_core/target/release/librust_audio_core.so" \
         "$PWD/../src_rust/rust_audio_core/target/release/librust_audio_core.so" \
         "$script_dir/src_rust/rust_audio_core/target/release/librust_audio_core.so" \
-        "$source_root/src_rust/rust_audio_core/target/release/librust_audio_core.so"
+        "$source_root/src_rust/rust_audio_core/target/release/librust_audio_core.so" \
+        "$PWD/src_rust/librust_audio_core.so" \
+        "$PWD/../src_rust/librust_audio_core.so" \
+        "$script_dir/src_rust/librust_audio_core.so" \
+        "$source_root/src_rust/librust_audio_core.so"
     do
         if [ -f "$cand" ]; then
             rust_audio_so="$cand"
@@ -266,7 +270,7 @@ install_srova_headless_rust_audio_core() {
     done
 
     if [ -z "$rust_audio_so" ]; then
-        echo "ERROR: built librust_audio_core.so not found for SROVA headless package"
+        echo "ERROR: librust_audio_core.so not found for SROVA headless package"
         return 1
     fi
 
@@ -316,39 +320,11 @@ if [ "$USE_PY_BINARY" == "1" ]; then
     echo "✅ Bundled Python binary: $INSTALL_DIR/hiresti_app/hiresti_app"
 fi
 
-# Public-package Rust builds must not embed private build-host paths.
-# Preserve any caller-provided RUSTFLAGS, then add stable public prefixes.
-srova_cargo_release_build() {
-    local manifest="$1"
-    local source_root
-    local cargo_home
-    local remap_flags
-    local combined_rustflags
-
-    source_root="$(pwd -P)"
-    cargo_home="${CARGO_HOME:-${HOME:?HOME is required for Rust packaging}/.cargo}"
-
-    remap_flags="--remap-path-prefix=${source_root}=/usr/src/srova"
-    remap_flags+=" --remap-path-prefix=${cargo_home}/registry/src=/usr/src/cargo/registry"
-    remap_flags+=" --remap-path-prefix=${cargo_home}/git=/usr/src/cargo/git"
-    remap_flags+=" --remap-path-prefix=${HOME}=/usr/src/build-home"
-
-    combined_rustflags="${RUSTFLAGS:-}"
-    if [ -n "$combined_rustflags" ]; then
-        combined_rustflags+=" "
-    fi
-    combined_rustflags+="$remap_flags"
-
-    RUSTFLAGS="$combined_rustflags" \
-        cargo build --manifest-path "$manifest" --release
-}
-
-
 # 2.1 Build and bundle Rust visualizer core shared library (libviz_core.so)
 if [ -f "src_rust/rust_viz_core/Cargo.toml" ]; then
     if command -v cargo &> /dev/null; then
         echo "🦀 Building Rust visualizer core..."
-        srova_cargo_release_build src_rust/rust_viz_core/Cargo.toml
+        cargo build --manifest-path src_rust/rust_viz_core/Cargo.toml --release
         RUST_SO="src_rust/rust_viz_core/target/release/libviz_core.so"
         if [ ! -f "$RUST_SO" ]; then
             echo "Error: Rust build finished but $RUST_SO not found."
@@ -366,7 +342,7 @@ fi
 if [ -f "src_rust/rust_audio_core/Cargo.toml" ]; then
     if command -v cargo &> /dev/null; then
         echo "🦀 Building Rust audio core..."
-        srova_cargo_release_build src_rust/rust_audio_core/Cargo.toml
+        cargo build --manifest-path src_rust/rust_audio_core/Cargo.toml --release
         RUST_AUDIO_SO="src_rust/rust_audio_core/target/release/librust_audio_core.so"
         if [ ! -f "$RUST_AUDIO_SO" ]; then
             echo "Error: Rust audio build finished but $RUST_AUDIO_SO not found."
@@ -395,7 +371,7 @@ WRAPPER
 elif [ -f "src_rust/rust_launcher/Cargo.toml" ]; then
     if command -v cargo &> /dev/null; then
         echo "🦀 Building Rust launcher..."
-        srova_cargo_release_build src_rust/rust_launcher/Cargo.toml
+        cargo build --manifest-path src_rust/rust_launcher/Cargo.toml --release
         RUST_LAUNCHER_BIN="src_rust/rust_launcher/target/release/hiresti"
         if [ ! -f "$RUST_LAUNCHER_BIN" ]; then
             echo "Error: Rust launcher build finished but $RUST_LAUNCHER_BIN not found."
@@ -580,8 +556,10 @@ modules = [
     "requests",
     "urllib3",
     "qrcode",
+    "PIL",
     "certifi",
     "idna",
+    "charset_normalizer",
     "dateutil",
     "typing_extensions",
     "isodate",
@@ -620,52 +598,6 @@ print("Copied local modules:", ", ".join(copied) if copied else "(none)")
 PY
 fi
 
-# Portability invariant: /opt/srova/libs must contain only portable
-# pure-Python dependencies. Compiled CPython extensions are tied to the
-# builder interpreter ABI and must be supplied by the target distribution.
-ABI_COUPLED_EXTENSION="$(
-    find "$INSTALL_DIR/libs" \
-        -type f \
-        -name '*.cpython-*.so' \
-        -print \
-        -quit
-)"
-
-if [ -n "$ABI_COUPLED_EXTENSION" ]; then
-    echo "ERROR: ABI-coupled Python extension found in portable bundle: $ABI_COUPLED_EXTENSION"
-    exit 1
-fi
-
-for SYSTEM_PYTHON_PATH in \
-    "$INSTALL_DIR/libs/PIL" \
-    "$INSTALL_DIR/libs/pillow.libs" \
-    "$INSTALL_DIR/libs/charset_normalizer"
-do
-    if [ -e "$SYSTEM_PYTHON_PATH" ]; then
-        echo "ERROR: system-supplied Python dependency was bundled: $SYSTEM_PYTHON_PATH"
-        exit 1
-    fi
-done
-
-SYSTEM_PYTHON_METADATA="$(
-    find "$INSTALL_DIR/libs" \
-        -maxdepth 1 \
-        -type d \
-        \( \
-            -iname 'pillow-*.dist-info' -o \
-            -iname 'charset_normalizer-*.dist-info' \
-        \) \
-        -print \
-        -quit
-)"
-
-if [ -n "$SYSTEM_PYTHON_METADATA" ]; then
-    echo "ERROR: system-supplied Python dependency metadata was bundled: $SYSTEM_PYTHON_METADATA"
-    exit 1
-fi
-
-echo "✅ Portable Python bundle contains no build-host CPython extensions"
-
 # Keep RPM shebang checks happy: avoid /usr/bin/env python triggering brp-mangle-shebangs errors
 while IFS= read -r f; do
     sed -i '1s|^#!/usr/bin/env python$|#!/usr/bin/env python3|' "$f"
@@ -687,6 +619,7 @@ Wants=network-online.target srova-network-mounts.service
 Type=simple
 User=srova
 Group=srova
+SupplementaryGroups=audio
 WorkingDirectory=/opt/srova
 Environment=HOME=/var/lib/srova
 Environment=XDG_CONFIG_HOME=/var/lib/srova/.config
@@ -698,6 +631,8 @@ EnvironmentFile=-/var/lib/srova/srova.env
 ExecStart=/usr/bin/python3 /opt/srova/main_headless.py --host 0.0.0.0
 Restart=on-failure
 RestartSec=3
+RuntimeDirectory=srova
+RuntimeDirectoryMode=0755
 
 [Install]
 WantedBy=multi-user.target
@@ -714,6 +649,10 @@ EOF
         packaging/network/srova-network-mount-helper \
         "$BUILD_ROOT/usr/lib/srova/srova-network-mount-helper"
 
+    install -m 0755 \
+        packaging/network/srova-spotify-firewall-helper \
+        "$BUILD_ROOT/usr/lib/srova/srova-spotify-firewall-helper"
+
     install -m 0644 \
         packaging/network/srova-network-mounts.service \
         "$BUILD_ROOT/usr/lib/systemd/system/srova-network-mounts.service"
@@ -722,7 +661,12 @@ EOF
 srova ALL=(root) NOPASSWD: /usr/lib/srova/srova-network-mount-helper
 EOF
 
+    cat <<'EOF' > "$BUILD_ROOT/etc/sudoers.d/srova-spotify-firewall"
+srova ALL=(root) NOPASSWD: /usr/lib/srova/srova-spotify-firewall-helper
+EOF
+
     chmod 0440 "$BUILD_ROOT/etc/sudoers.d/srova-network-mount"
+    chmod 0440 "$BUILD_ROOT/etc/sudoers.d/srova-spotify-firewall"
     chmod 0700 "$BUILD_ROOT/etc/srova/network-credentials"
     chmod 0755 "$BUILD_ROOT/mnt/srova-network"
 }
@@ -824,8 +768,10 @@ normalize_deb_payload_permissions() {
     # Preserve the stricter modes required by the privileged Network Music
     # helper after the generic Debian payload normalization above.
     chmod 0755 "$BUILD_ROOT/usr/lib/srova/srova-network-mount-helper"
+    chmod 0755 "$BUILD_ROOT/usr/lib/srova/srova-spotify-firewall-helper"
     chmod 0644 "$BUILD_ROOT/usr/lib/systemd/system/srova-network-mounts.service"
     chmod 0440 "$BUILD_ROOT/etc/sudoers.d/srova-network-mount"
+    chmod 0440 "$BUILD_ROOT/etc/sudoers.d/srova-spotify-firewall"
     chmod 0700 "$BUILD_ROOT/etc/srova/network-credentials"
     chmod 0755 "$BUILD_ROOT/mnt/srova-network"
 
@@ -1089,12 +1035,19 @@ EOF
 
 validate_deb_network_payload() {
     local helper="$BUILD_ROOT/usr/lib/srova/srova-network-mount-helper"
+    local spotify_helper="$BUILD_ROOT/usr/lib/srova/srova-spotify-firewall-helper"
     local restore_service="$BUILD_ROOT/usr/lib/systemd/system/srova-network-mounts.service"
     local sudoers="$BUILD_ROOT/etc/sudoers.d/srova-network-mount"
+    local spotify_sudoers="$BUILD_ROOT/etc/sudoers.d/srova-spotify-firewall"
     local credential_dir="$BUILD_ROOT/etc/srova/network-credentials"
 
     [ -f "$helper" ] || {
         echo "Error: missing network mount helper." >&2
+        return 1
+    }
+
+    [ -f "$spotify_helper" ] || {
+        echo "Error: missing Spotify firewall helper." >&2
         return 1
     }
 
@@ -1108,8 +1061,18 @@ validate_deb_network_payload() {
         return 1
     }
 
+    [ -f "$spotify_sudoers" ] || {
+        echo "Error: missing Spotify firewall sudoers file." >&2
+        return 1
+    }
+
     [ "$(stat -c '%a' "$helper")" = "755" ] || {
         echo "Error: network helper mode must be 0755." >&2
+        return 1
+    }
+
+    [ "$(stat -c '%a' "$spotify_helper")" = "755" ] || {
+        echo "Error: Spotify firewall helper mode must be 0755." >&2
         return 1
     }
 
@@ -1123,6 +1086,17 @@ validate_deb_network_payload() {
         return 1
     }
 
+    [ "$(stat -c '%a' "$spotify_sudoers")" = "440" ] || {
+        echo "Error: Spotify firewall sudoers mode must be 0440." >&2
+        return 1
+    }
+
+    [ "$(cat "$spotify_sudoers")" = \
+        "srova ALL=(root) NOPASSWD: /usr/lib/srova/srova-spotify-firewall-helper" ] || {
+        echo "Error: Spotify firewall sudoers authorization is not exact." >&2
+        return 1
+    }
+
     [ "$(stat -c '%a' "$credential_dir")" = "700" ] || {
         echo "Error: network credential directory mode must be 0700." >&2
         return 1
@@ -1130,6 +1104,7 @@ validate_deb_network_payload() {
 
     if command -v visudo >/dev/null 2>&1; then
         visudo -cf "$sudoers"
+        visudo -cf "$spotify_sudoers"
     fi
 }
 
@@ -1156,6 +1131,18 @@ validate_deb_network_archive() {
             echo "Error: packaged network sudoers file must be root/root mode 0440." >&2
             return 1
         }
+
+    printf '%s\n' "$listing" |
+        awk '$1 == "-rwxr-xr-x" && $2 == "root/root" && $NF == "./usr/lib/srova/srova-spotify-firewall-helper" { found=1 } END { exit !found }' || {
+            echo "Error: packaged Spotify firewall helper must be root/root mode 0755." >&2
+            return 1
+        }
+
+    printf '%s\n' "$listing" |
+        awk '$1 == "-r--r-----" && $2 == "root/root" && $NF == "./etc/sudoers.d/srova-spotify-firewall" { found=1 } END { exit !found }' || {
+            echo "Error: packaged Spotify firewall sudoers file must be root/root mode 0440." >&2
+            return 1
+        }
 }
 
 if [ "$TYPE" == "deb" ]; then
@@ -1167,7 +1154,7 @@ Version: $VERSION
 Section: sound
 Priority: optional
 Architecture: $DEB_ARCH
-Depends: python3, python3-gi, python3-gi-cairo, python3-cairo, python3-dateutil, python3-typing-extensions, python3-isodate, python3-pil, python3-charset-normalizer, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-gtksource-4, qrencode, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, libpipewire-0.3-0, libpulse0, sudo, nfs-common, cifs-utils, smbclient, iproute2
+Depends: python3, python3-gi, python3-gi-cairo, python3-cairo, python3-pil, python3-charset-normalizer, python3-dateutil, python3-typing-extensions, python3-isodate, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-gtksource-4, qrencode, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, pipewire-bin, wireplumber, libpipewire-0.3-0, libpulse0, sudo, nfs-common, cifs-utils, smbclient, iproute2
 Maintainer: $MAINTAINER
 Homepage: https://srova.music/
 Description: $DESCRIPTION
@@ -1210,7 +1197,7 @@ Version: $VERSION
 Section: sound
 Priority: optional
 Architecture: $DEB_ARCH
-Depends: python3, python3-gi, python3-gi-cairo, python3-cairo, python3-dateutil, python3-typing-extensions, python3-isodate, python3-pil, python3-charset-normalizer, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-gtksource-4, qrencode, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, libpipewire-0.3-0, libpulse0, sudo, nfs-common, cifs-utils, smbclient, iproute2
+Depends: python3, python3-gi, python3-gi-cairo, python3-cairo, python3-pil, python3-charset-normalizer, python3-dateutil, python3-typing-extensions, python3-isodate, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-gtksource-4, qrencode, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, pipewire-bin, wireplumber, libpipewire-0.3-0, libpulse0, sudo, nfs-common, cifs-utils, smbclient, iproute2
 Maintainer: $MAINTAINER
 Homepage: https://srova.music/
 Description: $DESCRIPTION

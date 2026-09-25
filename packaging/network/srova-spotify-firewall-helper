@@ -1,0 +1,345 @@
+#!/usr/bin/python3
+"""Root helper for exact, temporary SROVA Spotify UFW rules."""
+
+from __future__ import annotations
+
+import contextlib
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+UFW_PATHS = ("/usr/sbin/ufw", "/sbin/ufw")
+LOCK_FILE = Path("/run/srova-spotify-firewall.lock")
+COMMENT_PREFIX = "SROVA-SPOTIFY-"
+MAX_STDIN_BYTES = 4096
+COMMAND_TIMEOUT = 10.0
+LOCK_TIMEOUT = 5.0
+_INTERFACE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}\Z")
+_NUMBERED_RE = re.compile(r"^\[\s*(\d+)\]\s+(.*)$")
+_MARKER_RE = re.compile(r"#\s*(SROVA-SPOTIFY-[0-9a-f]{16})\s*$")
+_LEASE_FIELDS = {
+    "interface",
+    "source_cidr",
+    "destination_ipv4",
+    "port",
+}
+
+
+class HelperError(RuntimeError):
+    """A requested helper operation was invalid or could not be verified."""
+
+
+def validate_lease(payload):
+    if not isinstance(payload, dict) or set(payload) != _LEASE_FIELDS:
+        raise HelperError("invalid lease structure")
+    interface = payload["interface"]
+    if not isinstance(interface, str) or not _INTERFACE_RE.fullmatch(interface):
+        raise HelperError("invalid LAN interface")
+    if interface == "lo":
+        raise HelperError("loopback is not a LAN interface")
+
+    source = payload["source_cidr"]
+    if not isinstance(source, str):
+        raise HelperError("invalid IPv4 source network")
+    try:
+        network = ipaddress.ip_network(source, strict=True)
+    except ValueError:
+        raise HelperError("invalid IPv4 source network") from None
+    if network.version != 4 or network.prefixlen == 0:
+        raise HelperError("invalid IPv4 source network")
+    if network.is_loopback or network.is_multicast or network.is_unspecified:
+        raise HelperError("invalid IPv4 source network")
+
+    destination_text = payload["destination_ipv4"]
+    if not isinstance(destination_text, str):
+        raise HelperError("invalid destination IPv4 address")
+    try:
+        destination = ipaddress.ip_address(destination_text)
+    except ValueError:
+        raise HelperError("invalid destination IPv4 address") from None
+    if destination.version != 4 or destination not in network:
+        raise HelperError("destination must be IPv4 within the source network")
+    if destination.is_loopback or destination.is_multicast or destination.is_unspecified:
+        raise HelperError("invalid destination IPv4 address")
+
+    port = payload["port"]
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise HelperError("invalid TCP port")
+    return {
+        "interface": interface,
+        "source_cidr": str(network),
+        "destination_ipv4": str(destination),
+        "port": port,
+    }
+
+
+def ownership_marker(lease):
+    canonical = "\0".join(
+        (
+            lease["interface"],
+            lease["source_cidr"],
+            lease["destination_ipv4"],
+            str(lease["port"]),
+        )
+    ).encode("ascii")
+    return COMMENT_PREFIX + hashlib.sha256(canonical).hexdigest()[:16]
+
+
+def select_ufw(path_exists=os.path.exists):
+    for path in UFW_PATHS:
+        if path_exists(path):
+            return path
+    return None
+
+
+def run_command(argv):
+    try:
+        return subprocess.run(
+            list(argv),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=COMMAND_TIMEOUT,
+            check=False,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise HelperError("firewall command failed") from None
+
+
+def ufw_status(ufw_path):
+    completed = run_command([ufw_path, "status"])
+    if completed.returncode != 0:
+        raise HelperError("UFW status failed")
+    states = {
+        line.strip().lower()
+        for line in completed.stdout.splitlines()
+        if line.strip().lower() in ("status: active", "status: inactive")
+    }
+    if states == {"status: active"}:
+        return True
+    if states == {"status: inactive"}:
+        return False
+    raise HelperError("UFW returned an unknown status")
+
+
+def numbered_rules(ufw_path):
+    completed = run_command([ufw_path, "status", "numbered"])
+    if completed.returncode != 0:
+        raise HelperError("UFW rule listing failed")
+    states = {
+        line.strip().lower()
+        for line in completed.stdout.splitlines()
+        if line.strip().lower() in ("status: active", "status: inactive")
+    }
+    if states != {"status: active"}:
+        raise HelperError("UFW rule state is not active")
+    rules = []
+    for raw_line in completed.stdout.splitlines():
+        match = _NUMBERED_RE.match(raw_line.strip())
+        if not match:
+            continue
+        marker = _MARKER_RE.search(match.group(2))
+        if marker:
+            rules.append((int(match.group(1)), marker.group(1)))
+    return rules
+
+
+def delete_numbered(ufw_path, numbers):
+    for number in sorted(set(numbers), reverse=True):
+        completed = run_command(
+            [ufw_path, "--force", "delete", str(number)]
+        )
+        if completed.returncode != 0:
+            raise HelperError("UFW rule deletion failed")
+
+
+def action_status(payload):
+    if payload != {}:
+        raise HelperError("status does not accept fields")
+    ufw_path = select_ufw()
+    if ufw_path is None:
+        return {"ok": True, "available": False, "active": False}
+    return {"ok": True, "available": True, "active": ufw_status(ufw_path)}
+
+
+def action_open(payload):
+    lease = validate_lease(payload)
+    ufw_path = select_ufw()
+    if ufw_path is None:
+        raise HelperError("UFW is unavailable")
+    if ufw_status(ufw_path) is not True:
+        raise HelperError("UFW is inactive")
+    marker = ownership_marker(lease)
+    rules = numbered_rules(ufw_path)
+    exact_numbers = [number for number, found in rules if found == marker]
+    stale_numbers = [number for number, found in rules if found != marker]
+    if stale_numbers:
+        delete_numbered(ufw_path, stale_numbers)
+    if exact_numbers:
+        if not any(
+            found == marker for _number, found in numbered_rules(ufw_path)
+        ):
+            raise HelperError("UFW rule state could not be verified")
+        return {"ok": True, "changed": bool(stale_numbers), "owned": True}
+
+    argv = [
+        ufw_path,
+        "allow",
+        "in",
+        "on",
+        lease["interface"],
+        "from",
+        lease["source_cidr"],
+        "to",
+        lease["destination_ipv4"],
+        "port",
+        str(lease["port"]),
+        "proto",
+        "tcp",
+        "comment",
+        marker,
+    ]
+    completed = run_command(argv)
+    if completed.returncode != 0:
+        raise HelperError("UFW rule creation failed")
+    if not any(found == marker for _number, found in numbered_rules(ufw_path)):
+        raise HelperError("UFW rule creation could not be verified")
+    return {"ok": True, "changed": True, "owned": True}
+
+
+def action_close(payload):
+    lease = validate_lease(payload)
+    ufw_path = select_ufw()
+    if ufw_path is None:
+        raise HelperError("UFW is unavailable")
+    marker = ownership_marker(lease)
+    matches = [
+        number for number, found in numbered_rules(ufw_path) if found == marker
+    ]
+    if not matches:
+        return {"ok": True, "changed": False, "owned": False}
+    delete_numbered(ufw_path, matches)
+    if any(found == marker for _number, found in numbered_rules(ufw_path)):
+        raise HelperError("UFW rule deletion could not be verified")
+    return {"ok": True, "changed": True, "owned": False}
+
+
+def action_cleanup(payload):
+    if payload != {}:
+        raise HelperError("cleanup does not accept fields")
+    ufw_path = select_ufw()
+    if ufw_path is None:
+        raise HelperError("UFW is unavailable")
+    rules = numbered_rules(ufw_path)
+    delete_numbered(ufw_path, [number for number, _marker in rules])
+    if numbered_rules(ufw_path):
+        raise HelperError("UFW cleanup could not be verified")
+    return {"ok": True, "changed": bool(rules), "owned": False}
+
+
+_ACTIONS = {
+    "status": action_status,
+    "open": action_open,
+    "close": action_close,
+    "cleanup": action_cleanup,
+}
+
+
+def read_stdin_json(stream=None):
+    source = stream if stream is not None else sys.stdin.buffer
+    raw = source.read(MAX_STDIN_BYTES + 1)
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    if len(raw) > MAX_STDIN_BYTES:
+        raise HelperError("request is too large")
+    try:
+        payload = json.loads(raw.decode("utf-8")) if raw.strip() else {}
+    except (UnicodeError, json.JSONDecodeError):
+        raise HelperError("request is not valid JSON") from None
+    if not isinstance(payload, dict):
+        raise HelperError("request must be a JSON object")
+    return payload
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise HelperError("root privileges are required")
+
+
+@contextlib.contextmanager
+def operation_lock(timeout=LOCK_TIMEOUT):
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(LOCK_FILE, flags, 0o600)
+    except OSError:
+        raise HelperError("firewall lock could not be opened safely") from None
+    acquired = False
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0:
+            raise HelperError("firewall lock ownership is unsafe")
+        os.fchmod(fd, 0o600)
+        if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
+            raise HelperError("firewall lock mode is unsafe")
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise HelperError("firewall helper is busy") from None
+                time.sleep(0.02)
+        yield
+    finally:
+        if acquired:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def dispatch(action, payload):
+    handler = _ACTIONS.get(action)
+    if handler is None:
+        raise HelperError("invalid action")
+    return handler(payload)
+
+
+def emit(response):
+    sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
+
+
+def main(argv=None):
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    try:
+        require_root()
+        if len(arguments) != 1 or arguments[0] not in _ACTIONS:
+            raise HelperError("invalid action")
+        payload = read_stdin_json()
+        with operation_lock():
+            response = dispatch(arguments[0], payload)
+        if not isinstance(response, dict) or response.get("ok") is not True:
+            raise HelperError("invalid helper response")
+        emit(response)
+        return 0
+    except Exception:
+        emit({"ok": False, "error": "firewall helper operation failed"})
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

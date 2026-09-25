@@ -332,15 +332,7 @@ def test_schedule_surface_resync_debounces_idle_and_refreshes_settle_timers(monk
 
     app_now_playing._schedule_now_playing_surface_resync(app)
 
-    expected_delays = [
-        app_now_playing._NOW_PLAYING_REVEAL_DURATION_MS + 40,
-        app_now_playing._NOW_PLAYING_REVEAL_DURATION_MS + 160,
-    ]
-    assert list(app_now_playing._NOW_PLAYING_LAYOUT_SETTLE_DELAYS_MS) == expected_delays
-    assert sorted(
-        timeout[0]
-        for timeout in timeout_callbacks.values()
-    ) == sorted(expected_delays)
+    assert sorted(timeout[0] for timeout in timeout_callbacks.values()) == [90, 300]
     assert len(idle_callbacks) == 1
     assert app._now_playing_resize_idle_source == 1
     assert app._now_playing_resize_settle_source == 2

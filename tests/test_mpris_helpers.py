@@ -56,8 +56,8 @@ def _make_app():
 
 
 def test_track_id_to_object_path_sanitizes_tokens():
-    assert track_id_to_object_path("123 abc/def") == "/com/srova/player/track/t_123_abc_def"
-    assert track_id_to_object_path("") == "/com/srova/player/track/unknown"
+    assert track_id_to_object_path("123 abc/def") == "/com/hiresti/player/track/t_123_abc_def"
+    assert track_id_to_object_path("") == "/com/hiresti/player/track/unknown"
 
 
 def test_play_mode_mapping():

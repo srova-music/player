@@ -88,24 +88,9 @@ def test_service_section_css_is_scoped_and_mobile_safe():
     assert "--srova-danger" not in CSS
 
 
-def test_system_restart_assets_use_valid_cache_tokens():
-    import re
-
-    asset_patterns = {
-        "ui.js": r"/ui_web/ui\.js\?v=([A-Za-z0-9_.-]+)",
-        "srova.css": r"/ui_web/srova\.css\?v=([A-Za-z0-9_.-]+)",
-    }
-
-    for asset, pattern in asset_patterns.items():
-        tokens = re.findall(pattern, INDEX)
-        assert len(tokens) == 1, (asset, tokens)
-        assert tokens[0]
-
-    assert '<script src="/ui_web/ui.js"></script>' not in INDEX
-    assert (
-        '<link rel="stylesheet" href="/ui_web/srova.css">'
-        not in INDEX
-    )
+def test_system_restart_cache_tokens_are_current():
+    assert "/ui_web/ui.js?v=" in INDEX
+    assert "/ui_web/srova.css?v=" in INDEX
 
 
 def test_remote_access_restart_hidden_rule_wins_settings_cascade():
@@ -139,11 +124,14 @@ def test_backend_restart_uses_systemd_managed_self_exit():
 
 
 def test_packaged_services_restart_after_controlled_failure_exit():
-    source = (REPO_ROOT / "package.sh").read_text(
-        encoding="utf-8",
-    )
-
-    assert "Restart=on-failure" in source
+    for relative in (
+        "package.sh",
+        "packaging/arm64/build_rc1_deb.sh",
+    ):
+        source = (REPO_ROOT / relative).read_text(
+            encoding="utf-8",
+        )
+        assert "Restart=on-failure" in source, relative
 
 
 

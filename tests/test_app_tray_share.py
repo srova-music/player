@@ -43,7 +43,7 @@ def test_share_from_tray_copies_repo_url(monkeypatch):
 
     app_tray._share_from_tray(app)
 
-    assert display.clipboard.value == "https://srova.music"
+    assert display.clipboard.value == "https://github.com/yelanxin/hiresTI"
 
 
 def test_copy_share_url_to_clipboard_returns_true_when_copied():
@@ -51,4 +51,4 @@ def test_copy_share_url_to_clipboard_returns_true_when_copied():
     app = SimpleNamespace(win=_Window(display))
 
     assert app_tray._copy_share_url_to_clipboard(app) is True
-    assert display.clipboard.value == "https://srova.music"
+    assert display.clipboard.value == "https://github.com/yelanxin/hiresTI"

@@ -107,7 +107,6 @@ def _make_switch_adapter(rc, last_error=""):
     adapter.alsa_latency_time = 2000
     adapter.exclusive_lock_mode = True
     adapter._alsa_reservation = None
-    adapter._apply_driver_spectrum_policy = lambda _driver: None
     return adapter
 
 

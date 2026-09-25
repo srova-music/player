@@ -1415,7 +1415,9 @@ html, body {
           )
         : rawSource === "tidal"
           ? "TIDAL"
-          : (
+          : rawSource === "qobuz"
+            ? "QOBUZ"
+            : (
               rawSource === "local" ||
               rawSource === "local_music" ||
               rawSource === "my music" ||

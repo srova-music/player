@@ -175,3 +175,81 @@ def test_local_queue_play_preserves_existing_queue(monkeypatch, tmp_path):
     assert backend.QUEUE_INDEX == 1
     assert save_calls == []
     assert len(callbacks) == 1
+
+
+def test_active_local_context_wins_over_retained_nonlocal_queue(monkeypatch):
+    retained_id = "qobuz:36080298"
+    local_id = "local-test:radiohead"
+
+    monkeypatch.setattr(backend, "RADIO_MODE", False)
+    monkeypatch.setattr(backend, "CURRENT_RADIO", None)
+    monkeypatch.setattr(
+        backend,
+        "_qobuz_playback_is_active",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_qobuz_active_queue_id",
+        lambda: "",
+    )
+    monkeypatch.setattr(
+        backend,
+        "PLAY_QUEUE",
+        [retained_id],
+    )
+    monkeypatch.setattr(
+        backend,
+        "PLAY_QUEUE_META_CACHE",
+        {
+            retained_id: {
+                "id": retained_id,
+                "source": "qobuz",
+                "title": "Skinny",
+                "artist": "Izzy Bizu",
+                "duration": 235,
+            },
+        },
+    )
+    monkeypatch.setattr(backend, "QUEUE_INDEX", 0)
+    monkeypatch.setattr(backend, "LOCAL_PLAYBACK_ACTIVE", True)
+    monkeypatch.setattr(
+        backend,
+        "LOCAL_PLAYBACK_CONTEXT",
+        {
+            "track_id": local_id,
+            "title": "Paranoid Android (Remastered)",
+            "artist": "Radiohead",
+            "album": "100 Cult Albums",
+            "duration": 387,
+            "context_title": "Local Test",
+            "context_type": "local",
+            "context_id": local_id,
+        },
+    )
+    monkeypatch.setattr(
+        backend,
+        "CURRENT_CONTEXT",
+        {
+            "track_id": local_id,
+            "title": "Paranoid Android (Remastered)",
+            "artist": "Radiohead",
+            "album": "100 Cult Albums",
+            "duration": 387,
+            "context_title": "Local Test",
+            "context_type": "local",
+            "context_id": local_id,
+        },
+    )
+
+    status = backend._status_playback_context(
+        SimpleNamespace(is_playing=lambda: True),
+    )
+
+    assert status == {
+        "playback_state": "playing",
+        "current_track_valid": True,
+        "source": "local",
+        "current_track_id": local_id,
+        "context": backend.LOCAL_PLAYBACK_CONTEXT,
+    }

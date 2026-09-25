@@ -51,7 +51,6 @@ def _make_app():
     app._last_disconnected_driver = ""
     app._last_disconnected_device_name = ""
     app.notices = []
-    app.player = SimpleNamespace(requested_driver="ALSA")
     app.show_output_notice = lambda text, state, timeout: app.notices.append((text, state, timeout))
     return app
 

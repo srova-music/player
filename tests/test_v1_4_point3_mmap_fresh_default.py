@@ -16,7 +16,7 @@ MAIN_SOURCE = (ROOT / "src/main_headless.py").read_text(encoding="utf-8")
 UI_SOURCE = (ROOT / "src/ui_web/ui.js").read_text(encoding="utf-8")
 PACKAGE_SOURCE = (ROOT / "package.sh").read_text(encoding="utf-8")
 ARM64_PACKAGE_SOURCE = (
-    ROOT / "packaging/arm64/build_deb.sh"
+    ROOT / "packaging/arm64/build_rc1_deb.sh"
 ).read_text(encoding="utf-8")
 
 
@@ -27,6 +27,7 @@ def isolated_audio_output(tmp_path, monkeypatch):
     monkeypatch.setattr(backend, "ALSA_DRIVER", "alsa_mmap")
     monkeypatch.setattr(backend, "ALSA_DEVICE", "hw:0,0")
     monkeypatch.setattr(backend, "ALSA_DAC_NAME", "")
+    monkeypatch.setattr(backend, "_AUDIO_OUTPUT_SELECTED", False)
     monkeypatch.setattr(backend, "APP_INSTANCE", None)
     monkeypatch.delenv("SROVA_FORCE_CLI_AUDIO", raising=False)
     return preference
@@ -90,6 +91,7 @@ def test_no_preference_uses_mmap_without_creating_preference(
 
     assert backend.ALSA_DRIVER == "alsa_mmap"
     assert backend.ALSA_DEVICE == "hw:0,0"
+    assert backend._AUDIO_OUTPUT_SELECTED is False
     assert not isolated_audio_output.exists()
 
 
@@ -108,6 +110,7 @@ def test_valid_saved_alsa_overrides_new_default(
     assert backend.ALSA_DRIVER == "ALSA"
     assert backend.ALSA_DEVICE == "hw:2,0"
     assert backend.ALSA_DAC_NAME == "Saved ALSA DAC"
+    assert backend._AUDIO_OUTPUT_SELECTED is True
 
 
 def test_valid_saved_mmap_remains_mmap(isolated_audio_output, monkeypatch):
@@ -123,6 +126,7 @@ def test_valid_saved_mmap_remains_mmap(isolated_audio_output, monkeypatch):
     assert backend.ALSA_DRIVER == "alsa_mmap"
     assert backend.ALSA_DEVICE == "hw:3,1"
     assert backend.ALSA_DAC_NAME == "Saved mmap DAC"
+    assert backend._AUDIO_OUTPUT_SELECTED is True
 
 
 def test_older_preference_without_driver_inherits_mmap_and_retains_device(
@@ -150,6 +154,7 @@ def test_unforced_cli_alsa_still_applies_without_saved_preference(
 
     assert backend.ALSA_DRIVER == "ALSA"
     assert backend.ALSA_DEVICE == "plughw:5,0"
+    assert backend._AUDIO_OUTPUT_SELECTED is False
     assert not isolated_audio_output.exists()
 
 
@@ -171,11 +176,29 @@ def test_forced_cli_audio_still_overrides_saved_preference(
 
     assert backend.ALSA_DRIVER == "ALSA"
     assert backend.ALSA_DEVICE == "plughw:7,0"
+    assert backend._AUDIO_OUTPUT_SELECTED is True
     assert json.loads(isolated_audio_output.read_text(encoding="utf-8")) == {
         "alsa_driver": "alsa_mmap",
         "alsa_device": "hw:6,0",
         "dac_name": "Saved mmap DAC",
     }
+
+
+def test_forced_explicit_cli_audio_establishes_selection_without_preference(
+    isolated_audio_output,
+    monkeypatch,
+):
+    monkeypatch.setenv("SROVA_FORCE_CLI_AUDIO", "1")
+
+    _run_main_to_loop(
+        monkeypatch,
+        ["--alsa-driver", "ALSA", "--alsa-device", "plughw:7,0"],
+    )
+
+    assert backend.ALSA_DRIVER == "ALSA"
+    assert backend.ALSA_DEVICE == "plughw:7,0"
+    assert backend._AUDIO_OUTPUT_SELECTED is True
+    assert not isolated_audio_output.exists()
 
 
 def test_save_validation_accepts_both_existing_driver_identifiers():
@@ -192,9 +215,13 @@ def test_browser_selector_restores_backend_value_without_ui_change():
     assert "var SEEK_SESSION_GUARD_MS = 1500;" in UI_SOURCE
 
 
-def test_official_packaging_does_not_hard_code_audio_driver():
+def test_official_services_do_not_hard_code_audio_driver():
     generic_exec = (
         "ExecStart=/usr/bin/python3 /opt/srova/main_headless.py --host 0.0.0.0"
+    )
+    arm64_exec = (
+        "ExecStart=/usr/lib/srova/srova-server --host ${SROVA_HOST} "
+        "--port ${SROVA_PORT} --log-level ${SROVA_LOG_LEVEL}"
     )
 
     generic_exec_lines = [
@@ -202,16 +229,16 @@ def test_official_packaging_does_not_hard_code_audio_driver():
         for line in PACKAGE_SOURCE.splitlines()
         if line.startswith("ExecStart=") and "/opt/srova/main_headless.py" in line
     ]
+    arm64_exec_lines = [
+        line.strip()
+        for line in ARM64_PACKAGE_SOURCE.splitlines()
+        if line.startswith("ExecStart=") and "/usr/lib/srova/srova-server" in line
+    ]
 
     assert generic_exec_lines == [generic_exec]
-    assert all("--alsa-driver" not in line for line in generic_exec_lines)
-    assert all("--alsa-device" not in line for line in generic_exec_lines)
-
-    assert 'PACKAGE_SCRIPT="$REPO_ROOT/package.sh"' in ARM64_PACKAGE_SOURCE
-    assert 'VERSION_FILE="$REPO_ROOT/version.txt"' in ARM64_PACKAGE_SOURCE
-    assert 'exec bash "$PACKAGE_SCRIPT" deb "$VERSION"' in ARM64_PACKAGE_SOURCE
-    assert "--alsa-driver" not in ARM64_PACKAGE_SOURCE
-    assert "--alsa-device" not in ARM64_PACKAGE_SOURCE
+    assert arm64_exec_lines == [arm64_exec]
+    assert all("--alsa-driver" not in line for line in generic_exec_lines + arm64_exec_lines)
+    assert all("--alsa-device" not in line for line in generic_exec_lines + arm64_exec_lines)
 
 
 def test_physical_device_default_and_identifiers_are_unchanged():

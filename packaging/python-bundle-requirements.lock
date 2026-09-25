@@ -3,9 +3,11 @@
 # Exact Version 1 package set shared by AMD64 and ARM64 builds.
 # Install with --no-deps so pip cannot introduce an unlisted version.
 certifi==2026.7.22
+charset-normalizer==3.4.9
 idna==3.18
 isodate==0.7.2
 mpegdash==0.4.1
+pillow==12.3.0
 pyaes==1.6.1
 pystray==0.19.5
 python-dateutil==2.9.0.post0

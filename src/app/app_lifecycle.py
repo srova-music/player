@@ -21,6 +21,16 @@ def _restore_session_async(self):
         else:
             GLib.idle_add(self._toggle_login_view, False)
 
+        qobuz_backend = getattr(self, "qobuz_backend", None)
+        if qobuz_backend is not None:
+            try:
+                qobuz_backend.restore_session()
+            except Exception as exc:
+                logger.warning(
+                    "Qobuz session restore failed safely (%s)",
+                    type(exc).__name__,
+                )
+
     submit_daemon(task)
 
 

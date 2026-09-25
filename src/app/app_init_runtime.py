@@ -19,8 +19,21 @@ from utils.paths import get_cache_dir, get_config_dir
 logger = logging.getLogger(__name__)
 
 
-def _init_paths_and_settings(self):
+def _init_streaming_backends(self):
+    """Attach optional streaming providers without disturbing TIDAL authority."""
     self.backend = TidalBackend()
+    self.qobuz_backend = None
+
+    try:
+        from backend.qobuz import QobuzBackend
+
+        self.qobuz_backend = QobuzBackend()
+    except Exception as exc:
+        logger.warning("Qobuz backend initialization failed safely: %s", exc)
+
+
+def _init_paths_and_settings(self):
+    _init_streaming_backends(self)
     self._cache_root = get_cache_dir()
     self._config_root = get_config_dir()
     os.makedirs(self._cache_root, exist_ok=True)
@@ -61,7 +74,7 @@ def _init_paths_and_settings(self):
     self.play_mode = self.settings.get("play_mode", self.MODE_LOOP)
     if self.play_mode not in self.MODE_ICONS:
         self.play_mode = self.MODE_LOOP
-    self.shuffle_indices = []
+    self.shuffle_indices = []  # 用来存随机播放的顺序列表
 
 
 def _init_audio_and_data_services(self):

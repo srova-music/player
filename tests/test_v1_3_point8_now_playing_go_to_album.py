@@ -417,25 +417,29 @@ def test_watcher_hides_before_lookup_and_rejects_stale_completion():
         start,
     )
     block = UI[start:end]
+    compact = "".join(block.split())
 
-    assert block.index("hideNowPlayingAlbumAction();") < block.index(
-        '"/tidal/now-playing-album"'
+    assert compact.index(
+        "hideNowPlayingAlbumAction();"
+    ) < compact.index(
+        'fetchWithTimeout("/now-playing-albums"'
     )
     assert (
-        "if (serial !== nowPlayingAlbumWatchSerial) { return; }"
-        in block
+        "serial!==nowPlayingAlbumWatchSerial"
+        in compact
     )
     assert (
-        "if (signature !== nowPlayingAlbumWatchKey) { return; }"
-        in block
+        "signature!==nowPlayingAlbumWatchKey"
+        in compact
     )
     assert (
-        "nowPlayingAlbumWatchSignature(latest) !== signature"
-        in block
+        "nowPlayingAlbumWatchSignature(latest)!==signature"
+        in compact
     )
-    assert 'npBtnAlbum.classList.remove("hidden");' in block
-
-
+    assert (
+        'npBtnAlbum.classList.remove("hidden");'
+        in compact
+    )
 def test_status_polling_drives_confidence_watcher():
     start = UI.index("function pollStatus() {")
     end = UI.index(".catch(function", start)
@@ -458,18 +462,27 @@ def test_logout_immediately_hides_album_action():
 
 
 def test_go_to_album_uses_nowplaying_as_explicit_return_state():
-    start = UI.index("function openNowPlayingResolvedAlbum() {")
+    start = UI.index("function openNowPlayingAlbumDestination(")
     end = UI.index(
-        "function goBackToNowPlayingFromAlbum() {",
+        "function openNowPlayingResolvedAlbum() {",
         start,
     )
     block = UI[start:end]
+    compact = "".join(block.split())
 
-    assert "underlyingView: nowPlayingFromView || \"home\"" in block
-    assert '"/tidal/album/" + resolved.albumId' in block
+    assert (
+        'underlyingView:nowPlayingFromView||"home"'
+        in compact
+    )
+    assert (
+        '"/tidal/album/"+destination.albumId'
+        in compact
+    )
+    assert (
+        'loadQobuzAlbumDetail('
+        in block
+    )
     assert '"nowplaying"' in block
-
-
 def test_album_back_arrow_returns_to_live_now_playing():
     start = UI.index("function goBack() {")
     end = UI.index("// --- My Playlists view ---", start)

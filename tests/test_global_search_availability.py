@@ -190,6 +190,31 @@ def test_global_search_starts_hidden_and_refreshes_from_home():
     assert "refreshGlobalSearchAvailability();" in source
 
 
+def test_settings_back_restores_global_search_only_for_true_home():
+    settings = function_source("showSettings")
+    assert (
+        "_settingsPreviousWasTrueHome = "
+        "isTrueHomeLandingViewActive();"
+    ) in settings
+    assert "setGlobalSearchVisible(false);" in settings
+
+    render = function_source("renderSettings")
+    assert (
+        'showView(_settingsPreviousView);\n'
+        '            if (_settingsPreviousWasTrueHome) {\n'
+        '                setGlobalSearchVisible(true);\n'
+        '                refreshGlobalSearchAvailability();\n'
+        '            }'
+    ) in render
+
+
+def test_settings_search_restore_true_home_guard_excludes_source_pages():
+    source = function_source("isTrueHomeLandingViewActive")
+    assert 'currentSrovaView === "home"' in source
+    assert 'currentSourceSection === ""' in source
+    assert "!nowPlayingOpen" in source
+
+
 def test_tidal_search_ready_requires_authenticated_online_status():
     source = function_source("applyGlobalSearchTidalStatus")
     assert "data.logged_in === true" in source

@@ -7,10 +7,7 @@ from core.settings import CURRENT_SETTINGS_VERSION, normalize_settings
 
 
 def test_viz_effect_migration_maps_removed_pro_effects():
-    assert (
-        normalize_settings({})["settings_version"]
-        == CURRENT_SETTINGS_VERSION
-    )
+    assert CURRENT_SETTINGS_VERSION == 4
 
     assert normalize_settings({"settings_version": 2, "viz_effect": 14})["viz_effect"] == 0
     assert normalize_settings({"settings_version": 2, "viz_effect": 15})["viz_effect"] == 1

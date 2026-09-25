@@ -149,7 +149,7 @@ def test_share_selection_grid_centring_is_preserved():
 
 
 def test_css_and_javascript_cache_tokens_advance_exactly_once():
-    assert INDEX.count('/ui_web/srova.css?v=20260828_v1_4_release1') == 1
-    assert INDEX.count('/ui_web/ui.js?v=20260828_v1_4_release1') == 1
+    assert INDEX.count(f'/ui_web/srova.css?v={POINT6_TOKEN}') == 1
+    assert INDEX.count(f'/ui_web/ui.js?v={JAVASCRIPT_TOKEN}') == 1
     assert INDEX.count("/ui_web/srova.css?v=") == 1
     assert INDEX.count("/ui_web/ui.js?v=") == 1

@@ -14,7 +14,7 @@
 <link rel="manifest" href="/ui_web/manifest.webmanifest" crossorigin="use-credentials">
 <meta name="theme-color" content="#050505">
 
-<link rel="stylesheet" href="/ui_web/srova.css?v=20260828_v1_4_release1">
+<link rel="stylesheet" href="/ui_web/srova.css?v=20260914_v2_0_q10d_auth_ux_css2_q10f_provider_aware_go_to_album_css3_q10h_mobile_back_arrow_css1_q10i_20260915_favorites_always_visible_css2_q10i_artist_top_track_heart_layout_css3_q10i_hover_parity_css4_q10i_artist_add_footer_css5_q10i_artist_list_isolation_css6_q10i_search_favorites_css7_q10i_search_favorite_gold_css8_q10i_search_layout_parity_css9_q10i_short_detail_scroll_css10_sp3b_spotify_settings_css3_p2_playlist_states_css1">
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Josefin+Sans:wght@100;200;300;400&family=Outfit:wght@300;400&display=swap" rel="stylesheet">
 </head>
@@ -71,6 +71,30 @@
       <p class="loginInstruction">Open the link below in your browser and log in to Tidal:</p>
       <a id="loginUrl" href="#" target="_blank" rel="noopener"></a>
       <p class="loginStatus">Waiting for authorisation<span class="loginDots"></span></p>
+
+      <div id="qobuzLoginComplete" class="hidden">
+        <p class="loginInstruction">
+          If your browser says localhost cannot be reached after Qobuz signs
+          you in, copy the full address from the browser address bar, return
+          here, and paste it below.
+        </p>
+
+        <input id="qobuzCallbackUrl"
+               class="settingsInput"
+               type="url"
+               inputmode="url"
+               autocomplete="off"
+               autocapitalize="off"
+               spellcheck="false"
+               aria-label="Qobuz completion address"
+               placeholder="Paste the full localhost address">
+
+        <button id="qobuzCompleteLoginBtn"
+                class="settingsBtn qobuzCompleteBtn"
+                type="button"
+                onclick="completeQobuzLogin()">Complete Sign-In</button>
+      </div>
+
       <button class="loginCancelBtn" onclick="cancelLogin()">Cancel</button>
     </div>
     <div id="loginError" class="hidden">
@@ -152,6 +176,7 @@
     </button>
     <img id="albumArt">
     <div>
+      <div id="albumSourceLabel" class="hidden"></div>
       <div id="albumTitle"></div>
       <div id="albumArtist"></div>
       <div id="albumTechInfo" class="hidden"></div>
@@ -426,6 +451,23 @@
 </div>
 
 
+<div id="nativePlaybackBlocker"
+     class="nativePlaybackBlocker hidden"
+     role="alert"
+     aria-live="assertive"
+     aria-hidden="true">
+  <div class="nativePlaybackBlockerCard">
+    <span class="material-icons nativePlaybackBlockerIcon" aria-hidden="true">speaker</span>
+    <h2>SROVA PLAYBACK UNAVAILABLE</h2>
+    <p>Spotify Connect is currently using the selected DAC. To return to SROVA, disconnect this device in Spotify or press STOP SPOTIFY CONNECT below.</p>
+    <button id="nativePlaybackBlockerStopBtn"
+            class="settingsBtn nativePlaybackBlockerAction"
+            type="button"
+            aria-label="Stop Spotify Connect">STOP SPOTIFY CONNECT</button>
+  </div>
+</div>
+
+
 <div id="add-radio-modal" class="modal hidden" aria-hidden="true">
   <div class="modal-content">
     <h2 id="radio-modal-title">Add station</h2>
@@ -440,7 +482,7 @@
   </div>
 </div>
 
-<script src="/ui_web/ui.js?v=20260828_v1_4_release1"></script>
+<script src="/ui_web/ui.js?v=20260912_v2_0_q10a_infinite_play_pause_logo_js4_q10b_20260913_v2_0_q10b_qobuz_transition_js1_v1_4_point5_compat_q10b_readiness_js2_q10b_pending_presentation_js3_q10b_atomic_presentation_js4_q10b_infinite_visibility_latch_js5_q10b_infinite_commit_order_js6_q10a_provider_aware_pause_js7_q10c_playlist_maintenance_provider_js8_q10d_manual_browser_auth_js9_q10d_auth_ux_js10_q10e_qobuz_lyrics_js11_q10f_provider_aware_go_to_album_js12_q10i_20260915_qobuz_favorites_js13_q10i_search_favorites_js14_q10i_empty_artist_header_heart_js15_q10j_global_search_qobuz_js16_q10j_global_search_parity_js17_q10k_play_all_js18_q10k_radio_queue_parity_js19_bf4_spotify_status_sync_js9_p6_first_run_dac_selection_js10_p4_radio_stop_js11_p5_global_search_restore_js12_p2_playlist_states_js1_p7_hero_no_flash_js1_p12_source03_active_provider_js1"></script>
 <script>
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", function() {
