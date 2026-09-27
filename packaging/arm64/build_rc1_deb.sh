@@ -547,7 +547,7 @@ Priority: optional
 Architecture: arm64
 Maintainer: SROVA Team <support@srova.music>
 Homepage: https://srova.music/
-Depends: python3, python3-gi, python3-requests, python3-numpy, python3-mutagen, python3-cairo, python3-pil, python3-charset-normalizer, python3-qrcode, python3-pystray, python3-xlib, python3-dateutil, python3-isodate, python3-six, gir1.2-glib-2.0, gir1.2-gstreamer-1.0, gir1.2-gst-plugins-base-1.0, gir1.2-gdkpixbuf-2.0, gir1.2-gtk-3.0, gir1.2-gtk-4.0, gir1.2-adw-1, gstreamer1.0-tools, gstreamer1.0-alsa, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, pipewire-bin, wireplumber, adduser, sudo, nfs-common, cifs-utils, smbclient, iproute2, liblilv-0-0, libasound2 | libasound2t64
+Depends: python3, python3-cryptography, python3-gi, python3-requests, python3-numpy, python3-mutagen, python3-cairo, python3-pil, python3-charset-normalizer, python3-qrcode, python3-pystray, python3-xlib, python3-dateutil, python3-isodate, python3-six, gir1.2-glib-2.0, gir1.2-gstreamer-1.0, gir1.2-gst-plugins-base-1.0, gir1.2-gdkpixbuf-2.0, gir1.2-gtk-3.0, gir1.2-gtk-4.0, gir1.2-adw-1, gstreamer1.0-tools, gstreamer1.0-alsa, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, pipewire-bin, wireplumber, adduser, sudo, nfs-common, cifs-utils, smbclient, iproute2, liblilv-0-0, libasound2 | libasound2t64
 Description: SROVA headless audiophile player with bit-perfect output support.
  SROVA is a headless audiophile player for Local Music, TIDAL, Qobuz, and Internet Radio.
 EOF
@@ -737,6 +737,7 @@ import importlib.util
 
 mods = [
     "tidalapi", "ratelimit", "mpegdash", "pyaes",
+    "cryptography",
     "requests", "urllib3", "certifi", "charset_normalizer", "idna",
     "dateutil", "isodate", "typing_extensions", "six",
     "qrcode", "pystray", "Xlib", "PIL",

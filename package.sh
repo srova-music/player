@@ -1154,7 +1154,7 @@ Version: $VERSION
 Section: sound
 Priority: optional
 Architecture: $DEB_ARCH
-Depends: python3, python3-gi, python3-gi-cairo, python3-cairo, python3-pil, python3-charset-normalizer, python3-dateutil, python3-typing-extensions, python3-isodate, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-gtksource-4, qrencode, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, pipewire-bin, wireplumber, libpipewire-0.3-0, libpulse0, sudo, nfs-common, cifs-utils, smbclient, iproute2
+Depends: python3, python3-cryptography, python3-gi, python3-gi-cairo, python3-cairo, python3-pil, python3-charset-normalizer, python3-dateutil, python3-typing-extensions, python3-isodate, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-gtksource-4, qrencode, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, pipewire-bin, wireplumber, libpipewire-0.3-0, libpulse0, sudo, nfs-common, cifs-utils, smbclient, iproute2
 Maintainer: $MAINTAINER
 Homepage: https://srova.music/
 Description: $DESCRIPTION
@@ -1197,7 +1197,7 @@ Version: $VERSION
 Section: sound
 Priority: optional
 Architecture: $DEB_ARCH
-Depends: python3, python3-gi, python3-gi-cairo, python3-cairo, python3-pil, python3-charset-normalizer, python3-dateutil, python3-typing-extensions, python3-isodate, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-gtksource-4, qrencode, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, pipewire-bin, wireplumber, libpipewire-0.3-0, libpulse0, sudo, nfs-common, cifs-utils, smbclient, iproute2
+Depends: python3, python3-cryptography, python3-gi, python3-gi-cairo, python3-cairo, python3-pil, python3-charset-normalizer, python3-dateutil, python3-typing-extensions, python3-isodate, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-gtksource-4, qrencode, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, pipewire-bin, wireplumber, libpipewire-0.3-0, libpulse0, sudo, nfs-common, cifs-utils, smbclient, iproute2
 Maintainer: $MAINTAINER
 Homepage: https://srova.music/
 Description: $DESCRIPTION

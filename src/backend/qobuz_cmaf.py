@@ -14,6 +14,17 @@ import re
 
 import pyaes
 
+try:
+    from cryptography.hazmat.primitives.ciphers import (
+        Cipher,
+        algorithms,
+        modes,
+    )
+except ImportError:
+    Cipher = None
+    algorithms = None
+    modes = None
+
 
 QBZ_INIT_UUID = bytes.fromhex("c7c75df0fdd951e98fc22971e4acf8d2")
 QBZ_SEGMENT_UUID = bytes.fromhex("3b42129256f35f75923663b69a1f52b2")
@@ -198,10 +209,17 @@ def decrypt_frame(content_key, iv, data):
         raise QobuzCmafError("content key must be 16 bytes")
     if len(iv) != 8:
         raise QobuzCmafError("frame IV must be 8 bytes")
+    if Cipher is None or algorithms is None or modes is None:
+        raise QobuzCmafError(
+            "native AES-CTR backend is unavailable"
+        )
+
     nonce = iv + (b"\x00" * 8)
-    counter = pyaes.Counter(int.from_bytes(nonce, "big"))
-    cipher = pyaes.AESModeOfOperationCTR(content_key, counter=counter)
-    return cipher.decrypt(bytes(data))
+    decryptor = Cipher(
+        algorithms.AES(content_key),
+        modes.CTR(nonce),
+    ).decryptor()
+    return decryptor.update(bytes(data)) + decryptor.finalize()
 
 
 def compute_request_signature(method, arguments, timestamp, seed):
