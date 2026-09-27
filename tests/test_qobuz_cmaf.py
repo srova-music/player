@@ -2,6 +2,7 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
+import pyaes
 import pytest
 import requests
 
@@ -254,6 +255,33 @@ def test_qbz_crypto_vectors_are_exact():
         NOW,
         CMAF_SEED,
     ) == "6de2b2df0f35fcb30d916f70bd42bfa1"
+
+
+@pytest.mark.parametrize(
+    ("iv", "payload"),
+    [
+        (FRAME_IV, FRAME_CIPHERTEXT),
+        (b"\x00" * 8, b"\x01"),
+        (
+            bytes.fromhex("ffffffffffffffff"),
+            bytes(range(17)),
+        ),
+        (
+            bytes.fromhex("1020304050607080"),
+            bytes((index * 37) % 256 for index in range(257)),
+        ),
+    ],
+)
+def test_native_aes_ctr_matches_legacy_pyaes_byte_for_byte(iv, payload):
+    nonce = iv + (b"\x00" * 8)
+    counter = pyaes.Counter(int.from_bytes(nonce, "big"))
+    legacy_cipher = pyaes.AESModeOfOperationCTR(
+        CONTENT_KEY,
+        counter=counter,
+    )
+    legacy = legacy_cipher.decrypt(bytes(payload))
+
+    assert decrypt_frame(CONTENT_KEY, iv, payload) == legacy
 
 
 @pytest.mark.parametrize(
